@@ -1,0 +1,100 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "api",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-12-21",
+	"observability": {
+		"enabled": true
+	},
+	"kv_namespaces": [
+		{
+			"binding": "SYSTEMIX_KV",
+			"id": "8daf7908b2534de989c486d3e98f5216",
+			"preview_id": "d8bd5be6e38d4fa7ba794587c5cff08c"
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "SYSTEMIX",
+			"database_name": "systemix",
+			"database_id": "b6573bdd-c88d-4480-a882-745fb10177c7"
+		}
+	],
+	"vars": {
+		"ENVIRONMENT": "production",
+		"PUBLIC_BASE_URL": "https://api.sean-ndele.workers.dev",
+		"MISSED_CALL_TIMEOUT_SECONDS": "20",
+		"TWILIO_SIGNATURE_MODE": "log"
+	},
+	"env": {
+		"dev": {
+			"name": "systemix-dev",
+			"kv_namespaces": [
+				{
+					"binding": "SYSTEMIX_KV",
+					"id": "8daf7908b2534de989c486d3e98f5216",
+					"preview_id": "d8bd5be6e38d4fa7ba794587c5cff08c"
+				}
+			],
+			"vars": {
+				"ENVIRONMENT": "development",
+				"PUBLIC_BASE_URL": "https://systemix-dev.sean-ndele.workers.dev",
+				"MISSED_CALL_TIMEOUT_SECONDS": "20",
+				"TWILIO_SIGNATURE_MODE": "log",
+				"SYSTEMIX_NUMBER": "+10000000000"
+			},
+			"d1_databases": [
+				{
+					"binding": "SYSTEMIX",
+					"database_name": "systemix_dev",
+					"database_id": "82088792-6c4a-41fc-95a0-1d5129c1c3f3"
+				}
+			]
+		}
+	}
+
+/**
+ * Non-secret vars to set outside git:
+ * - BUSINESS_FORWARD_NUMBER
+ * - OWNER_NOTIFICATION_NUMBER
+ *
+ * Secrets (set via `wrangler secret put`):
+ * - TWILIO_AUTH_TOKEN
+ * - TWILIO_ACCOUNT_SID
+ * - TWILIO_MESSAGING_SERVICE_SID or TWILIO_FROM_NUMBER
+ */
+
+
+	/**
+	 * Smart Placement
+	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+	 */
+	// "placement": {  "mode": "smart" }
+	/**
+	 * Bindings
+	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
+	 * databases, object storage, AI inference, real-time communication and more.
+	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+	 */
+	/**
+	 * Environment Variables
+	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
+	 * Note: Use secrets to store sensitive data.
+	 * https://developers.cloudflare.com/workers/configuration/secrets/
+	 */
+
+	/**
+	 * Static Assets
+	 * https://developers.cloudflare.com/workers/static-assets/binding/
+	 */
+	// "assets": {  "directory": "./public/",  "binding": "ASSETS" }
+	/**
+	 * Service Bindings (communicate between multiple Workers)
+	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
+	 */
+	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
+}

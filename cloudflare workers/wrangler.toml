@@ -1,0 +1,42 @@
+name = "systemix-backend"
+main = "api-main/api/src/index.ts"
+compatibility_date = "2026-01-26"
+
+# Add your D1 database binding
+[[d1_databases]]
+binding = "SYSTEMIX"
+migrations_dir = "api-main/api/migrations"
+database_name = "systemix"
+database_id = "b6573bdd-c88d-4480-a882-745fb10177c7"  # Get this from: wrangler d1 list
+
+[[kv_namespaces]]
+binding = "SYSTEMIX_KV"
+id = "8daf7908b2534de989c486d3e98f5216"
+preview_id = "d8bd5be6e38d4fa7ba794587c5cff08c"
+
+# Secrets (set via: wrangler secret put <NAME>)
+# - OPENAI_API_KEY
+# - TEXTBELT_API_KEY
+# - CLIENT_PHONE
+# - TWILIO_ACCOUNT_SID
+# - TWILIO_AUTH_TOKEN
+
+[env.dev]
+name = "systemix-backend-dev"
+
+[env.dev.vars]
+SYSTEMIX_NUMBER = "+1XXXXXXXXXX"
+STRIPE_SECRET_KEY = 
+STRIPE_SUCCESS_URL = "http://localhost:3000/billing/success"
+STRIPE_CANCEL_URL = "http://localhost:3000/billing/cancel"
+
+[[env.dev.d1_databases]]
+binding = "SYSTEMIX"
+migrations_dir = "api-main/api/migrations"
+database_name = "systemix_dev"
+database_id = "82088792-6c4a-41fc-95a0-1d5129c1c3f3"
+
+[[env.dev.kv_namespaces]]
+binding = "SYSTEMIX_KV"
+id = "8daf7908b2534de989c486d3e98f5216"
+preview_id = "d8bd5be6e38d4fa7ba794587c5cff08c"
