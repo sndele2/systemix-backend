@@ -1,20 +1,23 @@
 import { Context } from 'hono';
-import { sendTwilioSms } from '../core/sms';
 import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
 
 type Bindings = {
   SYSTEMIX: D1Database;
   OPENAI_API_KEY: string;
-  CLIENT_PHONE: string;
   TWILIO_ACCOUNT_SID: string;
   TWILIO_AUTH_TOKEN: string;
-  TWILIO_PHONE_NUMBER: string;
+  TWILIO_PHONE_NUMBER?: string;
+  OWNER_PHONE_NUMBER?: string;
   TWILIO_SIGNATURE_MODE?: string;
   ENVIRONMENT?: string;
   WORKER_URL?: string;
-  SYSTEMIX_NUMBER: string;
+  SYSTEMIX_NUMBER?: string;
   VOICE_CONSENT_SCRIPT?: string;
 };
+
+const CALL_PROVIDER = 'twilio';
+const CUSTOMER_WELCOME_STATUSES = new Set(['completed', 'busy', 'no-answer']);
+const CUSTOMER_MISSED_STATUSES = new Set(['busy', 'no-answer']);
 
 function getDb(env: Bindings) {
   return env.SYSTEMIX;
@@ -36,6 +39,50 @@ function maskPhone(phone: string): string {
   return `***${digits.slice(-4)}`;
 }
 
+function normalizeStatus(value: string | null): string {
+  return (value || '').trim().toLowerCase();
+}
+
+async function lookupBusinessNameByDialedNumber(env: Bindings, toPhone: string): Promise<string> {
+  const fallback = 'the office';
+  const dialedNumber = (toPhone || '').trim();
+  if (!dialedNumber) return fallback;
+
+  try {
+    const companyRow = await getDb(env)
+      .prepare('SELECT company_name FROM tenants WHERE business_number = ? LIMIT 1')
+      .bind(dialedNumber)
+      .first<{ company_name?: string }>();
+
+    if (companyRow?.company_name) {
+      return String(companyRow.company_name);
+    }
+  } catch (error) {
+    console.warn('Tenant lookup via company_name failed', {
+      to: maskPhone(dialedNumber),
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  try {
+    const nameRow = await getDb(env)
+      .prepare('SELECT name FROM tenants WHERE business_number = ? LIMIT 1')
+      .bind(dialedNumber)
+      .first<{ name?: string }>();
+
+    if (nameRow?.name) {
+      return String(nameRow.name);
+    }
+  } catch (error) {
+    console.warn('Tenant lookup via name failed', {
+      to: maskPhone(dialedNumber),
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  return fallback;
+}
+
 function isTrustedTwilioHost(urlValue: string): boolean {
   try {
     const url = new URL(urlValue);
@@ -44,6 +91,128 @@ function isTrustedTwilioHost(urlValue: string): boolean {
   } catch {
     return false;
   }
+}
+
+type TwilioRestClient = {
+  sendSms: (
+    input: { toPhone: string; fromPhone: string; body: string }
+  ) => Promise<{ ok: boolean; sid?: string; detail?: string }>;
+};
+
+function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) {
+    return null;
+  }
+
+  const accountSid = env.TWILIO_ACCOUNT_SID;
+  const authHeader = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
+
+  return {
+    async sendSms(input: {
+      toPhone: string;
+      fromPhone: string;
+      body: string;
+    }): Promise<{ ok: boolean; sid?: string; detail?: string }> {
+      const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
+        method: 'POST',
+        headers: {
+          Authorization: authHeader,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          To: input.toPhone,
+          From: input.fromPhone,
+          Body: input.body,
+        }).toString(),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return { ok: false, detail: `twilio_sms_failed_${response.status}:${errorText}` };
+      }
+
+      const payload = (await response.json()) as { sid?: string };
+      return { ok: true, sid: payload.sid };
+    },
+  };
+}
+
+async function sendOwnerTranscriptSms(
+  client: TwilioRestClient,
+  toPhone: string,
+  fromPhone: string,
+  body: string
+): Promise<{ ok: boolean; sid?: string; detail?: string }> {
+  if (!fromPhone) {
+    return { ok: false, detail: 'missing_twilio_phone_number' };
+  }
+
+  try {
+    return await client.sendSms({
+      toPhone,
+      fromPhone,
+      body,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      detail: `twilio_sms_error:${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function sendCustomerWelcomeSms(
+  client: TwilioRestClient,
+  toPhone: string,
+  fromPhone: string,
+  body: string
+): Promise<{ ok: boolean; sid?: string; detail?: string }> {
+  if (!fromPhone) {
+    return { ok: false, detail: 'missing_twilio_phone_number' };
+  }
+
+  try {
+    return await client.sendSms({
+      toPhone,
+      fromPhone,
+      body,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      detail: `twilio_sms_error:${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function releaseCustomerWelcomeLock(env: Bindings, providerCallId: string): Promise<void> {
+  await getDb(env)
+    .prepare(
+      `
+      UPDATE calls
+      SET customer_welcome_sent_at = NULL
+      WHERE provider = ?
+        AND provider_call_id = ?
+        AND customer_welcome_message_id IS NULL
+    `
+    )
+    .bind(CALL_PROVIDER, providerCallId)
+    .run();
+}
+
+async function releaseOwnerTranscriptLock(env: Bindings, providerCallId: string): Promise<void> {
+  await getDb(env)
+    .prepare(
+      `
+      UPDATE calls
+      SET owner_transcript_sent_at = NULL
+      WHERE provider = ?
+        AND provider_call_id = ?
+        AND owner_transcript_message_id IS NULL
+    `
+    )
+    .bind(CALL_PROVIDER, providerCallId)
+    .run();
 }
 
 // ==========================================
@@ -62,26 +231,144 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      console.error('Twilio voice signature rejected', { mode: sig.mode, reason: sig.reason });
-      return c.body(
-        `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are unable to process your call right now.</Say><Hangup/></Response>`,
-        200,
-        { 'Content-Type': 'text/xml' }
-      );
+      console.error('Twilio voice signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
     }
 
     const from = (formData.get('From') as string) || '';
     const to = (formData.get('To') as string) || '';
+    const rawStatus = ((formData.get('CallStatus') as string) || (formData.get('DialCallStatus') as string) || '')
+      .trim();
+    const callStatus = normalizeStatus(rawStatus);
+    const callSid = ((formData.get('CallSid') as string) || '').trim();
+    const parentCallSid = ((formData.get('ParentCallSid') as string) || '').trim();
+
+    // Handle call status callback on /voice and send customer SMS from this handler.
+    if (CUSTOMER_WELCOME_STATUSES.has(callStatus)) {
+      const providerCallId = callSid || parentCallSid;
+      if (!providerCallId) {
+        console.error('Customer SMS skipped in voice handler: missing call identifier', {
+          status: callStatus,
+          from: maskPhone(from),
+          to: maskPhone(to),
+        });
+        return c.json({ ok: false, error: 'missing_call_sid' }, 200);
+      }
+
+      await getDb(env)
+        .prepare(
+          `
+          INSERT INTO calls (
+            id,
+            provider,
+            provider_call_id,
+            call_sid,
+            from_phone,
+            to_phone,
+            status,
+            raw_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(provider, provider_call_id) DO UPDATE SET
+            call_sid = excluded.call_sid,
+            from_phone = excluded.from_phone,
+            to_phone = excluded.to_phone,
+            status = excluded.status,
+            raw_json = excluded.raw_json
+        `
+        )
+        .bind(
+          crypto.randomUUID(),
+          CALL_PROVIDER,
+          providerCallId,
+          callSid || null,
+          from || 'unknown',
+          to || 'unknown',
+          callStatus,
+          JSON.stringify({
+            source: 'twilio_voice_status_callback',
+            callSid,
+            parentCallSid,
+            from,
+            to,
+            callStatus: rawStatus,
+          })
+        )
+        .run();
+
+      const lock = await getDb(env)
+        .prepare(
+          `
+          UPDATE calls
+          SET customer_welcome_sent_at = datetime('now')
+          WHERE provider = ?
+            AND provider_call_id = ?
+            AND customer_welcome_sent_at IS NULL
+        `
+        )
+        .bind(CALL_PROVIDER, providerCallId)
+        .run();
+
+      if (Number(lock.meta?.changes || 0) === 0) {
+        return c.json({ ok: true, deduped: true, status: callStatus }, 200);
+      }
+
+      const callerNumber = from.trim();
+      const smsFrom = (env.TWILIO_PHONE_NUMBER || '').trim();
+
+      if (!callerNumber) {
+        await releaseCustomerWelcomeLock(env, providerCallId);
+        return c.json({ ok: false, error: 'missing_sms_to' }, 200);
+      }
+
+      if (!smsFrom) {
+        await releaseCustomerWelcomeLock(env, providerCallId);
+        return c.json({ ok: false, error: 'missing_twilio_phone_number' }, 200);
+      }
+
+      const twilioClient = createTwilioRestClient(env);
+      if (!twilioClient) {
+        await releaseCustomerWelcomeLock(env, providerCallId);
+        return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
+      }
+
+      const businessName = await lookupBusinessNameByDialedNumber(env, to);
+      const customerMessage =
+        callStatus === 'completed'
+          ? `Hi, this is ${businessName}. We received your voicemail and will get back to you as soon as possible!`
+          : `Hi, this is ${businessName}. We're sorry we missed your call! Please leave a reply here and we'll get back to you shortly.`;
+
+      // Intentionally no caller-vs-business relationship check for test environments.
+      console.log('Sending Customer SMS to:', callerNumber);
+      const sms = await sendCustomerWelcomeSms(twilioClient, callerNumber, smsFrom, customerMessage);
+      if (!sms.ok) {
+        await releaseCustomerWelcomeLock(env, providerCallId);
+        return c.json({ ok: false, error: 'sms_failed', detail: sms.detail || 'unknown' }, 200);
+      }
+
+      await getDb(env)
+        .prepare(
+          `
+          UPDATE calls
+          SET missed_at = CASE WHEN ? = 1 THEN COALESCE(missed_at, datetime('now')) ELSE missed_at END,
+              customer_welcome_message_id = COALESCE(customer_welcome_message_id, ?)
+          WHERE provider = ? AND provider_call_id = ?
+        `
+        )
+        .bind(CUSTOMER_MISSED_STATUSES.has(callStatus) ? 1 : 0, sms.sid || null, CALL_PROVIDER, providerCallId)
+        .run();
+
+      return c.json({ ok: true, status: callStatus, messageSid: sms.sid || null }, 200);
+    }
+
     const baseUrl = new URL(c.req.url).origin;
     const workerUrl = env.WORKER_URL || baseUrl;
     const defaultConsentScript =
-      'Thanks for calling Systemix. We are currently on a job site or helping another customer right now. Please leave a brief message with your name and what you need help with. To get you scheduled quickly, we will send a follow-up text to this number. By leaving a message, you consent to receive text messages from us regarding your inquiry. Please leave your message after the tone.';
+      "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts.";
     const consentText = (env.VOICE_CONSENT_SCRIPT || '').trim() || defaultConsentScript;
     const consentScript = escapeXml(consentText);
 
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew-Neural">${consentScript}</Say>
+  <Say voice="Polly.Joanna-Neural">${consentScript}</Say>
   <Record
     maxLength="120"
     timeout="10"
@@ -126,7 +413,7 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      return c.json({ success: false, error: 'unauthorized' }, 401);
+      console.error('Twilio recording signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
     }
 
     const url = new URL(c.req.url);
@@ -151,20 +438,7 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
       mode: sig.mode,
     });
 
-    let companyName = 'the office';
-    try {
-      const tenantQuery = await getDb(env)
-        .prepare('SELECT company_name FROM tenants WHERE systemix_number = ?')
-        .bind(to)
-        .first();
-
-      if (tenantQuery?.company_name) {
-        companyName = tenantQuery.company_name as string;
-      }
-    } catch (dbError) {
-      console.error('Tenant lookup failed');
-      console.error(dbError);
-    }
+    const companyName = await lookupBusinessNameByDialedNumber(env, to);
 
     let audioBlob: Blob | null = null;
     try {
@@ -235,70 +509,119 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
       }
     }
 
-    try {
-      const providerCallId = callSid || recordingSid || crypto.randomUUID();
-      const rawJson = JSON.stringify({
-        recordingSid,
-        callSid,
+    const providerCallId = (callSid || recordingSid || '').trim() || crypto.randomUUID();
+    const rawJson = JSON.stringify({
+      recordingSid,
+      callSid,
+      from,
+      to,
+      recordingUrl,
+      recordingDuration,
+      transcription,
+    });
+
+    await getDb(env)
+      .prepare(
+        `
+        INSERT INTO calls (
+          id,
+          provider,
+          provider_call_id,
+          call_sid,
+          from_phone,
+          to_phone,
+          status,
+          recording_url,
+          transcription,
+          raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(provider, provider_call_id) DO UPDATE SET
+          call_sid = excluded.call_sid,
+          from_phone = excluded.from_phone,
+          to_phone = excluded.to_phone,
+          status = excluded.status,
+          recording_url = excluded.recording_url,
+          transcription = excluded.transcription,
+          raw_json = excluded.raw_json
+      `
+      )
+      .bind(
+        crypto.randomUUID(),
+        CALL_PROVIDER,
+        providerCallId,
+        callSid || null,
         from,
         to,
+        'completed',
         recordingUrl,
-        recordingDuration,
+        transcription,
+        rawJson
+      )
+      .run();
+
+    const lock = await getDb(env)
+      .prepare(
+        `
+        UPDATE calls
+        SET owner_transcript_sent_at = datetime('now')
+        WHERE provider = ?
+          AND provider_call_id = ?
+          AND owner_transcript_sent_at IS NULL
+      `
+      )
+      .bind(CALL_PROVIDER, providerCallId)
+      .run();
+
+    if (Number(lock.meta?.changes || 0) === 0) {
+      return c.json({ success: true, deduped: true }, 200);
+    }
+
+    const ownerPhone = (env.OWNER_PHONE_NUMBER || '').trim();
+    if (!ownerPhone) {
+      await releaseOwnerTranscriptLock(env, providerCallId);
+      console.error('Owner transcript SMS skipped: OWNER_PHONE_NUMBER is not configured', {
+        callSid: callSid || 'unknown',
       });
-
-      await getDb(env)
-        .prepare(`
-          INSERT INTO calls (
-            id,
-            provider,
-            provider_call_id,
-            call_sid,
-            from_phone,
-            to_phone,
-            status,
-            recording_url,
-            transcription,
-            raw_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(provider, provider_call_id) DO UPDATE SET
-            call_sid = excluded.call_sid,
-            from_phone = excluded.from_phone,
-            to_phone = excluded.to_phone,
-            status = excluded.status,
-            recording_url = excluded.recording_url,
-            transcription = excluded.transcription,
-            raw_json = excluded.raw_json
-        `)
-        .bind(
-          crypto.randomUUID(),
-          'twilio',
-          providerCallId,
-          callSid || null,
-          from,
-          to,
-          'completed',
-          recordingUrl,
-          transcription,
-          rawJson
-        )
-        .run();
-
-      console.log('Recording saved to database', { callSid: callSid || 'unknown' });
-    } catch (dbError) {
-      console.error('Database save failed');
-      console.error(dbError);
+      return c.json({ success: false, error: 'missing_owner_phone_number' }, 200);
     }
 
-    try {
-      const smsMessage = `New voicemail at ${companyName} from ${from}:\n\n"${transcription}"\n\nMsg&data rates may apply. Reply STOP to opt out.`;
-      await sendTwilioSms(env, env.CLIENT_PHONE, smsMessage);
-      console.log('Owner notification SMS sent');
-    } catch (smsError) {
-      console.error('Owner notification SMS failed');
-      console.error(smsError);
+    const twilioClient = createTwilioRestClient(env);
+    if (!twilioClient) {
+      await releaseOwnerTranscriptLock(env, providerCallId);
+      return c.json({ success: false, error: 'missing_twilio_credentials' }, 200);
     }
 
-    return c.json({ success: true }, 200);
+    const smsMessage = `New voicemail for ${companyName} from ${from}: "${transcription}"`;
+    const sms = await sendOwnerTranscriptSms(twilioClient, ownerPhone, (env.TWILIO_PHONE_NUMBER || '').trim(), smsMessage);
+
+    if (!sms.ok) {
+      await releaseOwnerTranscriptLock(env, providerCallId);
+      console.error('Owner transcript SMS failed', {
+        callSid: callSid || 'unknown',
+        detail: sms.detail || 'unknown',
+      });
+      return c.json({ success: false, error: 'sms_failed' }, 200);
+    }
+
+    await getDb(env)
+      .prepare(
+        `
+        UPDATE calls
+        SET owner_transcript_message_id = COALESCE(owner_transcript_message_id, ?)
+        WHERE provider = ?
+          AND provider_call_id = ?
+      `
+      )
+      .bind(sms.sid || null, CALL_PROVIDER, providerCallId)
+      .run();
+
+    console.log('Owner transcript SMS sent', {
+      callSid: callSid || 'unknown',
+      owner: maskPhone(ownerPhone),
+      sid: sms.sid || 'unknown',
+    });
+
+    return c.json({ success: true, messageSid: sms.sid || null }, 200);
   } catch (error) {
     console.error('Recording handler error');
     console.error(error);

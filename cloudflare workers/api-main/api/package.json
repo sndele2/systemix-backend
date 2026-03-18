@@ -5,11 +5,13 @@
 	"type": "module",
 	"scripts": {
 		"build": "tsc --noEmit",
+		"create-payment-link": "node --experimental-strip-types scripts/create-payment-link.ts",
 		"dev": "wrangler dev",
 		"start": "wrangler dev"
 	},
 	"dependencies": {
 		"hono": "^4.11.3",
+		"stripe": "^20.4.1",
 		"zod": "^4.3.5"
 	},
 	"devDependencies": {

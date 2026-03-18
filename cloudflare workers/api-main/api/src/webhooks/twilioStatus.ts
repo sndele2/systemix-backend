@@ -6,12 +6,12 @@ type Bindings = {
   TWILIO_ACCOUNT_SID: string;
   TWILIO_AUTH_TOKEN: string;
   TWILIO_PHONE_NUMBER?: string;
-  SYSTEMIX_NUMBER?: string;
   TWILIO_SIGNATURE_MODE?: string;
   ENVIRONMENT?: string;
 };
 
-const MISSED_STATUSES = new Set(['no-answer', 'busy', 'canceled']);
+const CUSTOMER_WELCOME_STATUSES = new Set(['completed', 'busy', 'no-answer']);
+const MISSED_STATUSES = new Set(['busy', 'no-answer']);
 const CALL_PROVIDER = 'twilio';
 
 function normalizeStatus(value: string | null): string {
@@ -70,7 +70,7 @@ function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
 }
 
 async function getBusinessName(env: Bindings, toPhone: string): Promise<string> {
-  const fallback = 'Systemix';
+  const fallback = 'the office';
   if (!toPhone) return fallback;
 
   try {
@@ -78,7 +78,7 @@ async function getBusinessName(env: Bindings, toPhone: string): Promise<string> 
       `
       SELECT company_name
       FROM tenants
-      WHERE systemix_number = ?
+      WHERE business_number = ?
       LIMIT 1
       `
     )
@@ -100,7 +100,7 @@ async function getBusinessName(env: Bindings, toPhone: string): Promise<string> 
       `
       SELECT name
       FROM tenants
-      WHERE systemix_number = ?
+      WHERE business_number = ?
       LIMIT 1
       `
     )
@@ -120,74 +120,38 @@ async function getBusinessName(env: Bindings, toPhone: string): Promise<string> 
   return fallback;
 }
 
-function voicemailInPayload(formData: FormData): boolean {
-  const recordingSid = ((formData.get('RecordingSid') as string) || '').trim();
-  const recordingUrl = ((formData.get('RecordingUrl') as string) || '').trim();
-  const recordingDuration = ((formData.get('RecordingDuration') as string) || '').trim();
-
-  if (recordingSid || recordingUrl) {
-    return true;
-  }
-
-  return recordingDuration !== '' && recordingDuration !== '0';
-}
-
-async function voicemailInDatabase(env: Bindings, providerCallId: string, callSid: string): Promise<boolean> {
-  try {
-    if (providerCallId) {
-      const byProviderCallId = await env.SYSTEMIX.prepare(
-        `
-        SELECT recording_url, transcription
-        FROM calls
-        WHERE provider = ? AND provider_call_id = ?
-        LIMIT 1
-      `
-      )
-        .bind(CALL_PROVIDER, providerCallId)
-        .first<{ recording_url?: string | null; transcription?: string | null }>();
-
-      if (byProviderCallId?.recording_url || byProviderCallId?.transcription) {
-        return true;
-      }
-    }
-
-    if (callSid && callSid !== providerCallId) {
-      const byCallSid = await env.SYSTEMIX.prepare(
-        `
-        SELECT recording_url, transcription
-        FROM calls
-        WHERE provider = ? AND call_sid = ?
-        LIMIT 1
-      `
-      )
-        .bind(CALL_PROVIDER, callSid)
-        .first<{ recording_url?: string | null; transcription?: string | null }>();
-
-      if (byCallSid?.recording_url || byCallSid?.transcription) {
-        return true;
-      }
-    }
-  } catch (error) {
-    console.warn('Voicemail lookup failed', {
-      callSid: callSid || 'unknown',
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  return false;
-}
-
 async function sendMissedCallSms(
   client: TwilioRestClient,
   toPhone: string,
   fromPhone: string,
   body: string
 ): Promise<{ ok: boolean; sid?: string; detail?: string }> {
-  return client.sendSms({
-    toPhone,
-    fromPhone,
-    body,
-  });
+  try {
+    return await client.sendSms({
+      toPhone,
+      fromPhone,
+      body,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      detail: `twilio_sms_error:${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function releaseCustomerWelcomeLock(env: Bindings, providerCallId: string): Promise<void> {
+  await env.SYSTEMIX.prepare(
+    `
+    UPDATE calls
+    SET customer_welcome_sent_at = NULL
+    WHERE provider = ?
+      AND provider_call_id = ?
+      AND customer_welcome_message_id IS NULL
+  `
+  )
+    .bind(CALL_PROVIDER, providerCallId)
+    .run();
 }
 
 export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
@@ -203,8 +167,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      console.error('Twilio status signature rejected', { mode: sig.mode, reason: sig.reason });
-      return c.json({ ok: false, error: 'unauthorized' }, 401);
+      console.error('Twilio status signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
     }
 
     const callSid = (formData.get('CallSid') as string) || '';
@@ -213,7 +176,16 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
     const rawStatus = ((formData.get('CallStatus') as string) || (formData.get('DialCallStatus') as string) || '');
     const status = normalizeStatus(rawStatus);
     const parentCallSid = (formData.get('ParentCallSid') as string) || '';
-    const providerCallId = callSid || parentCallSid || crypto.randomUUID();
+    const providerCallId = (callSid || parentCallSid || '').trim();
+
+    if (!providerCallId) {
+      console.error('Customer welcome SMS skipped: missing call identifier', {
+        from: maskPhone(fromPhone),
+        to: maskPhone(toPhone),
+        status,
+      });
+      return c.json({ ok: false, error: 'missing_call_sid' }, 200);
+    }
 
     await env.SYSTEMIX.prepare(
       `
@@ -253,50 +225,61 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       )
       .run();
 
-    const missedCall = MISSED_STATUSES.has(status);
-    const voicemailFound =
-      status === 'completed' &&
-      (voicemailInPayload(formData) || (await voicemailInDatabase(env, providerCallId, callSid)));
-    const shouldSendFollowup = missedCall || voicemailFound;
-    if (!shouldSendFollowup) {
+    if (!CUSTOMER_WELCOME_STATUSES.has(status)) {
       return c.json({ ok: true, ignored: true, status }, 200);
     }
 
-    const existing = await env.SYSTEMIX.prepare(
+    const lock = await env.SYSTEMIX.prepare(
       `
-      SELECT followup_sent_at
-      FROM calls
-      WHERE provider = ? AND provider_call_id = ?
-      LIMIT 1
+      UPDATE calls
+      SET customer_welcome_sent_at = datetime('now')
+      WHERE provider = ?
+        AND provider_call_id = ?
+        AND customer_welcome_sent_at IS NULL
     `
     )
       .bind(CALL_PROVIDER, providerCallId)
-      .first<{ followup_sent_at?: string }>();
+      .run();
 
-    if (existing?.followup_sent_at) {
+    if (Number(lock.meta?.changes || 0) === 0) {
       return c.json({ ok: true, deduped: true, status }, 200);
     }
 
-    const smsTo = fromPhone;
-    const smsFrom = env.TWILIO_PHONE_NUMBER || env.SYSTEMIX_NUMBER || toPhone;
-    if (!smsTo || !smsFrom) {
-      console.error('Missed call SMS skipped due to missing phone values', {
+    const smsTo = (fromPhone || '').trim();
+    const smsFrom = (env.TWILIO_PHONE_NUMBER || '').trim();
+
+    if (!smsTo) {
+      console.error('Missed call SMS skipped: caller number is missing', {
         callSid: callSid || 'unknown',
-        from: maskPhone(fromPhone),
         to: maskPhone(toPhone),
       });
-      return c.json({ ok: false, error: 'missing_sms_phone' }, 200);
+      await releaseCustomerWelcomeLock(env, providerCallId);
+      return c.json({ ok: false, error: 'missing_sms_to' }, 200);
+    }
+
+    if (!smsFrom) {
+      console.error('Missed call SMS skipped: TWILIO_PHONE_NUMBER is not configured', {
+        callSid: callSid || 'unknown',
+        to: maskPhone(toPhone),
+      });
+      await releaseCustomerWelcomeLock(env, providerCallId);
+      return c.json({ ok: false, error: 'missing_twilio_phone_number' }, 200);
     }
 
     const twilioClient = createTwilioRestClient(env);
     if (!twilioClient) {
+      await releaseCustomerWelcomeLock(env, providerCallId);
       return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
     }
 
     const businessName = await getBusinessName(env, toPhone);
-    const message = `Hi, this is ${businessName}. Sorry we missed your call! How can we help you today?`;
+    const message =
+      status === 'completed'
+        ? `Hi, this is ${businessName}. We received your voicemail and will get back to you as soon as possible!`
+        : `Hi, this is ${businessName}. We're sorry we missed your call! Please leave a reply here and we'll get back to you shortly.`;
     const sms = await sendMissedCallSms(twilioClient, smsTo, smsFrom, message);
     if (!sms.ok) {
+      await releaseCustomerWelcomeLock(env, providerCallId);
       console.error('Missed call SMS failed', {
         callSid: callSid || 'unknown',
         status,
@@ -308,19 +291,18 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
     await env.SYSTEMIX.prepare(
       `
       UPDATE calls
-      SET missed_at = COALESCE(missed_at, datetime('now')),
-          followup_sent_at = COALESCE(followup_sent_at, datetime('now')),
-          followup_message_id = COALESCE(followup_message_id, ?)
+      SET missed_at = CASE WHEN ? = 1 THEN COALESCE(missed_at, datetime('now')) ELSE missed_at END,
+          customer_welcome_message_id = COALESCE(customer_welcome_message_id, ?)
       WHERE provider = ? AND provider_call_id = ?
     `
     )
-      .bind(sms.sid || null, CALL_PROVIDER, providerCallId)
+      .bind(MISSED_STATUSES.has(status) ? 1 : 0, sms.sid || null, CALL_PROVIDER, providerCallId)
       .run();
 
-    console.log('Missed call SMS sent', {
+    console.log('Customer welcome SMS sent', {
       callSid: callSid || 'unknown',
       status,
-      reason: missedCall ? 'missed_status' : 'completed_with_voicemail',
+      reason: status === 'completed' ? 'completed' : 'missed_call',
       to: maskPhone(fromPhone),
       sid: sms.sid || 'unknown',
     });
@@ -328,9 +310,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
     return c.json(
       {
         ok: true,
-        missed: true,
         status,
-        voicemailFound,
         messageSid: sms.sid || null,
       },
       200

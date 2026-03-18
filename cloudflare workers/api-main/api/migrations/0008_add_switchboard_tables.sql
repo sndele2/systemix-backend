@@ -1,0 +1,2 @@
+-- Intentionally no-op.
+-- Canonical schema objects are managed by later migrations and runtime checks.

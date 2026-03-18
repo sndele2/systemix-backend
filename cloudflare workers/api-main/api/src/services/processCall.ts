@@ -27,7 +27,7 @@ export async function processCall(params: ProcessCallParams, deps: ProcessCallDe
   let tenantName = 'the office';
   try {
     const tenantQuery = await env.SYSTEMIX
-      .prepare('SELECT company_name FROM tenants WHERE systemix_number = ?')
+      .prepare('SELECT company_name FROM tenants WHERE business_number = ?')
       .bind(toPhone || '')
       .first();
 

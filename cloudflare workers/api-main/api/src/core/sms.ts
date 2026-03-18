@@ -25,7 +25,10 @@ export async function sendTwilioSms(
     const body = `${content}${suffix}`;
 
     const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
-    const from = env.TWILIO_PHONE_NUMBER || env.SYSTEMIX_NUMBER;
+    const from = (env.TWILIO_PHONE_NUMBER || '').trim();
+    if (!from) {
+      throw new Error('TWILIO_PHONE_NUMBER is required for outbound SMS');
+    }
     const form = new URLSearchParams({
       To: to,
       From: from,
