@@ -14,6 +14,19 @@ type DatabaseEnv = {
   SYSTEMIX_NUMBER: string;
 };
 
+export async function sendBusinessWelcomeSms(
+  env: DatabaseEnv,
+  owner_phone_number: string,
+  business_number: string
+): Promise<void> {
+  await sendTwilioSms(
+    env,
+    owner_phone_number,
+    `Systemix is now active on your line (${business_number}). Any missed calls will now be captured and sent here. Text SYSTEMIX HELP for commands.`
+  );
+  console.log(`[D1] Welcome SMS sent to ${owner_phone_number}`);
+}
+
 export async function upsertBusiness(
   { business_number, owner_phone_number, display_name }: UpsertBusinessInput,
   env: DatabaseEnv
@@ -45,10 +58,5 @@ export async function upsertBusiness(
   await env.SYSTEMIX.prepare(sql).bind(business_number, owner_phone_number, display_name).run();
   console.log(`[D1] Business upserted: ${business_number}`);
 
-  await sendTwilioSms(
-    env,
-    owner_phone_number,
-    `Systemix is now active on your line (${business_number}). Any missed calls will now be captured and sent here. Text SYSTEMIX HELP for commands.`
-  );
-  console.log(`[D1] Welcome SMS sent to ${owner_phone_number}`);
+  await sendBusinessWelcomeSms(env, owner_phone_number, business_number);
 }

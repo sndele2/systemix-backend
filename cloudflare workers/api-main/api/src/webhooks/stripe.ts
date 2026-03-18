@@ -1,6 +1,6 @@
 import Stripe from 'stripe';
 import { Context } from 'hono';
-import { handleCheckoutCompleted, verifyStripeWebhook } from '../services/stripe';
+import { handleCheckoutCompleted, prepareCheckoutCompleted, verifyStripeWebhook } from '../services/stripe';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -29,10 +29,17 @@ export async function stripeWebhookHandler(c: Context<{ Bindings: Bindings }>) {
     return c.text('ok', 200);
   }
 
+  const session = event.data.object as Stripe.Checkout.Session;
   c.executionCtx.waitUntil(
-    handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session, c.env)
-      .then(() => console.log('[STRIPE] Onboard complete'))
-      .catch((error) => console.log('[STRIPE] Onboard failed: ', error))
+    (async () => {
+      const preparation = await prepareCheckoutCompleted(session, c.env);
+      if (!preparation.shouldProcess) {
+        return;
+      }
+
+      await handleCheckoutCompleted(session, c.env);
+      console.log('[STRIPE] Onboard complete');
+    })().catch((error) => console.log('[STRIPE] Onboard failed: ', error))
   );
 
   return c.text('ok', 200);

@@ -494,6 +494,7 @@ async function ensureSwitchboardSchema(env: Bindings): Promise<void> {
         business_number TEXT NOT NULL UNIQUE,
         owner_phone_number TEXT,
         display_name TEXT,
+        last_stripe_session_id TEXT,
         is_active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -522,6 +523,7 @@ async function ensureSwitchboardSchema(env: Bindings): Promise<void> {
       for (const statement of statements) {
         await getDb(env).prepare(statement).run();
       }
+      await maybeAddColumn('ALTER TABLE businesses ADD COLUMN last_stripe_session_id TEXT');
       await maybeAddColumn('ALTER TABLE active_sessions ADD COLUMN last_emergency_alert_at TEXT');
       await maybeAddColumn('ALTER TABLE active_sessions ADD COLUMN last_emergency_classification TEXT');
     })()
