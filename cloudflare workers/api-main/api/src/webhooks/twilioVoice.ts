@@ -1,5 +1,12 @@
 import { Context } from 'hono';
 import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
+import {
+  buildMissedCallVoiceHookMessage,
+  findBusinessByNumber,
+  normalizeCallStatus,
+  normalizePhone,
+  shouldFireMissedCallVoiceHook,
+} from '../services/twilioLaunch';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -16,7 +23,6 @@ type Bindings = {
 };
 
 const CALL_PROVIDER = 'twilio';
-const CUSTOMER_WELCOME_STATUSES = new Set(['completed', 'busy', 'no-answer']);
 const CUSTOMER_MISSED_STATUSES = new Set(['busy', 'no-answer']);
 
 function getDb(env: Bindings) {
@@ -37,10 +43,6 @@ function maskPhone(phone: string): string {
   const digits = phone.replace(/\D/g, '');
   if (digits.length <= 4) return '***';
   return `***${digits.slice(-4)}`;
-}
-
-function normalizeStatus(value: string | null): string {
-  return (value || '').trim().toLowerCase();
 }
 
 async function lookupBusinessNameByDialedNumber(env: Bindings, toPhone: string): Promise<string> {
@@ -238,12 +240,11 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
     const to = (formData.get('To') as string) || '';
     const rawStatus = ((formData.get('CallStatus') as string) || (formData.get('DialCallStatus') as string) || '')
       .trim();
-    const callStatus = normalizeStatus(rawStatus);
+    const callStatus = normalizeCallStatus(rawStatus);
     const callSid = ((formData.get('CallSid') as string) || '').trim();
     const parentCallSid = ((formData.get('ParentCallSid') as string) || '').trim();
 
-    // Handle call status callback on /voice and send customer SMS from this handler.
-    if (CUSTOMER_WELCOME_STATUSES.has(callStatus)) {
+    if (shouldFireMissedCallVoiceHook(callStatus, to)) {
       const providerCallId = callSid || parentCallSid;
       if (!providerCallId) {
         console.error('Customer SMS skipped in voice handler: missing call identifier', {
@@ -311,6 +312,16 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
         return c.json({ ok: true, deduped: true, status: callStatus }, 200);
       }
 
+      const normalizedBusinessNumber = normalizePhone(to);
+      const business = await findBusinessByNumber(getDb(env), normalizedBusinessNumber);
+      if (!business) {
+        await releaseCustomerWelcomeLock(env, providerCallId);
+        console.warn('[TWILIO] VOICE HOOK SKIPPED: business not found', {
+          business_number: normalizedBusinessNumber,
+        });
+        return c.json({ ok: true, skipped: true, reason: 'business_not_found' }, 200);
+      }
+
       const callerNumber = from.trim();
       const smsFrom = (env.TWILIO_PHONE_NUMBER || '').trim();
 
@@ -330,15 +341,12 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
         return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
       }
 
-      const businessName = await lookupBusinessNameByDialedNumber(env, to);
-      const customerMessage =
-        callStatus === 'completed'
-          ? `Hi, this is ${businessName}. We received your voicemail and will get back to you as soon as possible!`
-          : `Hi, this is ${businessName}. We're sorry we missed your call! Please leave a reply here and we'll get back to you shortly.`;
-
-      // Intentionally no caller-vs-business relationship check for test environments.
-      console.log('Sending Customer SMS to:', callerNumber);
-      const sms = await sendCustomerWelcomeSms(twilioClient, callerNumber, smsFrom, customerMessage);
+      const sms = await sendCustomerWelcomeSms(
+        twilioClient,
+        callerNumber,
+        smsFrom,
+        buildMissedCallVoiceHookMessage(business.display_name)
+      );
       if (!sms.ok) {
         await releaseCustomerWelcomeLock(env, providerCallId);
         return c.json({ ok: false, error: 'sms_failed', detail: sms.detail || 'unknown' }, 200);
@@ -356,7 +364,18 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
         .bind(CUSTOMER_MISSED_STATUSES.has(callStatus) ? 1 : 0, sms.sid || null, CALL_PROVIDER, providerCallId)
         .run();
 
+      console.log('[TWILIO] VOICE HOOK FIRED', {
+        caller_number: callerNumber,
+        business_number: business.business_number,
+        status: callStatus,
+        sid: sms.sid || null,
+      });
+
       return c.json({ ok: true, status: callStatus, messageSid: sms.sid || null }, 200);
+    }
+
+    if (rawStatus) {
+      return c.json({ ok: true, ignored: true, status: callStatus }, 200);
     }
 
     const baseUrl = new URL(c.req.url).origin;

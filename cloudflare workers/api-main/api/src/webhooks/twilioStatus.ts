@@ -1,5 +1,12 @@
 import { Context } from 'hono';
 import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
+import {
+  buildMissedCallVoiceHookMessage,
+  findBusinessByNumber,
+  normalizeCallStatus,
+  normalizePhone,
+  shouldFireMissedCallVoiceHook,
+} from '../services/twilioLaunch';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -10,13 +17,8 @@ type Bindings = {
   ENVIRONMENT?: string;
 };
 
-const CUSTOMER_WELCOME_STATUSES = new Set(['completed', 'busy', 'no-answer']);
 const MISSED_STATUSES = new Set(['busy', 'no-answer']);
 const CALL_PROVIDER = 'twilio';
-
-function normalizeStatus(value: string | null): string {
-  return (value || '').trim().toLowerCase();
-}
 
 function maskPhone(phone: string): string {
   if (!phone) return 'unknown';
@@ -67,57 +69,6 @@ function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
       return { ok: true, sid: payload.sid };
     },
   };
-}
-
-async function getBusinessName(env: Bindings, toPhone: string): Promise<string> {
-  const fallback = 'the office';
-  if (!toPhone) return fallback;
-
-  try {
-    const companyRow = await env.SYSTEMIX.prepare(
-      `
-      SELECT company_name
-      FROM tenants
-      WHERE business_number = ?
-      LIMIT 1
-      `
-    )
-      .bind(toPhone)
-      .first<{ company_name?: string }>();
-
-    if (companyRow?.company_name) {
-      return String(companyRow.company_name);
-    }
-  } catch (error) {
-    console.warn('Business name lookup via company_name failed', {
-      to: maskPhone(toPhone),
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  try {
-    const nameRow = await env.SYSTEMIX.prepare(
-      `
-      SELECT name
-      FROM tenants
-      WHERE business_number = ?
-      LIMIT 1
-      `
-    )
-      .bind(toPhone)
-      .first<{ name?: string }>();
-
-    if (nameRow?.name) {
-      return String(nameRow.name);
-    }
-  } catch (error) {
-    console.warn('Business name lookup via name failed', {
-      to: maskPhone(toPhone),
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-
-  return fallback;
 }
 
 async function sendMissedCallSms(
@@ -174,7 +125,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
     const fromPhone = (formData.get('From') as string) || '';
     const toPhone = (formData.get('To') as string) || '';
     const rawStatus = ((formData.get('CallStatus') as string) || (formData.get('DialCallStatus') as string) || '');
-    const status = normalizeStatus(rawStatus);
+    const status = normalizeCallStatus(rawStatus);
     const parentCallSid = (formData.get('ParentCallSid') as string) || '';
     const providerCallId = (callSid || parentCallSid || '').trim();
 
@@ -225,7 +176,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       )
       .run();
 
-    if (!CUSTOMER_WELCOME_STATUSES.has(status)) {
+    if (!shouldFireMissedCallVoiceHook(status, toPhone)) {
       return c.json({ ok: true, ignored: true, status }, 200);
     }
 
@@ -243,6 +194,16 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
 
     if (Number(lock.meta?.changes || 0) === 0) {
       return c.json({ ok: true, deduped: true, status }, 200);
+    }
+
+    const normalizedBusinessNumber = normalizePhone(toPhone);
+    const business = await findBusinessByNumber(env.SYSTEMIX, normalizedBusinessNumber);
+    if (!business) {
+      await releaseCustomerWelcomeLock(env, providerCallId);
+      console.warn('[TWILIO] VOICE HOOK SKIPPED: business not found', {
+        business_number: normalizedBusinessNumber,
+      });
+      return c.json({ ok: true, skipped: true, reason: 'business_not_found' }, 200);
     }
 
     const smsTo = (fromPhone || '').trim();
@@ -272,12 +233,12 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
     }
 
-    const businessName = await getBusinessName(env, toPhone);
-    const message =
-      status === 'completed'
-        ? `Hi, this is ${businessName}. We received your voicemail and will get back to you as soon as possible!`
-        : `Hi, this is ${businessName}. We're sorry we missed your call! Please leave a reply here and we'll get back to you shortly.`;
-    const sms = await sendMissedCallSms(twilioClient, smsTo, smsFrom, message);
+    const sms = await sendMissedCallSms(
+      twilioClient,
+      smsTo,
+      smsFrom,
+      buildMissedCallVoiceHookMessage(business.display_name)
+    );
     if (!sms.ok) {
       await releaseCustomerWelcomeLock(env, providerCallId);
       console.error('Missed call SMS failed', {
@@ -299,12 +260,11 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       .bind(MISSED_STATUSES.has(status) ? 1 : 0, sms.sid || null, CALL_PROVIDER, providerCallId)
       .run();
 
-    console.log('Customer welcome SMS sent', {
-      callSid: callSid || 'unknown',
+    console.log('[TWILIO] VOICE HOOK FIRED', {
+      caller_number: smsTo,
+      business_number: business.business_number,
       status,
-      reason: status === 'completed' ? 'completed' : 'missed_call',
-      to: maskPhone(fromPhone),
-      sid: sms.sid || 'unknown',
+      sid: sms.sid || null,
     });
 
     return c.json(

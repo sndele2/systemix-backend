@@ -6,6 +6,7 @@ import {
   classifyLeadIntent,
   type AiLeadClassification,
 } from '../services/openai';
+import { buildEmergencyPriorityMessage } from '../services/twilioLaunch';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -46,6 +47,7 @@ type TriageCoreResult = Omit<TriageResult, 'keywordMatcherMs' | 'gptClassifierMs
 type BusinessContext = {
   businessNumber: string;
   ownerPhone: string;
+  displayName: string;
 };
 
 type TwilioRestClient = {
@@ -62,8 +64,6 @@ const OWNER_THREAD_PREFIX = 'owner:';
 const LINE_STATE_SENTINEL = '__line_state__';
 const FORCED_HUBSPOT_SYNC_CUSTOMER = '+18443217137';
 const FORCED_HUBSPOT_SYNC_BUSINESS = '+18443217137';
-const CUSTOMER_EMERGENCY_CONFIRMATION =
-  'We have flagged this as an emergency and the team has been notified. Someone will be in contact with you shortly.';
 const ACTIVE_THREAD_NOTICE = 'NOTICE: You have multiple active threads. Use SWITCH {number} to switch.';
 const EMERGENCY_TIMEOUT_MESSAGE =
   'The team is currently on a job but has been notified of your emergency. They will contact you as soon as they are off the ladder.';
@@ -246,15 +246,18 @@ async function classifyCustomerMessage(messageBody: string, apiKey?: string): Pr
   const keywordMatcherMs = roundMs(nowMs() - keywordStartMs);
 
   if (emergencyHit) {
+    const gptStartMs = nowMs();
+    const emergencySummary = await classifyLeadIntent(messageBody, apiKey);
+    const gptClassifierMs = roundMs(nowMs() - gptStartMs);
     return {
       classification: 'emergency',
       aiClassification: 'emergency',
-      summary: buildLeadSummary('emergency', messageBody),
+      summary: emergencySummary.summary,
       confidence: 'high',
-      source: 'keyword_emergency',
-      gptUsed: false,
+      source: emergencySummary.source === 'gpt_fallback' ? 'gpt_fallback' : 'keyword_emergency',
+      gptUsed: emergencySummary.gptUsed,
       keywordMatcherMs,
-      gptClassifierMs: 0,
+      gptClassifierMs,
     };
   }
 
@@ -569,7 +572,7 @@ async function resolveBusinessContext(env: Bindings, toPhone: string): Promise<B
   const businessRow = await getDb(env)
     .prepare(
       `
-      SELECT business_number, owner_phone_number
+      SELECT business_number, owner_phone_number, display_name
       FROM businesses
       WHERE business_number = ?
         AND is_active = 1
@@ -577,7 +580,7 @@ async function resolveBusinessContext(env: Bindings, toPhone: string): Promise<B
     `
     )
     .bind(normalizedTo)
-    .first<{ business_number?: string; owner_phone_number?: string | null }>();
+    .first<{ business_number?: string; owner_phone_number?: string | null; display_name?: string | null }>();
 
   if (!businessRow?.business_number) {
     return null;
@@ -586,6 +589,7 @@ async function resolveBusinessContext(env: Bindings, toPhone: string): Promise<B
   return {
     businessNumber: normalizePhone(businessRow.business_number) || normalizedTo,
     ownerPhone: normalizePhone(businessRow.owner_phone_number || ''),
+    displayName: (businessRow.display_name || '').trim(),
   };
 }
 
@@ -1605,6 +1609,7 @@ async function handleCustomerInbound(input: {
   twilioClient: TwilioRestClient;
   businessNumber: string;
   ownerPhone: string;
+  displayName: string;
   customerNumber: string;
   body: string;
   providerMessageId: string;
@@ -1834,10 +1839,11 @@ async function handleCustomerInbound(input: {
     },
   });
 
+  const emergencyCustomerMessage = buildEmergencyPriorityMessage(triage.summary, input.displayName);
   const customerReply = await input.twilioClient.sendSms({
     toPhone: input.customerNumber,
     fromPhone: input.businessNumber,
-    body: CUSTOMER_EMERGENCY_CONFIRMATION,
+    body: emergencyCustomerMessage,
   });
 
   if (!customerReply.ok) {
@@ -1857,11 +1863,9 @@ async function handleCustomerInbound(input: {
     };
   }
 
-  console.log('[TWILIO] CUSTOMER CONFIRMATION', {
+  console.log('[TWILIO] EMERGENCY SMS SENT', {
     sid: customerReply.sid || null,
-    to: maskPhone(input.customerNumber),
-    from: maskPhone(input.businessNumber),
-    classification: triage.aiClassification,
+    customer_number: input.customerNumber,
     summary: triage.summary,
   });
 
@@ -1870,7 +1874,7 @@ async function handleCustomerInbound(input: {
     customerReply.sid || '',
     input.businessNumber,
     input.customerNumber,
-    CUSTOMER_EMERGENCY_CONFIRMATION,
+    emergencyCustomerMessage,
     JSON.stringify({
       source: 'customer_emergency_confirmation',
       inboundClassification,
@@ -1885,12 +1889,14 @@ async function handleCustomerInbound(input: {
     direction: 'outbound',
     fromNumber: input.businessNumber,
     toNumber: input.customerNumber,
-    messageBody: CUSTOMER_EMERGENCY_CONFIRMATION,
+    messageBody: emergencyCustomerMessage,
     classification: inboundClassification,
     confidence: triage.confidence,
     metadata: {
       target: 'customer_confirmation',
       deduped: isDeduped,
+      summary: triage.summary,
+      displayName: input.displayName || null,
     },
   });
 
@@ -2329,6 +2335,7 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
       twilioClient,
       businessNumber: resolvedBusinessNumber,
       ownerPhone,
+      displayName: businessContext.displayName,
       customerNumber: inboundFrom,
       body,
       providerMessageId,

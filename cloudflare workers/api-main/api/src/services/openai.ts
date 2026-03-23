@@ -131,7 +131,7 @@ export async function classifyLeadIntent(
           {
             role: 'system',
             content:
-              'Classify inbound home-service SMS leads. Return only strict JSON that exactly matches this schema: {"classification":"emergency"|"inquiry"|"spam","summary":string,"confidence":"high"|"low"}. The summary must be exactly one sentence describing the customer intent with no extra keys or commentary.',
+              'Classify inbound home-service SMS leads. Return only strict JSON that exactly matches this schema: {"classification":"emergency"|"inquiry"|"spam","summary":string,"confidence":"high"|"low"}. Return a one-sentence summary of the customer\'s issue in plain language suitable for a business owner to read at a glance. The summary must be exactly one sentence with no extra keys or commentary.',
           },
           {
             role: 'user',
