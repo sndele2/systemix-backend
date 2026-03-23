@@ -1,6 +1,11 @@
 import { Context } from 'hono';
 import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
 import { syncToHubspot as syncHubspotContact } from '../services/hubspot';
+import {
+  buildLeadSummary,
+  classifyLeadIntent,
+  type AiLeadClassification,
+} from '../services/openai';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -27,6 +32,8 @@ type TriageLabel =
 
 type TriageResult = {
   classification: 'emergency' | 'standard';
+  aiClassification: AiLeadClassification;
+  summary: string;
   confidence: Exclude<Confidence, null>;
   source: 'keyword_emergency' | 'keyword_standard' | 'gpt' | 'gpt_fallback';
   gptUsed: boolean;
@@ -218,105 +225,17 @@ function isClearStandardMessage(messageBody: string): boolean {
   return false;
 }
 
-function parseGptJson(content: string): { classification?: string; confidence?: string } | null {
-  const trimmed = content.trim();
-  if (!trimmed) return null;
-
-  try {
-    return JSON.parse(trimmed) as { classification?: string; confidence?: string };
-  } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-
-    try {
-      return JSON.parse(match[0]) as { classification?: string; confidence?: string };
-    } catch {
-      return null;
-    }
-  }
-}
-
 async function classifyAmbiguousWithGpt(messageBody: string, apiKey?: string): Promise<TriageCoreResult> {
-  if (!apiKey) {
-    return {
-      classification: 'emergency',
-      confidence: 'low',
-      source: 'gpt_fallback',
-      gptUsed: false,
-    };
-  }
+  const aiResult = await classifyLeadIntent(messageBody, apiKey);
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
-
-  try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: 0,
-        max_tokens: 80,
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Classify inbound home-service SMS as emergency or standard. Return only strict JSON with keys classification and confidence. Confidence must be high or low.',
-          },
-          {
-            role: 'user',
-            content: `Message: ${messageBody}`,
-          },
-        ],
-      }),
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const detail = await response.text();
-      console.error('GPT emergency classifier failed', {
-        status: response.status,
-        detail,
-      });
-      return {
-        classification: 'emergency',
-        confidence: 'low',
-        source: 'gpt_fallback',
-        gptUsed: true,
-      };
-    }
-
-    const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | null } }>;
-    };
-    const content = payload.choices?.[0]?.message?.content || '';
-    const parsed = parseGptJson(content);
-    const classification = parsed?.classification === 'standard' ? 'standard' : 'emergency';
-    const confidence = parsed?.confidence === 'high' ? 'high' : 'low';
-
-    return {
-      classification,
-      confidence,
-      source: 'gpt',
-      gptUsed: true,
-    };
-  } catch (error) {
-    console.error('GPT emergency classifier error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return {
-      classification: 'emergency',
-      confidence: 'low',
-      source: 'gpt_fallback',
-      gptUsed: true,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
+  return {
+    classification: aiResult.classification === 'emergency' ? 'emergency' : 'standard',
+    aiClassification: aiResult.classification,
+    summary: aiResult.summary,
+    confidence: aiResult.confidence,
+    source: aiResult.source,
+    gptUsed: aiResult.gptUsed,
+  };
 }
 
 async function classifyCustomerMessage(messageBody: string, apiKey?: string): Promise<TriageResult> {
@@ -329,6 +248,8 @@ async function classifyCustomerMessage(messageBody: string, apiKey?: string): Pr
   if (emergencyHit) {
     return {
       classification: 'emergency',
+      aiClassification: 'emergency',
+      summary: buildLeadSummary('emergency', messageBody),
       confidence: 'high',
       source: 'keyword_emergency',
       gptUsed: false,
@@ -340,6 +261,8 @@ async function classifyCustomerMessage(messageBody: string, apiKey?: string): Pr
   if (clearStandardHit) {
     return {
       classification: 'standard',
+      aiClassification: 'inquiry',
+      summary: buildLeadSummary('inquiry', messageBody),
       confidence: 'high',
       source: 'keyword_standard',
       gptUsed: false,
@@ -1660,11 +1583,11 @@ async function syncLeadToHubspot(input: {
   env: Bindings;
   businessNumber: string;
   customerNumber: string;
-  body: string;
-  classification: 'emergency' | 'standard';
+  summary: string;
+  classification: AiLeadClassification;
 }): Promise<{ synced: boolean; reason?: string }> {
   try {
-    await syncHubspotContact(input.customerNumber, input.classification, input.body, input.env);
+    await syncHubspotContact(input.customerNumber, input.classification, input.summary, input.env);
 
     return { synced: true };
   } catch (error) {
@@ -1689,7 +1612,9 @@ async function handleCustomerInbound(input: {
 }): Promise<{
   ok: boolean;
   mode: 'customer_analysis';
-  classification: TriageLabel;
+  routingClassification: TriageLabel;
+  aiClassification: AiLeadClassification;
+  summary: string;
   confidence: Confidence;
   gptUsed: boolean;
   customerReplySid?: string | null;
@@ -1705,7 +1630,9 @@ async function handleCustomerInbound(input: {
     keywordMatcherMs: triage.keywordMatcherMs,
     gptClassifierMs: triage.gptClassifierMs,
     gptUsed: triage.gptUsed,
-    classification: triage.classification,
+    classification: triage.aiClassification,
+    routingClassification: triage.classification,
+    summary: triage.summary,
     confidence: triage.confidence,
   });
 
@@ -1721,14 +1648,14 @@ async function handleCustomerInbound(input: {
 
   const syncToHubspot = async (
     customerPhone: string,
-    classification: 'emergency' | 'standard',
-    gptSummary: string
+    classification: AiLeadClassification,
+    summary: string
   ): Promise<void> => {
     const result = await syncLeadToHubspot({
       env: input.env,
       businessNumber: input.businessNumber,
       customerNumber: customerPhone,
-      body: gptSummary,
+      summary,
       classification,
     });
     if (!result.synced) {
@@ -1736,18 +1663,17 @@ async function handleCustomerInbound(input: {
     }
   };
 
-  const queueHubspotSync = (classification: 'emergency' | 'standard') => {
+  const queueHubspotSync = (classification: AiLeadClassification, summary: string) => {
     const customerPhone = input.customerNumber;
-    const gptSummary = input.body;
 
     if (input.executionCtx?.waitUntil) {
       input.executionCtx.waitUntil(
-        syncToHubspot(customerPhone, classification, gptSummary)
+        syncToHubspot(customerPhone, classification, summary)
           .then(() => console.log('[HUBSPOT] SUCCESS'))
           .catch((error) => console.log('[HUBSPOT] FAILED: ', error))
       );
     } else {
-      void syncToHubspot(customerPhone, classification, gptSummary)
+      void syncToHubspot(customerPhone, classification, summary)
         .then(() => console.log('[HUBSPOT] SUCCESS'))
         .catch((error) => console.log('[HUBSPOT] FAILED: ', error));
     }
@@ -1766,6 +1692,8 @@ async function handleCustomerInbound(input: {
       confidence: triage.confidence,
       metadata: {
         source: triage.source,
+        aiClassification: triage.aiClassification,
+        summary: triage.summary,
         gptUsed: triage.gptUsed,
         keywordMatcherMs: triage.keywordMatcherMs,
         gptClassifierMs: triage.gptClassifierMs,
@@ -1776,7 +1704,9 @@ async function handleCustomerInbound(input: {
       return {
         ok: false,
         mode: 'customer_analysis',
-        classification: 'standard',
+        routingClassification: 'standard',
+        aiClassification: triage.aiClassification,
+        summary: triage.summary,
         confidence: triage.confidence,
         gptUsed: triage.gptUsed,
       };
@@ -1790,7 +1720,9 @@ async function handleCustomerInbound(input: {
       return {
         ok: true,
         mode: 'customer_analysis',
-        classification: 'standard',
+        routingClassification: 'standard',
+        aiClassification: triage.aiClassification,
+        summary: triage.summary,
         confidence: triage.confidence,
         gptUsed: triage.gptUsed,
         ownerAlertSid: null,
@@ -1813,13 +1745,23 @@ async function handleCustomerInbound(input: {
       return {
         ok: false,
         mode: 'customer_analysis',
-        classification: 'standard',
+        routingClassification: 'standard',
+        aiClassification: triage.aiClassification,
+        summary: triage.summary,
         confidence: triage.confidence,
         gptUsed: triage.gptUsed,
       };
     }
 
-    queueHubspotSync('standard');
+    console.log('[TWILIO] OWNER ALERT', {
+      sid: ownerSms.sid || null,
+      to: maskPhone(input.ownerPhone),
+      from: maskPhone(input.businessNumber),
+      classification: triage.aiClassification,
+      summary: triage.summary,
+    });
+
+    queueHubspotSync(triage.aiClassification, triage.summary);
 
     await saveOutboundSms(
       input.env,
@@ -1845,6 +1787,8 @@ async function handleCustomerInbound(input: {
       confidence: triage.confidence,
       metadata: {
         source: 'existing_standard_auto_reply_logic',
+        aiClassification: triage.aiClassification,
+        summary: triage.summary,
         keywordMatcherMs: triage.keywordMatcherMs,
         gptClassifierMs: triage.gptClassifierMs,
       },
@@ -1853,7 +1797,9 @@ async function handleCustomerInbound(input: {
     return {
       ok: true,
       mode: 'customer_analysis',
-      classification: 'standard',
+      routingClassification: 'standard',
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
       ownerAlertSid: ownerSms.sid || null,
@@ -1879,6 +1825,8 @@ async function handleCustomerInbound(input: {
     confidence: triage.confidence,
     metadata: {
       source: triage.source,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       gptUsed: triage.gptUsed,
       deduped: isDeduped,
       keywordMatcherMs: triage.keywordMatcherMs,
@@ -1901,11 +1849,21 @@ async function handleCustomerInbound(input: {
     return {
       ok: false,
       mode: 'customer_analysis',
-      classification: inboundClassification,
+      routingClassification: inboundClassification,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
     };
   }
+
+  console.log('[TWILIO] CUSTOMER CONFIRMATION', {
+    sid: customerReply.sid || null,
+    to: maskPhone(input.customerNumber),
+    from: maskPhone(input.businessNumber),
+    classification: triage.aiClassification,
+    summary: triage.summary,
+  });
 
   await saveOutboundSms(
     input.env,
@@ -1940,7 +1898,9 @@ async function handleCustomerInbound(input: {
     return {
       ok: true,
       mode: 'customer_analysis',
-      classification: inboundClassification,
+      routingClassification: inboundClassification,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
       customerReplySid: customerReply.sid || null,
@@ -1951,7 +1911,9 @@ async function handleCustomerInbound(input: {
     return {
       ok: false,
       mode: 'customer_analysis',
-      classification: inboundClassification,
+      routingClassification: inboundClassification,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
       customerReplySid: customerReply.sid || null,
@@ -1980,7 +1942,9 @@ async function handleCustomerInbound(input: {
     return {
       ok: true,
       mode: 'customer_analysis',
-      classification: inboundClassification,
+      routingClassification: inboundClassification,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
       customerReplySid: customerReply.sid || null,
@@ -2003,14 +1967,24 @@ async function handleCustomerInbound(input: {
     return {
       ok: false,
       mode: 'customer_analysis',
-      classification: inboundClassification,
+      routingClassification: inboundClassification,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
       customerReplySid: customerReply.sid || null,
     };
   }
 
-  queueHubspotSync('emergency');
+  console.log('[TWILIO] OWNER ALERT', {
+    sid: ownerAlert.sid || null,
+    to: maskPhone(input.ownerPhone),
+    from: maskPhone(input.businessNumber),
+    classification: triage.aiClassification,
+    summary: triage.summary,
+  });
+
+  queueHubspotSync(triage.aiClassification, triage.summary);
 
   await saveOutboundSms(
     input.env,
@@ -2041,6 +2015,8 @@ async function handleCustomerInbound(input: {
     metadata: {
       source: 'owner_emergency_alert',
       hasMultipleActiveThreads,
+      aiClassification: triage.aiClassification,
+      summary: triage.summary,
       keywordMatcherMs: triage.keywordMatcherMs,
       gptClassifierMs: triage.gptClassifierMs,
     },
@@ -2051,7 +2027,9 @@ async function handleCustomerInbound(input: {
   return {
     ok: true,
     mode: 'customer_analysis',
-    classification: inboundClassification,
+    routingClassification: inboundClassification,
+    aiClassification: triage.aiClassification,
+    summary: triage.summary,
     confidence: triage.confidence,
     gptUsed: triage.gptUsed,
     customerReplySid: customerReply.sid || null,
@@ -2260,8 +2238,8 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
           env: c.env,
           businessNumber: resolvedBusinessNumber,
           customerNumber: inboundFrom,
-          body,
-          classification: 'standard',
+          summary: buildLeadSummary('inquiry', body),
+          classification: 'inquiry',
         })
           .then((result) => {
             if (!result.synced) {
@@ -2365,7 +2343,9 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
       {
         ok: true,
         mode: customerResult.mode,
-        classification: customerResult.classification,
+        classification: customerResult.aiClassification,
+        routingClassification: customerResult.routingClassification,
+        summary: customerResult.summary,
         confidence: customerResult.confidence,
         gptUsed: customerResult.gptUsed,
         customerReplySid: customerResult.customerReplySid || null,
