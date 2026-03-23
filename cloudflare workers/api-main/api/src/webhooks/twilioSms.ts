@@ -53,7 +53,7 @@ const ACTIVE_THREAD_WINDOW_MS = 5 * 60 * 1000;
 const MAX_SMS_BODY = 1500;
 const OWNER_THREAD_PREFIX = 'owner:';
 const LINE_STATE_SENTINEL = '__line_state__';
-const FORCED_HUBSPOT_SYNC_CUSTOMER = '+17014282455';
+const FORCED_HUBSPOT_SYNC_CUSTOMER = '+18443217137';
 const FORCED_HUBSPOT_SYNC_BUSINESS = '+18443217137';
 const CUSTOMER_EMERGENCY_CONFIRMATION =
   'We have flagged this as an emergency and the team has been notified. Someone will be in contact with you shortly.';
@@ -500,6 +500,10 @@ async function ensureSwitchboardSchema(env: Bindings): Promise<void> {
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
       )`,
       'CREATE INDEX IF NOT EXISTS idx_businesses_business_number ON businesses(business_number)',
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_businesses_last_stripe_session_id_unique
+       ON businesses(last_stripe_session_id)
+       WHERE last_stripe_session_id IS NOT NULL
+         AND last_stripe_session_id != ''`,
       `CREATE TABLE IF NOT EXISTS active_sessions (
         id TEXT PRIMARY KEY,
         business_number TEXT NOT NULL,

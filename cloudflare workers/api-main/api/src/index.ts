@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { twilioVoiceHandler, twilioRecordingHandler } from './webhooks/twilioVoice';
 import { checkEmergencyTimeouts, twilioSmsHandler } from './webhooks/twilioSms';
 import { twilioStatusHandler } from './webhooks/twilioStatus';
@@ -28,6 +28,17 @@ type Bindings = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
+
+const productionOnlyStripeWebhookHandler = async (c: Context<{ Bindings: Bindings }>) => {
+  if (c.env.ENVIRONMENT !== 'production') {
+    console.log('[STRIPE] Webhook route disabled outside production', {
+      environment: c.env.ENVIRONMENT ?? 'unset',
+    });
+    return c.text('Not found', 404);
+  }
+
+  return stripeWebhookHandler(c);
+};
 
 app.get('/health', (c) => c.json({ status: 'ok' }));
 
@@ -87,8 +98,8 @@ app.post('/status', twilioStatusHandler);
 app.post('/v1/webhooks/twilio/sms', twilioSmsHandler);
 
 // Stripe webhook: create HubSpot company on completed checkout.
-app.post('/v1/webhooks/stripe', stripeWebhookHandler);
-app.post('/webhooks/stripe', stripeWebhookHandler);
+app.post('/v1/webhooks/stripe', productionOnlyStripeWebhookHandler);
+app.post('/webhooks/stripe', productionOnlyStripeWebhookHandler);
 
 // Testing endpoint (disabled in production in handler).
 app.post('/test/simulate-callback', simulateCallbackHandler);

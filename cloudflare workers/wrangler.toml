@@ -29,6 +29,27 @@ preview_id = "d8bd5be6e38d4fa7ba794587c5cff08c"
 VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."
 TWILIO_SIGNATURE_MODE = "log"
 ENVIRONMENT = "production"
+SYSTEMIX_NUMBER = "+18443217137"
+
+[env.production]
+name = "systemix-backend"
+
+[env.production.vars]
+VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."
+TWILIO_SIGNATURE_MODE = "log"
+ENVIRONMENT = "production"
+SYSTEMIX_NUMBER = "+18443217137"
+
+[[env.production.d1_databases]]
+binding = "SYSTEMIX"
+migrations_dir = "api-main/api/migrations"
+database_name = "systemix"
+database_id = "b6573bdd-c88d-4480-a882-745fb10177c7"
+
+[[env.production.kv_namespaces]]
+binding = "SYSTEMIX_KV"
+id = "8daf7908b2534de989c486d3e98f5216"
+preview_id = "d8bd5be6e38d4fa7ba794587c5cff08c"
 
 [env.dev]
 name = "systemix-backend-dev"

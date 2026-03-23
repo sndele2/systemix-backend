@@ -4,13 +4,12 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import Stripe from 'stripe';
 
-const PRICE_ID = 'price_1TAbXB6pK2eA6wDcXI1Rb1fU';
-
-const METADATA = {
-  business_number: '+18443217137',
-  owner_phone_number: '+12179912895',
-  display_name: 'Systemix Test Business',
-} as const;
+type ParsedArgs = {
+  priceId: string;
+  businessNumber: string;
+  ownerPhoneNumber: string;
+  displayName: string;
+};
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const envCandidates = [
@@ -65,30 +64,80 @@ function readEnvVar(name: string): string | undefined {
   return undefined;
 }
 
-async function main() {
-  const secretKey = readEnvVar('STRIPE_SECRET_KEY');
-  if (!secretKey) {
+function parseArgs(argv: string[]): ParsedArgs {
+  const values = new Map<string, string>();
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith('--')) {
+      throw new Error(`Unexpected argument: ${token}`);
+    }
+
+    const key = token.slice(2);
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) {
+      throw new Error(`Missing value for --${key}`);
+    }
+
+    values.set(key, value.trim());
+    index += 1;
+  }
+
+  const priceId = values.get('price-id') || '';
+  const businessNumber = values.get('business-number') || '';
+  const ownerPhoneNumber = values.get('owner-phone-number') || '';
+  const displayName = values.get('display-name') || '';
+
+  if (!priceId || !businessNumber || !ownerPhoneNumber || !displayName) {
     throw new Error(
-      'Missing STRIPE_SECRET_KEY. Set it in the environment or in a local .dev.vars file.'
+      'Usage: npm run create-payment-link -- --price-id <price_id> --business-number <E164> --owner-phone-number <E164> --display-name "<name>"'
     );
   }
 
+  return {
+    priceId,
+    businessNumber,
+    ownerPhoneNumber,
+    displayName,
+  };
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const secretKey = readEnvVar('STRIPE_SECRET_KEY');
+  if (!secretKey) {
+    throw new Error('Missing STRIPE_SECRET_KEY.');
+  }
+
+  if (!secretKey.startsWith('sk_live_')) {
+    throw new Error('STRIPE_SECRET_KEY must be a live Stripe secret key.');
+  }
+
   const stripe = new Stripe(secretKey);
+  const metadata = {
+    business_number: args.businessNumber,
+    owner_phone_number: args.ownerPhoneNumber,
+    display_name: args.displayName,
+  };
 
   const paymentLink = await stripe.paymentLinks.create({
     line_items: [
       {
-        price: PRICE_ID,
+        price: args.priceId,
         quantity: 1,
       },
     ],
-    metadata: METADATA,
+    metadata,
     subscription_data: {
-      metadata: METADATA,
+      metadata,
     },
   });
 
-  console.log(`Payment Link URL: ${paymentLink.url}`);
+  if (!paymentLink.url.startsWith('https://buy.stripe.com/')) {
+    throw new Error(`Unexpected Stripe payment link URL: ${paymentLink.url}`);
+  }
+
+  console.log(paymentLink.url);
 }
 
 main().catch((error: unknown) => {

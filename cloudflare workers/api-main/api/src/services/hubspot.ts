@@ -1,5 +1,3 @@
-declare const process: { env?: Record<string, string | undefined> } | undefined;
-
 type HubSpotApiResult<T> = {
   id?: string;
   results?: T[];
@@ -17,9 +15,14 @@ type CreateCompanyInput = {
   stripeSubscriptionId?: string;
 };
 
+type UpsertContactInput = {
+  phone: string;
+  accessToken?: string;
+  properties?: Record<string, string | undefined>;
+};
+
 function resolveHubSpotAccessToken(accessToken?: string): string {
-  const tokenFromProcess = typeof process !== 'undefined' ? process.env?.HUBSPOT_ACCESS_TOKEN : undefined;
-  return (accessToken || tokenFromProcess || '').trim();
+  return (accessToken || '').trim();
 }
 
 function getHubSpotHeaders(accessToken: string): Record<string, string> {
@@ -43,7 +46,8 @@ async function hubspotRequest<T>(path: string, init: RequestInit, accessToken: s
     throw new Error(`hubspot_${response.status}:${detail}`);
   }
 
-  return (await response.json()) as T;
+  const body = await response.text();
+  return (body ? (JSON.parse(body) as T) : undefined) as T;
 }
 
 function isMissingPropertyError(message: string): boolean {
@@ -61,7 +65,7 @@ async function saveContact(
   existingContactId: string | undefined,
   properties: Record<string, string>,
   hubspotToken: string
-): Promise<void> {
+): Promise<string> {
   const response = await fetch(existingContactId ? `${baseUrl}/${existingContactId}` : baseUrl, {
     method: existingContactId ? 'PATCH' : 'POST',
     headers: getHubSpotHeaders(hubspotToken),
@@ -72,6 +76,77 @@ async function saveContact(
     const detail = await response.text();
     throw new Error(`hubspot_${response.status}:${detail}`);
   }
+
+  const body = await response.text();
+  const result = body ? ((JSON.parse(body) as HubSpotApiResult<unknown>) || {}) : {};
+  const savedContactId = existingContactId || result.id;
+
+  if (!savedContactId) {
+    throw new Error('hubspot_contact_save_missing_id');
+  }
+
+  return String(savedContactId);
+}
+
+function normalizeProperties(
+  properties: Record<string, string | undefined>
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(properties).filter((entry): entry is [string, string] => {
+      const value = entry[1];
+      return typeof value === 'string' && value.trim().length > 0;
+    })
+  );
+}
+
+async function findContactByPhone(phone: string, hubspotToken: string): Promise<HubSpotContact | undefined> {
+  const baseUrl = 'https://api.hubapi.com/crm/v3/objects/contacts';
+  const searchRes = await fetch(`${baseUrl}/search`, {
+    method: 'POST',
+    headers: getHubSpotHeaders(hubspotToken),
+    body: JSON.stringify({
+      filterGroups: [
+        {
+          filters: [
+            {
+              propertyName: 'phone',
+              operator: 'EQ',
+              value: phone,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  if (!searchRes.ok) {
+    const detail = await searchRes.text();
+    throw new Error(`hubspot_${searchRes.status}:${detail}`);
+  }
+
+  const searchData = (await searchRes.json()) as HubSpotApiResult<HubSpotContact>;
+  return searchData.results?.[0];
+}
+
+export async function upsertHubSpotContactByPhone(input: UpsertContactInput): Promise<string> {
+  const hubspotToken = resolveHubSpotAccessToken(input.accessToken);
+  if (!hubspotToken) {
+    throw new Error('missing_hubspot_access_token');
+  }
+
+  const baseUrl = 'https://api.hubapi.com/crm/v3/objects/contacts';
+  const phone = input.phone.trim();
+  if (!phone) {
+    throw new Error('missing_hubspot_contact_phone');
+  }
+
+  const existingContact = await findContactByPhone(phone, hubspotToken);
+  const properties = normalizeProperties({
+    phone,
+    ...(input.properties || {}),
+  });
+
+  return saveContact(baseUrl, existingContact?.id, properties, hubspotToken);
 }
 
 export async function syncToHubspot(
@@ -86,31 +161,7 @@ export async function syncToHubspot(
   }
 
   const baseUrl = 'https://api.hubapi.com/crm/v3/objects/contacts';
-  const searchRes = await fetch(`${baseUrl}/search`, {
-    method: 'POST',
-    headers: getHubSpotHeaders(hubspotToken),
-    body: JSON.stringify({
-      filterGroups: [
-        {
-          filters: [
-            {
-              propertyName: 'phone',
-              operator: 'EQ',
-              value: customerPhone,
-            },
-          ],
-        },
-      ],
-    }),
-  });
-
-  if (!searchRes.ok) {
-    const detail = await searchRes.text();
-    throw new Error(`hubspot_${searchRes.status}:${detail}`);
-  }
-
-  const searchData = (await searchRes.json()) as HubSpotApiResult<HubSpotContact>;
-  const existingContact = searchData.results?.[0];
+  const existingContact = await findContactByPhone(customerPhone, hubspotToken);
 
   const properties = {
     phone: customerPhone,
@@ -136,6 +187,25 @@ export async function syncToHubspot(
       hubspotToken
     );
   }
+}
+
+export async function associateContactToCompany(
+  contactId: string,
+  companyId: string,
+  accessToken?: string
+): Promise<void> {
+  const hubspotToken = resolveHubSpotAccessToken(accessToken);
+  if (!hubspotToken) {
+    throw new Error('missing_hubspot_access_token');
+  }
+
+  await hubspotRequest<void>(
+    `/crm/v4/objects/0-1/${encodeURIComponent(contactId)}/associations/default/0-2/${encodeURIComponent(companyId)}`,
+    {
+      method: 'PUT',
+    },
+    hubspotToken
+  );
 }
 
 export async function createHubSpotCompany(input: CreateCompanyInput): Promise<string> {
@@ -171,4 +241,19 @@ export async function createHubSpotCompany(input: CreateCompanyInput): Promise<s
   }
 
   return String(result.id);
+}
+
+export async function deleteHubSpotCompany(companyId: string, accessToken?: string): Promise<void> {
+  const hubspotToken = resolveHubSpotAccessToken(accessToken);
+  if (!hubspotToken) {
+    throw new Error('missing_hubspot_access_token');
+  }
+
+  await hubspotRequest<void>(
+    `/crm/v3/objects/companies/${encodeURIComponent(companyId)}`,
+    {
+      method: 'DELETE',
+    },
+    hubspotToken
+  );
 }
