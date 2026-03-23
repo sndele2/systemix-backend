@@ -69,6 +69,13 @@ function normalizeClassification(value: unknown): AiLeadClassification | null {
   return null;
 }
 
+function coerceClassificationForConfidence(
+  classification: AiLeadClassification,
+  confidence: AiLeadConfidence
+): AiLeadClassification {
+  return confidence === 'low' ? 'emergency' : classification;
+}
+
 export function buildLeadSummary(
   classification: AiLeadClassification,
   messageBody: string
@@ -95,9 +102,10 @@ function buildFallbackResult(
   messageBody: string,
   gptUsed: boolean
 ): AiLeadClassificationResult {
+  const coercedClassification = coerceClassificationForConfidence(classification, 'low');
   return {
-    classification,
-    summary: buildLeadSummary(classification, messageBody),
+    classification: coercedClassification,
+    summary: buildLeadSummary(coercedClassification, messageBody),
     confidence: 'low',
     source: 'gpt_fallback',
     gptUsed,
@@ -157,16 +165,10 @@ export async function classifyLeadIntent(
     const content = payload.choices?.[0]?.message?.content || '';
     const parsed = extractJsonObject(content) as Record<string, unknown> | null;
 
-    const classification = normalizeClassification(parsed?.classification);
-    const confidence = parsed?.confidence === 'high' ? 'high' : 'low';
-    const summary = ensureSentence(
-      typeof parsed?.summary === 'string' ? parsed.summary : buildLeadSummary(classification || 'emergency', messageBody)
-    );
-
     const result = OPENAI_RESPONSE_SCHEMA.safeParse({
-      classification: classification || 'emergency',
-      summary,
-      confidence,
+      classification: normalizeClassification(parsed?.classification),
+      summary: typeof parsed?.summary === 'string' ? ensureSentence(parsed.summary) : parsed?.summary,
+      confidence: parsed?.confidence,
     });
 
     if (!result.success) {
@@ -174,11 +176,17 @@ export async function classifyLeadIntent(
         issues: result.error.issues,
         content,
       });
-      return buildFallbackResult(classification || 'emergency', messageBody, true);
+      return buildFallbackResult('emergency', messageBody, true);
     }
+
+    const classification = coerceClassificationForConfidence(
+      result.data.classification,
+      result.data.confidence
+    );
 
     return {
       ...result.data,
+      classification,
       source: 'gpt',
       gptUsed: true,
     };

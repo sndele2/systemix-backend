@@ -6,7 +6,12 @@ import {
   classifyLeadIntent,
   type AiLeadClassification,
 } from '../services/openai';
-import { buildEmergencyPriorityMessage } from '../services/twilioLaunch';
+import {
+  buildEmergencyPriorityMessage,
+  buildOwnerAlertMessage,
+  scheduleTwilioBackgroundTask,
+} from '../services/twilioLaunch';
+import { prepareCustomerFacingSmsBody } from '../services/smsCompliance';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -1480,7 +1485,12 @@ async function handleOwnerRelay(input: {
   const forwarded = await input.twilioClient.sendSms({
     toPhone: recipient,
     fromPhone: input.businessNumber,
-    body: sanitizeForSms(forwardBody),
+    body: await prepareCustomerFacingSmsBody(
+      input.env.SYSTEMIX,
+      input.businessNumber,
+      recipient,
+      sanitizeForSms(forwardBody)
+    ),
   });
 
   if (!forwarded.ok) {
@@ -1671,17 +1681,13 @@ async function handleCustomerInbound(input: {
   const queueHubspotSync = (classification: AiLeadClassification, summary: string) => {
     const customerPhone = input.customerNumber;
 
-    if (input.executionCtx?.waitUntil) {
-      input.executionCtx.waitUntil(
-        syncToHubspot(customerPhone, classification, summary)
-          .then(() => console.log('[HUBSPOT] SUCCESS'))
-          .catch((error) => console.log('[HUBSPOT] FAILED: ', error))
-      );
-    } else {
-      void syncToHubspot(customerPhone, classification, summary)
-        .then(() => console.log('[HUBSPOT] SUCCESS'))
-        .catch((error) => console.log('[HUBSPOT] FAILED: ', error));
-    }
+    scheduleTwilioBackgroundTask(
+      input.executionCtx,
+      'HubSpot sync',
+      syncToHubspot(customerPhone, classification, summary).then(() => {
+        console.log('[HUBSPOT] SUCCESS');
+      })
+    );
   };
 
   if (triage.classification === 'standard') {
@@ -1734,7 +1740,11 @@ async function handleCustomerInbound(input: {
       };
     }
 
-    const ownerAlertBody = `New text reply from ${input.customerNumber}: ${input.body}`;
+    const ownerAlertBody = buildOwnerAlertMessage(
+      triage.aiClassification === 'spam' ? 'inquiry' : triage.aiClassification,
+      triage.summary,
+      input.customerNumber
+    );
     const ownerSms = await input.twilioClient.sendSms({
       toPhone: input.ownerPhone,
       fromPhone: input.businessNumber,
@@ -1812,11 +1822,7 @@ async function handleCustomerInbound(input: {
   }
 
   const isDeduped = await hasRecentEmergencyAlert(input.env, input.businessNumber, input.customerNumber);
-  const inboundClassification: TriageLabel = isDeduped
-    ? 'emergency_suppressed'
-    : triage.confidence === 'high'
-      ? 'emergency'
-      : 'possible_emergency';
+  const inboundClassification: TriageLabel = isDeduped ? 'emergency_suppressed' : 'emergency';
 
   await logSwitchboardMessage(input.env, {
     providerMessageId: input.providerMessageId || null,
@@ -1843,7 +1849,12 @@ async function handleCustomerInbound(input: {
   const customerReply = await input.twilioClient.sendSms({
     toPhone: input.customerNumber,
     fromPhone: input.businessNumber,
-    body: emergencyCustomerMessage,
+    body: await prepareCustomerFacingSmsBody(
+      input.env.SYSTEMIX,
+      input.businessNumber,
+      input.customerNumber,
+      emergencyCustomerMessage
+    ),
   });
 
   if (!customerReply.ok) {
@@ -1932,10 +1943,11 @@ async function handleCustomerInbound(input: {
     input.customerNumber
   );
 
-  const baseOwnerAlertBody =
-    triage.confidence === 'high'
-      ? `EMERGENCY ALERT from ${input.customerNumber}: "${input.body}"`
-      : `POSSIBLE EMERGENCY from ${input.customerNumber}: "${input.body}" - please verify`;
+  const baseOwnerAlertBody = buildOwnerAlertMessage(
+    'emergency',
+    triage.summary,
+    input.customerNumber
+  );
   const ownerAlertBody = hasMultipleActiveThreads
     ? `${ACTIVE_THREAD_NOTICE} ${baseOwnerAlertBody}`
     : baseOwnerAlertBody;
@@ -2006,7 +2018,7 @@ async function handleCustomerInbound(input: {
     })
   );
 
-  const ownerAlertClassification: TriageLabel = triage.confidence === 'high' ? 'emergency' : 'possible_emergency';
+  const ownerAlertClassification: TriageLabel = 'emergency';
 
   await logSwitchboardMessage(input.env, {
     providerMessageId: ownerAlert.sid || null,
@@ -2117,7 +2129,12 @@ export async function checkEmergencyTimeouts(env: Bindings): Promise<void> {
     const timeoutReply = await twilioClient.sendSms({
       toPhone: customerNumber,
       fromPhone: businessNumber,
-      body: EMERGENCY_TIMEOUT_MESSAGE,
+      body: await prepareCustomerFacingSmsBody(
+        env.SYSTEMIX,
+        businessNumber,
+        customerNumber,
+        EMERGENCY_TIMEOUT_MESSAGE
+      ),
     });
 
     if (!timeoutReply.ok) {
@@ -2239,7 +2256,9 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
     const resolvedBusinessNumber = businessContext.businessNumber;
 
     if (isForcedTestLead) {
-      c.executionCtx.waitUntil(
+      scheduleTwilioBackgroundTask(
+        c.executionCtx,
+        'Forced lead HubSpot sync',
         syncLeadToHubspot({
           env: c.env,
           businessNumber: resolvedBusinessNumber,
@@ -2253,7 +2272,6 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
             }
             console.log('[HUBSPOT] SUCCESS');
           })
-          .catch((error) => console.log('[HUBSPOT] FAILED: ', error))
       );
 
       return c.json(

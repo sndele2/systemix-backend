@@ -5,6 +5,7 @@ import { twilioStatusHandler } from './webhooks/twilioStatus';
 import { stripeWebhookHandler } from './webhooks/stripe';
 import { simulateCallbackHandler } from './testing/simulator';
 import { upsertBusiness } from './services/database';
+import { scheduleTwilioBackgroundTask } from './services/twilioLaunch';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -73,10 +74,12 @@ app.post('/v1/internal/onboard', async (c) => {
     return c.json({ error: 'Missing required fields' }, 400);
   }
 
-  c.executionCtx.waitUntil(
-    upsertBusiness({ business_number, owner_phone_number, display_name }, c.env)
-      .then(() => console.log('[D1] Manual onboard complete'))
-      .catch((error) => console.log('[D1] Manual onboard failed: ', error))
+  scheduleTwilioBackgroundTask(
+    c.executionCtx,
+    'Manual onboard',
+    upsertBusiness({ business_number, owner_phone_number, display_name }, c.env).then(() =>
+      console.log('[D1] Manual onboard complete')
+    )
   );
 
   return c.json({ success: true }, 200);
@@ -107,10 +110,13 @@ app.post('/test/simulate-callback', simulateCallbackHandler);
 const worker: ExportedHandler<Bindings> = {
   fetch: app.fetch,
   scheduled(_controller, env, ctx) {
-    ctx.waitUntil(
+    scheduleTwilioBackgroundTask(
+      ctx,
+      'Emergency timeout check',
       checkEmergencyTimeouts(env).catch((error) => {
         console.error('Emergency timeout scheduled check failed');
         console.error(error);
+        throw error;
       })
     );
   },

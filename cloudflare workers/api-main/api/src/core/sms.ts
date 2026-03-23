@@ -1,5 +1,19 @@
-const FOOTER = 'Msg&data rates may apply. Reply STOP to opt out.';
+export const SMS_OPT_OUT_FOOTER = 'Msg&data rates may apply. Reply STOP to opt out.';
 const MAX_TWILIO_BODY = 1600;
+
+export function appendSmsOptOutFooter(message: string): string {
+  let content = message.includes(SMS_OPT_OUT_FOOTER)
+    ? message.replace(SMS_OPT_OUT_FOOTER, '').trimEnd()
+    : message.trimEnd();
+  const suffix = `\n\n${SMS_OPT_OUT_FOOTER}`;
+  const maxContentLen = MAX_TWILIO_BODY - suffix.length - 1;
+
+  if (content.length > maxContentLen) {
+    content = `${content.slice(0, Math.max(0, maxContentLen)).trimEnd()}...`;
+  }
+
+  return `${content}${suffix}`;
+}
 
 export async function sendTwilioSms(
   env: {
@@ -12,17 +26,7 @@ export async function sendTwilioSms(
   message: string
 ): Promise<void> {
   try {
-    let content = message.includes(FOOTER)
-      ? message.replace(FOOTER, '').trimEnd()
-      : message.trimEnd();
-    const suffix = `\n\n${FOOTER}`;
-    const maxContentLen = MAX_TWILIO_BODY - suffix.length - 1;
-
-    if (content.length > maxContentLen) {
-      content = `${content.slice(0, Math.max(0, maxContentLen)).trimEnd()}...`;
-    }
-
-    const body = `${content}${suffix}`;
+    const body = appendSmsOptOutFooter(message);
 
     const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
     const from = (env.TWILIO_PHONE_NUMBER || '').trim();

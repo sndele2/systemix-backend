@@ -14,7 +14,11 @@ type ParsedArgs = {
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const envCandidates = [
   resolve(scriptDir, '../.dev.vars'),
+  resolve(scriptDir, '../../.dev.vars'),
+  resolve(scriptDir, '../../../.dev.vars'),
+  resolve(scriptDir, '../../../.env'),
   resolve(scriptDir, '../../../../.dev.vars'),
+  resolve(scriptDir, '../../../../.env'),
 ];
 
 function readEnvVar(name: string): string | undefined {

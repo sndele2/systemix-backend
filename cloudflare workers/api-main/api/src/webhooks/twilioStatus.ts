@@ -1,10 +1,9 @@
 import { Context } from 'hono';
 import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
 import {
-  buildMissedCallVoiceHookMessage,
-  findBusinessByNumber,
   normalizeCallStatus,
-  normalizePhone,
+  onboardNewLead,
+  scheduleTwilioBackgroundTask,
   shouldFireMissedCallVoiceHook,
 } from '../services/twilioLaunch';
 
@@ -17,7 +16,6 @@ type Bindings = {
   ENVIRONMENT?: string;
 };
 
-const MISSED_STATUSES = new Set(['busy', 'no-answer']);
 const CALL_PROVIDER = 'twilio';
 
 function maskPhone(phone: string): string {
@@ -69,26 +67,6 @@ function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
       return { ok: true, sid: payload.sid };
     },
   };
-}
-
-async function sendMissedCallSms(
-  client: TwilioRestClient,
-  toPhone: string,
-  fromPhone: string,
-  body: string
-): Promise<{ ok: boolean; sid?: string; detail?: string }> {
-  try {
-    return await client.sendSms({
-      toPhone,
-      fromPhone,
-      body,
-    });
-  } catch (error) {
-    return {
-      ok: false,
-      detail: `twilio_sms_error:${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
 }
 
 async function releaseCustomerWelcomeLock(env: Bindings, providerCallId: string): Promise<void> {
@@ -196,85 +174,44 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       return c.json({ ok: true, deduped: true, status }, 200);
     }
 
-    const normalizedBusinessNumber = normalizePhone(toPhone);
-    const business = await findBusinessByNumber(env.SYSTEMIX, normalizedBusinessNumber);
-    if (!business) {
-      await releaseCustomerWelcomeLock(env, providerCallId);
-      console.warn('[TWILIO] VOICE HOOK SKIPPED: business not found', {
-        business_number: normalizedBusinessNumber,
-      });
-      return c.json({ ok: true, skipped: true, reason: 'business_not_found' }, 200);
-    }
+    scheduleTwilioBackgroundTask(
+      c.executionCtx,
+      'Status hook onboard new lead',
+      (async () => {
+        const twilioClient = createTwilioRestClient(env);
+        if (!twilioClient) {
+          await releaseCustomerWelcomeLock(env, providerCallId);
+          throw new Error('missing_twilio_credentials');
+        }
 
-    const smsTo = (fromPhone || '').trim();
-    const smsFrom = (env.TWILIO_PHONE_NUMBER || '').trim();
+        const result = await onboardNewLead({
+          db: env.SYSTEMIX,
+          twilioClient,
+          smsFrom: (env.TWILIO_PHONE_NUMBER || '').trim(),
+          callerNumber: fromPhone,
+          provider: CALL_PROVIDER,
+          providerCallId,
+          callStatus: status,
+          rawStatus,
+          callSid,
+          parentCallSid,
+        });
 
-    if (!smsTo) {
-      console.error('Missed call SMS skipped: caller number is missing', {
-        callSid: callSid || 'unknown',
-        to: maskPhone(toPhone),
-      });
-      await releaseCustomerWelcomeLock(env, providerCallId);
-      return c.json({ ok: false, error: 'missing_sms_to' }, 200);
-    }
+        if (!result.ok) {
+          await releaseCustomerWelcomeLock(env, providerCallId);
+          throw new Error(result.detail);
+        }
 
-    if (!smsFrom) {
-      console.error('Missed call SMS skipped: TWILIO_PHONE_NUMBER is not configured', {
-        callSid: callSid || 'unknown',
-        to: maskPhone(toPhone),
-      });
-      await releaseCustomerWelcomeLock(env, providerCallId);
-      return c.json({ ok: false, error: 'missing_twilio_phone_number' }, 200);
-    }
-
-    const twilioClient = createTwilioRestClient(env);
-    if (!twilioClient) {
-      await releaseCustomerWelcomeLock(env, providerCallId);
-      return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
-    }
-
-    const sms = await sendMissedCallSms(
-      twilioClient,
-      smsTo,
-      smsFrom,
-      buildMissedCallVoiceHookMessage(business.display_name)
+        console.log('[TWILIO] VOICE HOOK FIRED', {
+          caller_number: result.callerNumber,
+          business_number: result.businessNumber,
+          status,
+          sid: result.messageSid,
+        });
+      })()
     );
-    if (!sms.ok) {
-      await releaseCustomerWelcomeLock(env, providerCallId);
-      console.error('Missed call SMS failed', {
-        callSid: callSid || 'unknown',
-        status,
-        detail: sms.detail || 'unknown',
-      });
-      return c.json({ ok: false, error: 'sms_failed' }, 200);
-    }
 
-    await env.SYSTEMIX.prepare(
-      `
-      UPDATE calls
-      SET missed_at = CASE WHEN ? = 1 THEN COALESCE(missed_at, datetime('now')) ELSE missed_at END,
-          customer_welcome_message_id = COALESCE(customer_welcome_message_id, ?)
-      WHERE provider = ? AND provider_call_id = ?
-    `
-    )
-      .bind(MISSED_STATUSES.has(status) ? 1 : 0, sms.sid || null, CALL_PROVIDER, providerCallId)
-      .run();
-
-    console.log('[TWILIO] VOICE HOOK FIRED', {
-      caller_number: smsTo,
-      business_number: business.business_number,
-      status,
-      sid: sms.sid || null,
-    });
-
-    return c.json(
-      {
-        ok: true,
-        status,
-        messageSid: sms.sid || null,
-      },
-      200
-    );
+    return c.json({ ok: true, queued: true, status }, 200);
   } catch (error) {
     console.error('Twilio status handler error');
     console.error(error);

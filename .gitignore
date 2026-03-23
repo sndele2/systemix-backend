@@ -1,0 +1,5 @@
+.DS_Store
+.dev.vars
+cloudflare workers/.env
+cloudflare workers/.wrangler/
+cloudflare workers/node_modules/

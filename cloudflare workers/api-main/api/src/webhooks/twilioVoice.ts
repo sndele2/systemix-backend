@@ -1,12 +1,11 @@
-import { Context } from 'hono';
-import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
+import type { Context } from 'hono';
+import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature.ts';
 import {
-  buildMissedCallVoiceHookMessage,
-  findBusinessByNumber,
   normalizeCallStatus,
-  normalizePhone,
+  onboardNewLead,
+  scheduleTwilioBackgroundTask,
   shouldFireMissedCallVoiceHook,
-} from '../services/twilioLaunch';
+} from '../services/twilioLaunch.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -312,66 +311,44 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
         return c.json({ ok: true, deduped: true, status: callStatus }, 200);
       }
 
-      const normalizedBusinessNumber = normalizePhone(to);
-      const business = await findBusinessByNumber(getDb(env), normalizedBusinessNumber);
-      if (!business) {
-        await releaseCustomerWelcomeLock(env, providerCallId);
-        console.warn('[TWILIO] VOICE HOOK SKIPPED: business not found', {
-          business_number: normalizedBusinessNumber,
-        });
-        return c.json({ ok: true, skipped: true, reason: 'business_not_found' }, 200);
-      }
+      scheduleTwilioBackgroundTask(
+        c.executionCtx,
+        'Voice hook onboard new lead',
+        (async () => {
+          const twilioClient = createTwilioRestClient(env);
+          if (!twilioClient) {
+            await releaseCustomerWelcomeLock(env, providerCallId);
+            throw new Error('missing_twilio_credentials');
+          }
 
-      const callerNumber = from.trim();
-      const smsFrom = (env.TWILIO_PHONE_NUMBER || '').trim();
+          const result = await onboardNewLead({
+            db: getDb(env),
+            twilioClient,
+            smsFrom: (env.TWILIO_PHONE_NUMBER || '').trim(),
+            callerNumber: from,
+            provider: CALL_PROVIDER,
+            providerCallId,
+            callStatus,
+            rawStatus,
+            callSid,
+            parentCallSid,
+          });
 
-      if (!callerNumber) {
-        await releaseCustomerWelcomeLock(env, providerCallId);
-        return c.json({ ok: false, error: 'missing_sms_to' }, 200);
-      }
+          if (!result.ok) {
+            await releaseCustomerWelcomeLock(env, providerCallId);
+            throw new Error(result.detail);
+          }
 
-      if (!smsFrom) {
-        await releaseCustomerWelcomeLock(env, providerCallId);
-        return c.json({ ok: false, error: 'missing_twilio_phone_number' }, 200);
-      }
-
-      const twilioClient = createTwilioRestClient(env);
-      if (!twilioClient) {
-        await releaseCustomerWelcomeLock(env, providerCallId);
-        return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
-      }
-
-      const sms = await sendCustomerWelcomeSms(
-        twilioClient,
-        callerNumber,
-        smsFrom,
-        buildMissedCallVoiceHookMessage(business.display_name)
+          console.log('[TWILIO] VOICE HOOK FIRED', {
+            caller_number: result.callerNumber,
+            business_number: result.businessNumber,
+            status: callStatus,
+            sid: result.messageSid,
+          });
+        })()
       );
-      if (!sms.ok) {
-        await releaseCustomerWelcomeLock(env, providerCallId);
-        return c.json({ ok: false, error: 'sms_failed', detail: sms.detail || 'unknown' }, 200);
-      }
 
-      await getDb(env)
-        .prepare(
-          `
-          UPDATE calls
-          SET missed_at = CASE WHEN ? = 1 THEN COALESCE(missed_at, datetime('now')) ELSE missed_at END,
-              customer_welcome_message_id = COALESCE(customer_welcome_message_id, ?)
-          WHERE provider = ? AND provider_call_id = ?
-        `
-        )
-        .bind(CUSTOMER_MISSED_STATUSES.has(callStatus) ? 1 : 0, sms.sid || null, CALL_PROVIDER, providerCallId)
-        .run();
-
-      console.log('[TWILIO] VOICE HOOK FIRED', {
-        caller_number: callerNumber,
-        business_number: business.business_number,
-        status: callStatus,
-        sid: sms.sid || null,
-      });
-
-      return c.json({ ok: true, status: callStatus, messageSid: sms.sid || null }, 200);
+      return c.json({ ok: true, queued: true, status: callStatus }, 200);
     }
 
     if (rawStatus) {
@@ -449,198 +426,204 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
       return c.json({ success: false, error: 'missing_recording' }, 200);
     }
 
-    console.log('Processing recording callback', {
-      callSid: callSid || 'unknown',
-      from: maskPhone(from),
-      to: maskPhone(to),
-      duration: recordingDuration || 'unknown',
-      mode: sig.mode,
-    });
-
-    const companyName = await lookupBusinessNameByDialedNumber(env, to);
-
-    let audioBlob: Blob | null = null;
-    try {
-      const audioUrl = recordingUrl.endsWith('.wav') ? recordingUrl : `${recordingUrl}.wav`;
-      const headers: Record<string, string> = {};
-
-      if (isTrustedTwilioHost(audioUrl)) {
-        headers.Authorization = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
-      } else if (env.ENVIRONMENT === 'production') {
-        console.error('Untrusted recording host blocked in production', { host: new URL(audioUrl).hostname });
-        return c.json({ success: false, error: 'invalid_recording_host' }, 200);
-      }
-
-      const audioController = new AbortController();
-      const audioTimeout = setTimeout(() => audioController.abort(), 10000);
-
-      const audioResponse = await fetch(audioUrl, {
-        headers,
-        signal: audioController.signal,
-      });
-
-      clearTimeout(audioTimeout);
-
-      if (audioResponse.ok) {
-        audioBlob = await audioResponse.blob();
-        console.log('Recording audio fetched', { sizeBytes: audioBlob.size });
-      } else {
-        console.error('Audio fetch failed', { status: audioResponse.status });
-      }
-    } catch (audioError) {
-      console.error('Audio fetch error');
-      console.error(audioError);
-    }
-
-    let transcription = 'Voice message received';
-    if (audioBlob && audioBlob.size > 0) {
-      try {
-        const whisperController = new AbortController();
-        const whisperTimeout = setTimeout(() => whisperController.abort(), 30000);
-
-        const fd = new FormData();
-        fd.append('file', audioBlob, 'recording.wav');
-        fd.append('model', 'whisper-1');
-        fd.append('language', 'en');
-
-        const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          },
-          body: fd,
-          signal: whisperController.signal,
+    scheduleTwilioBackgroundTask(
+      c.executionCtx,
+      'Recording callback',
+      (async () => {
+        console.log('Processing recording callback', {
+          callSid: callSid || 'unknown',
+          from: maskPhone(from),
+          to: maskPhone(to),
+          duration: recordingDuration || 'unknown',
+          mode: sig.mode,
         });
 
-        clearTimeout(whisperTimeout);
+        const companyName = await lookupBusinessNameByDialedNumber(env, to);
 
-        if (whisperResponse.ok) {
-          const result = (await whisperResponse.json()) as { text?: string };
-          transcription = result.text?.trim() || transcription;
-          console.log('Transcription complete', { chars: transcription.length });
-        } else {
-          const errorText = await whisperResponse.text();
-          console.error('Whisper API failed', { status: whisperResponse.status, detail: errorText });
+        let audioBlob: Blob | null = null;
+        try {
+          const audioUrl = recordingUrl.endsWith('.wav') ? recordingUrl : `${recordingUrl}.wav`;
+          const headers: Record<string, string> = {};
+
+          if (isTrustedTwilioHost(audioUrl)) {
+            headers.Authorization = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
+          } else if (env.ENVIRONMENT === 'production') {
+            console.error('Untrusted recording host blocked in production', {
+              host: new URL(audioUrl).hostname,
+            });
+            return;
+          }
+
+          const audioController = new AbortController();
+          const audioTimeout = setTimeout(() => audioController.abort(), 10000);
+
+          const audioResponse = await fetch(audioUrl, {
+            headers,
+            signal: audioController.signal,
+          });
+
+          clearTimeout(audioTimeout);
+
+          if (audioResponse.ok) {
+            audioBlob = await audioResponse.blob();
+            console.log('Recording audio fetched', { sizeBytes: audioBlob.size });
+          } else {
+            console.error('Audio fetch failed', { status: audioResponse.status });
+          }
+        } catch (audioError) {
+          console.error('Audio fetch error');
+          console.error(audioError);
         }
-      } catch (whisperError) {
-        console.error('Whisper transcription error');
-        console.error(whisperError);
-      }
-    }
 
-    const providerCallId = (callSid || recordingSid || '').trim() || crypto.randomUUID();
-    const rawJson = JSON.stringify({
-      recordingSid,
-      callSid,
-      from,
-      to,
-      recordingUrl,
-      recordingDuration,
-      transcription,
-    });
+        let transcription = 'Voice message received';
+        if (audioBlob && audioBlob.size > 0) {
+          try {
+            const whisperController = new AbortController();
+            const whisperTimeout = setTimeout(() => whisperController.abort(), 30000);
 
-    await getDb(env)
-      .prepare(
-        `
-        INSERT INTO calls (
-          id,
-          provider,
-          provider_call_id,
-          call_sid,
-          from_phone,
-          to_phone,
-          status,
-          recording_url,
+            const fd = new FormData();
+            fd.append('file', audioBlob, 'recording.wav');
+            fd.append('model', 'whisper-1');
+            fd.append('language', 'en');
+
+            const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+              },
+              body: fd,
+              signal: whisperController.signal,
+            });
+
+            clearTimeout(whisperTimeout);
+
+            if (whisperResponse.ok) {
+              const result = (await whisperResponse.json()) as { text?: string };
+              transcription = result.text?.trim() || transcription;
+              console.log('Transcription complete', { chars: transcription.length });
+            } else {
+              const errorText = await whisperResponse.text();
+              console.error('Whisper API failed', { status: whisperResponse.status, detail: errorText });
+            }
+          } catch (whisperError) {
+            console.error('Whisper transcription error');
+            console.error(whisperError);
+          }
+        }
+
+        const providerCallId = (callSid || recordingSid || '').trim() || crypto.randomUUID();
+        const rawJson = JSON.stringify({
+          recordingSid,
+          callSid,
+          from,
+          to,
+          recordingUrl,
+          recordingDuration,
           transcription,
-          raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(provider, provider_call_id) DO UPDATE SET
-          call_sid = excluded.call_sid,
-          from_phone = excluded.from_phone,
-          to_phone = excluded.to_phone,
-          status = excluded.status,
-          recording_url = excluded.recording_url,
-          transcription = excluded.transcription,
-          raw_json = excluded.raw_json
-      `
-      )
-      .bind(
-        crypto.randomUUID(),
-        CALL_PROVIDER,
-        providerCallId,
-        callSid || null,
-        from,
-        to,
-        'completed',
-        recordingUrl,
-        transcription,
-        rawJson
-      )
-      .run();
+        });
 
-    const lock = await getDb(env)
-      .prepare(
-        `
-        UPDATE calls
-        SET owner_transcript_sent_at = datetime('now')
-        WHERE provider = ?
-          AND provider_call_id = ?
-          AND owner_transcript_sent_at IS NULL
-      `
-      )
-      .bind(CALL_PROVIDER, providerCallId)
-      .run();
+        await getDb(env)
+          .prepare(
+            `
+            INSERT INTO calls (
+              id,
+              provider,
+              provider_call_id,
+              call_sid,
+              from_phone,
+              to_phone,
+              status,
+              recording_url,
+              transcription,
+              raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, provider_call_id) DO UPDATE SET
+              call_sid = excluded.call_sid,
+              from_phone = excluded.from_phone,
+              to_phone = excluded.to_phone,
+              status = excluded.status,
+              recording_url = excluded.recording_url,
+              transcription = excluded.transcription,
+              raw_json = excluded.raw_json
+          `
+          )
+          .bind(
+            crypto.randomUUID(),
+            CALL_PROVIDER,
+            providerCallId,
+            callSid || null,
+            from,
+            to,
+            'completed',
+            recordingUrl,
+            transcription,
+            rawJson
+          )
+          .run();
 
-    if (Number(lock.meta?.changes || 0) === 0) {
-      return c.json({ success: true, deduped: true }, 200);
-    }
+        const lock = await getDb(env)
+          .prepare(
+            `
+            UPDATE calls
+            SET owner_transcript_sent_at = datetime('now')
+            WHERE provider = ?
+              AND provider_call_id = ?
+              AND owner_transcript_sent_at IS NULL
+          `
+          )
+          .bind(CALL_PROVIDER, providerCallId)
+          .run();
 
-    const ownerPhone = (env.OWNER_PHONE_NUMBER || '').trim();
-    if (!ownerPhone) {
-      await releaseOwnerTranscriptLock(env, providerCallId);
-      console.error('Owner transcript SMS skipped: OWNER_PHONE_NUMBER is not configured', {
-        callSid: callSid || 'unknown',
-      });
-      return c.json({ success: false, error: 'missing_owner_phone_number' }, 200);
-    }
+        if (Number(lock.meta?.changes || 0) === 0) {
+          return;
+        }
 
-    const twilioClient = createTwilioRestClient(env);
-    if (!twilioClient) {
-      await releaseOwnerTranscriptLock(env, providerCallId);
-      return c.json({ success: false, error: 'missing_twilio_credentials' }, 200);
-    }
+        const ownerPhone = (env.OWNER_PHONE_NUMBER || '').trim();
+        if (!ownerPhone) {
+          await releaseOwnerTranscriptLock(env, providerCallId);
+          throw new Error('missing_owner_phone_number');
+        }
 
-    const smsMessage = `New voicemail for ${companyName} from ${from}: "${transcription}"`;
-    const sms = await sendOwnerTranscriptSms(twilioClient, ownerPhone, (env.TWILIO_PHONE_NUMBER || '').trim(), smsMessage);
+        const twilioClient = createTwilioRestClient(env);
+        if (!twilioClient) {
+          await releaseOwnerTranscriptLock(env, providerCallId);
+          throw new Error('missing_twilio_credentials');
+        }
 
-    if (!sms.ok) {
-      await releaseOwnerTranscriptLock(env, providerCallId);
-      console.error('Owner transcript SMS failed', {
-        callSid: callSid || 'unknown',
-        detail: sms.detail || 'unknown',
-      });
-      return c.json({ success: false, error: 'sms_failed' }, 200);
-    }
+        const smsMessage = `New voicemail for ${companyName} from ${from}: "${transcription}"`;
+        const sms = await sendOwnerTranscriptSms(
+          twilioClient,
+          ownerPhone,
+          (env.TWILIO_PHONE_NUMBER || '').trim(),
+          smsMessage
+        );
 
-    await getDb(env)
-      .prepare(
-        `
-        UPDATE calls
-        SET owner_transcript_message_id = COALESCE(owner_transcript_message_id, ?)
-        WHERE provider = ?
-          AND provider_call_id = ?
-      `
-      )
-      .bind(sms.sid || null, CALL_PROVIDER, providerCallId)
-      .run();
+        if (!sms.ok) {
+          await releaseOwnerTranscriptLock(env, providerCallId);
+          throw new Error(sms.detail || 'sms_failed');
+        }
 
-    console.log('Owner transcript SMS sent', {
-      callSid: callSid || 'unknown',
-      owner: maskPhone(ownerPhone),
-      sid: sms.sid || 'unknown',
-    });
+        await getDb(env)
+          .prepare(
+            `
+            UPDATE calls
+            SET owner_transcript_message_id = COALESCE(owner_transcript_message_id, ?)
+            WHERE provider = ?
+              AND provider_call_id = ?
+          `
+          )
+          .bind(sms.sid || null, CALL_PROVIDER, providerCallId)
+          .run();
 
-    return c.json({ success: true, messageSid: sms.sid || null }, 200);
+        console.log('Owner transcript SMS sent', {
+          callSid: callSid || 'unknown',
+          owner: maskPhone(ownerPhone),
+          sid: sms.sid || 'unknown',
+        });
+      })()
+    );
+
+    return c.json({ success: true, queued: true }, 200);
   } catch (error) {
     console.error('Recording handler error');
     console.error(error);
