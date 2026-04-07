@@ -1,11 +1,13 @@
 import Stripe from 'stripe';
-import { sendBusinessWelcomeSms } from './database';
+import { createLogger } from '../core/logging.ts';
+import { logConsentEvent } from './smsCompliance.ts';
+import { sendBusinessWelcomeSms } from './database.ts';
 import {
   associateContactToCompany,
   createHubSpotCompany,
   deleteHubSpotCompany,
   upsertHubSpotContactByPhone,
-} from './hubspot';
+} from './hubspot.ts';
 
 type StripeEnv = {
   SYSTEMIX: D1Database;
@@ -23,7 +25,13 @@ export type CheckoutCompletedMetadata = {
   business_number: string;
   owner_phone_number: string;
   display_name: string;
+  consent_given?: boolean;
+  consent_source?: string;
+  consent_text?: string;
+  consent_timestamp?: string;
 };
+
+const stripeLog = createLogger('[STRIPE]', 'stripeService');
 
 function createStripeClient(env: StripeEnv): Stripe {
   return new Stripe(env.STRIPE_SECRET_KEY, {
@@ -33,18 +41,6 @@ function createStripeClient(env: StripeEnv): Stripe {
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
-}
-
-function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.stack || error.message;
-  }
-
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
 }
 
 function isProductionEnvironment(env: Pick<StripeEnv, 'ENVIRONMENT'>): boolean {
@@ -113,10 +109,15 @@ function logDuplicateStripeSession(
   stripeSessionId: string,
   source: string
 ): void {
-  console.log('[STRIPE] Duplicate checkout session ignored', {
-    business_number: businessNumber,
-    stripeSessionId,
-    source,
+  stripeLog.log('Duplicate checkout session ignored', {
+    context: {
+      handler: 'prepareCheckoutCompleted',
+    },
+    data: {
+      businessNumber,
+      stripeSessionId,
+      source,
+    },
   });
 }
 
@@ -126,17 +127,31 @@ function logStripeSessionConflict(
   existingBusinessNumber: string,
   source: string
 ): void {
-  console.log('[STRIPE] Checkout session already claimed by different business', {
-    business_number: businessNumber,
-    stripeSessionId,
-    existing_business_number: existingBusinessNumber,
-    source,
+  stripeLog.warn('Checkout session already claimed by a different business', {
+    context: {
+      handler: 'prepareCheckoutCompleted',
+    },
+    data: {
+      businessNumber,
+      stripeSessionId,
+      existingBusinessNumber,
+      source,
+    },
   });
 }
 
 function hasRequiredCheckoutMetadata(metadata: CheckoutCompletedMetadata): boolean {
   return Boolean(
     metadata.business_number && metadata.owner_phone_number && metadata.display_name
+  );
+}
+
+function hasConsentMetadata(metadata: CheckoutCompletedMetadata): boolean {
+  return Boolean(
+    typeof metadata.consent_given === 'boolean' ||
+      (metadata.consent_source || '').trim() ||
+      (metadata.consent_text || '').trim() ||
+      (metadata.consent_timestamp || '').trim()
   );
 }
 
@@ -163,9 +178,14 @@ async function syncCheckoutCompletedHubSpot(
   } catch (error) {
     await deleteHubSpotCompany(hubspotCompanyId, env.HUBSPOT_ACCESS_TOKEN).catch(
       (rollbackError) => {
-        console.log('[STRIPE] HubSpot rollback failed', {
-          business_number: metadata.business_number,
-          error: describeError(rollbackError),
+        stripeLog.error('HubSpot rollback failed after association error', {
+          error: rollbackError,
+          context: {
+            handler: 'syncCheckoutCompletedHubSpot',
+          },
+          data: {
+            businessNumber: metadata.business_number,
+          },
         });
       }
     );
@@ -188,8 +208,13 @@ export async function verifyStripeWebhook(
   env: StripeEnv
 ): Promise<Stripe.Event> {
   if (!isProductionEnvironment(env)) {
-    console.log('[STRIPE] Webhook verification rejected outside production', {
-      environment: env.ENVIRONMENT ?? 'unset',
+    stripeLog.warn('Webhook verification rejected outside production', {
+      context: {
+        handler: 'verifyStripeWebhook',
+      },
+      data: {
+        environment: env.ENVIRONMENT ?? 'unset',
+      },
     });
     throw new Error('stripe_webhook_disabled_outside_production');
   }
@@ -205,10 +230,22 @@ export async function verifyStripeWebhook(
       undefined,
       cryptoProvider
     );
-    console.log(`[STRIPE] Webhook received: ${event.type}`);
+    stripeLog.log('Webhook received', {
+      context: {
+        handler: 'verifyStripeWebhook',
+      },
+      data: {
+        eventType: event.type,
+      },
+    });
     return event;
   } catch (error) {
-    console.log('[STRIPE] Webhook verification failed: ', error);
+    stripeLog.error('Webhook verification failed', {
+      error,
+      context: {
+        handler: 'verifyStripeWebhook',
+      },
+    });
     throw error;
   }
 }
@@ -219,59 +256,136 @@ export async function handleCheckoutCompleted(
   env: StripeEnv
 ): Promise<CheckoutCompletedResult> {
   if (!isProductionEnvironment(env)) {
-    console.log('[STRIPE] Checkout completion skipped outside production', {
-      environment: env.ENVIRONMENT ?? 'unset',
+    stripeLog.warn('Checkout completion skipped outside production', {
+      context: {
+        handler: 'handleCheckoutCompleted',
+      },
+      data: {
+        environment: env.ENVIRONMENT ?? 'unset',
+      },
     });
     return { hubspotSynced: false, welcomeSmsSent: false };
   }
 
   const stripeSessionId = asString(session.id);
   if (!hasRequiredCheckoutMetadata(metadata)) {
-    console.log('[STRIPE] Onboard skipped in async handler: missing required fields', {
-      stripeSessionId,
-      business_number: metadata.business_number,
-      owner_phone_number: metadata.owner_phone_number,
-      display_name: metadata.display_name,
+    stripeLog.warn('Checkout completion skipped because required metadata is missing', {
+      context: {
+        handler: 'handleCheckoutCompleted',
+      },
+      data: {
+        stripeSessionId,
+        businessNumber: metadata.business_number,
+        ownerPhoneNumber: metadata.owner_phone_number,
+        displayName: metadata.display_name,
+      },
     });
     return { hubspotSynced: false, welcomeSmsSent: false };
   }
 
-  console.log('[STRIPE] Processing checkout completion', {
-    stripeSessionId,
-    display_name: metadata.display_name,
+  stripeLog.log('Processing checkout completion', {
+    context: {
+      handler: 'handleCheckoutCompleted',
+    },
+    data: {
+      stripeSessionId,
+      displayName: metadata.display_name,
+    },
   });
 
-  const [welcomeSmsResult, hubspotResult] = await Promise.allSettled([
+  const consentTask = hasConsentMetadata(metadata)
+    ? logConsentEvent(env.SYSTEMIX, {
+        businessNumber: metadata.business_number,
+        phoneNumber: metadata.owner_phone_number,
+        source: (metadata.consent_source || '').trim() || 'trial_signup',
+        consentGiven: metadata.consent_given === true,
+        consentText: metadata.consent_text,
+        createdAt: metadata.consent_timestamp,
+        metadata: {
+          stripeSessionId,
+          eventType: 'checkout.session.completed',
+        },
+      })
+    : Promise.resolve();
+
+  const [welcomeSmsResult, hubspotResult, consentResult] = await Promise.allSettled([
     sendBusinessWelcomeSms(env, metadata.owner_phone_number, metadata.business_number),
     syncCheckoutCompletedHubSpot(session, metadata, env),
+    consentTask,
   ]);
 
   const welcomeSmsSent = welcomeSmsResult.status === 'fulfilled';
   if (welcomeSmsSent) {
-    console.log('[STRIPE] Twilio welcome SMS sent', {
-      stripeSessionId,
-      owner_phone_number: metadata.owner_phone_number,
+    stripeLog.log('Twilio welcome SMS sent', {
+      context: {
+        handler: 'handleCheckoutCompleted',
+        toNumber: metadata.owner_phone_number,
+      },
+      data: {
+        stripeSessionId,
+      },
     });
   } else {
-    console.log('[STRIPE] Twilio welcome SMS failed', {
-      stripeSessionId,
-      owner_phone_number: metadata.owner_phone_number,
-      error: describeError(welcomeSmsResult.reason),
+    stripeLog.error('Twilio welcome SMS failed', {
+      error: welcomeSmsResult.status === 'rejected' ? welcomeSmsResult.reason : null,
+      context: {
+        handler: 'handleCheckoutCompleted',
+        toNumber: metadata.owner_phone_number,
+      },
+      data: {
+        stripeSessionId,
+      },
     });
   }
 
   const hubspotSynced = hubspotResult.status === 'fulfilled';
   if (hubspotSynced) {
-    console.log('[STRIPE] HubSpot sync complete', {
-      stripeSessionId,
-      business_number: metadata.business_number,
+    stripeLog.log('HubSpot sync completed', {
+      context: {
+        handler: 'handleCheckoutCompleted',
+      },
+      data: {
+        stripeSessionId,
+        businessNumber: metadata.business_number,
+      },
     });
   } else {
-    console.log('[STRIPE] HubSpot sync failed', {
-      stripeSessionId,
-      business_number: metadata.business_number,
-      error: describeError(hubspotResult.reason),
+    stripeLog.error('HubSpot sync failed', {
+      error: hubspotResult.status === 'rejected' ? hubspotResult.reason : null,
+      context: {
+        handler: 'handleCheckoutCompleted',
+      },
+      data: {
+        stripeSessionId,
+        businessNumber: metadata.business_number,
+      },
     });
+  }
+
+  if (hasConsentMetadata(metadata)) {
+    if (consentResult.status === 'fulfilled') {
+      stripeLog.log('Consent event logged', {
+        context: {
+          handler: 'handleCheckoutCompleted',
+          toNumber: metadata.owner_phone_number,
+        },
+        data: {
+          stripeSessionId,
+          source: (metadata.consent_source || '').trim() || 'trial_signup',
+        },
+      });
+    } else {
+      stripeLog.error('Consent event logging failed', {
+        error: consentResult.reason,
+        context: {
+          handler: 'handleCheckoutCompleted',
+          toNumber: metadata.owner_phone_number,
+        },
+        data: {
+          stripeSessionId,
+        },
+      });
+    }
   }
 
   return {
@@ -286,8 +400,13 @@ export async function prepareCheckoutCompleted(
   env: StripeEnv
 ): Promise<CheckoutCompletedPreparation> {
   if (!isProductionEnvironment(env)) {
-    console.log('[STRIPE] Checkout preparation skipped outside production', {
-      environment: env.ENVIRONMENT ?? 'unset',
+    stripeLog.warn('Checkout preparation skipped outside production', {
+      context: {
+        handler: 'prepareCheckoutCompleted',
+      },
+      data: {
+        environment: env.ENVIRONMENT ?? 'unset',
+      },
     });
     return { shouldProcess: false };
   }
@@ -298,11 +417,16 @@ export async function prepareCheckoutCompleted(
   const stripeSessionId = asString(session.id);
 
   if (!hasRequiredCheckoutMetadata(metadata) || !stripeSessionId) {
-    console.log('[STRIPE] Onboard skipped during claim: missing required fields', {
-      business_number,
-      owner_phone_number,
-      display_name,
-      stripeSessionId,
+    stripeLog.warn('Checkout claim skipped because required metadata is missing', {
+      context: {
+        handler: 'prepareCheckoutCompleted',
+      },
+      data: {
+        businessNumber: business_number,
+        ownerPhoneNumber: owner_phone_number,
+        displayName: display_name,
+        stripeSessionId,
+      },
     });
     return { shouldProcess: false };
   }
@@ -406,10 +530,15 @@ export async function prepareCheckoutCompleted(
     }
 
     if (asString(existingBusiness?.business_number)) {
-      console.log('[STRIPE] Checkout claim skipped with no database changes', {
-        business_number,
-        stripeSessionId,
-        previous_last_stripe_session_id: asString(existingBusiness?.last_stripe_session_id),
+      stripeLog.warn('Checkout claim skipped with no database changes', {
+        context: {
+          handler: 'prepareCheckoutCompleted',
+        },
+        data: {
+          businessNumber: business_number,
+          stripeSessionId,
+          previousLastStripeSessionId: asString(existingBusiness?.last_stripe_session_id),
+        },
       });
     }
     return { shouldProcess: false };

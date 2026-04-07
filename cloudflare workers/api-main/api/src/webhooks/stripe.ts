@@ -1,11 +1,12 @@
 import Stripe from 'stripe';
-import { Context } from 'hono';
+import type { Context } from 'hono';
+import { createLogger } from '../core/logging.ts';
 import {
   handleCheckoutCompleted,
   prepareCheckoutCompleted,
   type CheckoutCompletedMetadata,
   verifyStripeWebhook,
-} from '../services/stripe';
+} from '../services/stripe.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -28,20 +29,20 @@ type Bindings = {
   SYSTEMIX_NUMBER: string;
 };
 
+const stripeLog = createLogger('[STRIPE]', 'stripeWebhookHandler');
+
 function asString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.stack || error.message;
-  }
+function asOptionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return undefined;
 
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  return undefined;
 }
 
 function scheduleStripeBackgroundTask(
@@ -51,9 +52,11 @@ function scheduleStripeBackgroundTask(
 ): void {
   c.executionCtx.waitUntil(
     task.catch((error) =>
-      console.log('[STRIPE] Async checkout processing failed', {
-        stripeSessionId,
-        error: describeError(error),
+      stripeLog.error('Async checkout processing failed', {
+        error,
+        data: {
+          stripeSessionId,
+        },
       })
     )
   );
@@ -63,18 +66,28 @@ function resolveCheckoutMetadata(session: Stripe.Checkout.Session): CheckoutComp
   const stripeSessionId = asString(session.id);
   const business_number = asString(session.metadata?.business_number);
   const owner_phone_number = asString(session.metadata?.owner_phone_number);
+  const consent_given = asOptionalBoolean(session.metadata?.consent_given);
+  const consent_source = asString(session.metadata?.consent_source);
+  const consent_text = asString(session.metadata?.consent_text);
+  const consent_timestamp = asString(session.metadata?.consent_timestamp);
 
   const primaryDisplayName = asString(session.metadata?.display_name);
   if (primaryDisplayName) {
-    console.log('[STRIPE] Primary metadata path used', {
-      stripeSessionId,
-      display_name: primaryDisplayName,
+    stripeLog.log('Primary metadata path used', {
+      data: {
+        stripeSessionId,
+        displayName: primaryDisplayName,
+      },
     });
 
     return {
       business_number,
       owner_phone_number,
       display_name: primaryDisplayName,
+      consent_given,
+      consent_source,
+      consent_text,
+      consent_timestamp,
     };
   }
 
@@ -86,23 +99,31 @@ function resolveCheckoutMetadata(session: Stripe.Checkout.Session): CheckoutComp
   );
 
   if (customFieldDisplayName) {
-    console.log('[STRIPE] Fallback 1 used', {
-      stripeSessionId,
-      display_name: customFieldDisplayName,
+    stripeLog.log('Custom field metadata fallback used', {
+      data: {
+        stripeSessionId,
+        displayName: customFieldDisplayName,
+      },
     });
 
     return {
       business_number,
       owner_phone_number,
       display_name: customFieldDisplayName,
+      consent_given,
+      consent_source,
+      consent_text,
+      consent_timestamp,
     };
   }
 
   const customerDetailsDisplayName = asString(session.customer_details?.name);
   if (customerDetailsDisplayName) {
-    console.log('[STRIPE] Fallback 2 used', {
-      stripeSessionId,
-      display_name: customerDetailsDisplayName,
+    stripeLog.log('Customer details metadata fallback used', {
+      data: {
+        stripeSessionId,
+        displayName: customerDetailsDisplayName,
+      },
     });
   }
 
@@ -110,6 +131,10 @@ function resolveCheckoutMetadata(session: Stripe.Checkout.Session): CheckoutComp
     business_number,
     owner_phone_number,
     display_name: customerDetailsDisplayName,
+    consent_given,
+    consent_source,
+    consent_text,
+    consent_timestamp,
   };
 }
 
@@ -127,13 +152,15 @@ export async function stripeWebhookHandler(c: Context<{ Bindings: Bindings }>) {
   try {
     event = await verifyStripeWebhook(body, signature, c.env);
   } catch {
-    console.log('[STRIPE] Signature verification failed');
+    stripeLog.error('Signature verification failed');
     return c.text('Webhook verification failed', 400);
   }
 
   if (event.type !== 'checkout.session.completed') {
-    console.log('[STRIPE] Ignoring non-checkout completion event', {
-      eventType: event.type,
+    stripeLog.log('Ignoring non-checkout completion event', {
+      data: {
+        eventType: event.type,
+      },
     });
     return c.text('ok', 200);
   }
@@ -143,18 +170,22 @@ export async function stripeWebhookHandler(c: Context<{ Bindings: Bindings }>) {
   const metadata = resolveCheckoutMetadata(session);
 
   if (!hasRequiredCheckoutMetadata(metadata)) {
-    console.log('[STRIPE] Onboard skipped: missing required fields', {
-      stripeSessionId,
-      business_number: metadata.business_number,
-      owner_phone_number: metadata.owner_phone_number,
-      display_name: metadata.display_name,
+    stripeLog.warn('Onboarding skipped because required fields are missing', {
+      data: {
+        stripeSessionId,
+        businessNumber: metadata.business_number,
+        ownerPhoneNumber: metadata.owner_phone_number,
+        displayName: metadata.display_name,
+      },
     });
     return c.text('ok', 200);
   }
 
-  console.log('[STRIPE] Scheduling async onboarding', {
-    stripeSessionId,
-    display_name: metadata.display_name,
+  stripeLog.log('Scheduling async onboarding', {
+    data: {
+      stripeSessionId,
+      displayName: metadata.display_name,
+    },
   });
 
   scheduleStripeBackgroundTask(
@@ -166,25 +197,31 @@ export async function stripeWebhookHandler(c: Context<{ Bindings: Bindings }>) {
         return;
       }
 
-      console.log('[STRIPE] Checkout claim accepted', {
-        stripeSessionId,
-        display_name: metadata.display_name,
+      stripeLog.log('Checkout claim accepted', {
+        data: {
+          stripeSessionId,
+          displayName: metadata.display_name,
+        },
       });
 
       const result = await handleCheckoutCompleted(session, metadata, c.env);
       if (result.hubspotSynced && result.welcomeSmsSent) {
-        console.log('[STRIPE] Onboard success', {
-          stripeSessionId,
-          display_name: metadata.display_name,
+        stripeLog.log('Onboarding completed successfully', {
+          data: {
+            stripeSessionId,
+            displayName: metadata.display_name,
+          },
         });
         return;
       }
 
-      console.log('[STRIPE] Onboard completed with errors', {
-        stripeSessionId,
-        display_name: metadata.display_name,
-        hubspotSynced: result.hubspotSynced,
-        welcomeSmsSent: result.welcomeSmsSent,
+      stripeLog.warn('Onboarding completed with partial failures', {
+        data: {
+          stripeSessionId,
+          displayName: metadata.display_name,
+          hubspotSynced: result.hubspotSynced,
+          welcomeSmsSent: result.welcomeSmsSent,
+        },
       });
     })()
   );

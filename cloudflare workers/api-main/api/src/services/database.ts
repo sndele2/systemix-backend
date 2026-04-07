@@ -1,4 +1,5 @@
-import { sendTwilioSms } from '../core/sms';
+import { sendTwilioSms } from '../core/sms.ts';
+import { createLogger } from '../core/logging.ts';
 
 type UpsertBusinessInput = {
   business_number: string;
@@ -14,6 +15,8 @@ type DatabaseEnv = {
   SYSTEMIX_NUMBER: string;
 };
 
+const d1Log = createLogger('[D1]', 'database');
+
 export async function sendBusinessWelcomeSms(
   env: DatabaseEnv,
   owner_phone_number: string,
@@ -22,9 +25,21 @@ export async function sendBusinessWelcomeSms(
   await sendTwilioSms(
     env,
     owner_phone_number,
-    `Systemix is now active on your line (${business_number}). Any missed calls will now be captured and sent here. Text SYSTEMIX HELP for commands.`
+    `Systemix is now active on your line (${business_number}). Any missed calls will now be captured and sent here. Text SYSTEMIX HELP for commands.`,
+    {
+      businessNumber: business_number,
+    }
   );
-  console.log(`[D1] Welcome SMS sent to ${owner_phone_number}`);
+  d1Log.log('Welcome SMS sent', {
+    context: {
+      handler: 'sendBusinessWelcomeSms',
+      fromNumber: env.SYSTEMIX_NUMBER,
+      toNumber: owner_phone_number,
+    },
+    data: {
+      businessNumber: business_number,
+    },
+  });
 }
 
 export async function upsertBusiness(
@@ -56,7 +71,16 @@ export async function upsertBusiness(
   `;
 
   await env.SYSTEMIX.prepare(sql).bind(business_number, owner_phone_number, display_name).run();
-  console.log(`[D1] Business upserted: ${business_number}`);
+  d1Log.log('Business upserted', {
+    context: {
+      handler: 'upsertBusiness',
+      fromNumber: business_number,
+      toNumber: owner_phone_number,
+    },
+    data: {
+      displayName: display_name,
+    },
+  });
 
   await sendBusinessWelcomeSms(env, owner_phone_number, business_number);
 }

@@ -1,17 +1,28 @@
-import { Context } from 'hono';
-import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
-import { syncToHubspot as syncHubspotContact } from '../services/hubspot';
+import type { Context } from 'hono';
+import { createTwilioRestClient, type TwilioRestClient } from '../core/sms.ts';
+import { createLogger, type StructuredLogContext } from '../core/logging.ts';
+import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature.ts';
+import { syncToHubspot as syncHubspotContact } from '../services/hubspot.ts';
 import {
   buildLeadSummary,
   classifyLeadIntent,
   type AiLeadClassification,
-} from '../services/openai';
+} from '../services/openai.ts';
 import {
+  buildBusinessOwnerAlertMessage,
   buildEmergencyPriorityMessage,
   buildOwnerAlertMessage,
   scheduleTwilioBackgroundTask,
-} from '../services/twilioLaunch';
-import { prepareCustomerFacingSmsBody } from '../services/smsCompliance';
+} from '../services/twilioLaunch.ts';
+import {
+  buildSmsHelpMessage,
+  buildSmsOptInConfirmationMessage,
+  buildSmsOptOutConfirmationMessage,
+  prepareCustomerFacingSmsBody,
+  resolveInboundSmsComplianceAction,
+  type InboundSmsComplianceAction,
+  upsertSmsOptOut,
+} from '../services/smsCompliance.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -53,12 +64,6 @@ type BusinessContext = {
   businessNumber: string;
   ownerPhone: string;
   displayName: string;
-};
-
-type TwilioRestClient = {
-  sendSms: (
-    input: { toPhone: string; fromPhone: string; body: string }
-  ) => Promise<{ ok: boolean; sid?: string; detail?: string }>;
 };
 
 const PROVIDER = 'twilio';
@@ -115,6 +120,22 @@ const CLEAR_STANDARD_KEYWORDS = [
 ] as const;
 
 let schemaReadyPromise: Promise<void> | null = null;
+const d1Log = createLogger('[D1]', 'twilioSms');
+const twilioLog = createLogger('[TWILIO]', 'twilioSms');
+const hubspotLog = createLogger('[HUBSPOT]', 'twilioSms');
+const classifyLog = createLogger('[CLASSIFY]', 'twilioSms');
+
+type SmsLogPrefix = '[D1]' | '[TWILIO]' | '[HUBSPOT]' | '[CLASSIFY]';
+
+function getLogger(prefix: SmsLogPrefix) {
+  const loggers: Record<SmsLogPrefix, ReturnType<typeof createLogger>> = {
+    '[D1]': d1Log,
+    '[TWILIO]': twilioLog,
+    '[HUBSPOT]': hubspotLog,
+    '[CLASSIFY]': classifyLog,
+  };
+  return loggers[prefix];
+}
 
 function getDb(env: Bindings): D1Database {
   return env.SYSTEMIX;
@@ -289,44 +310,6 @@ async function classifyCustomerMessage(messageBody: string, apiKey?: string): Pr
   };
 }
 
-function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) {
-    return null;
-  }
-
-  const accountSid = env.TWILIO_ACCOUNT_SID;
-  const authHeader = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
-
-  return {
-    async sendSms(input: {
-      toPhone: string;
-      fromPhone: string;
-      body: string;
-    }): Promise<{ ok: boolean; sid?: string; detail?: string }> {
-      const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
-        method: 'POST',
-        headers: {
-          Authorization: authHeader,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          To: input.toPhone,
-          From: input.fromPhone,
-          Body: input.body,
-        }).toString(),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        return { ok: false, detail: `twilio_sms_failed_${response.status}:${errorText}` };
-      }
-
-      const payload = (await response.json()) as { sid?: string };
-      return { ok: true, sid: payload.sid };
-    },
-  };
-}
-
 async function saveInboundSms(
   env: Bindings,
   fromPhone: string,
@@ -404,6 +387,80 @@ async function saveOutboundSms(
   )
     .bind(crypto.randomUUID(), PROVIDER, messageSid, fromPhone, toPhone, body, rawJson)
     .run();
+}
+
+function emptyTwimlResponseBody(): string {
+  return '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+}
+
+function respondWithEmptyTwiml(c: Context<{ Bindings: Bindings }>) {
+  return c.body(emptyTwimlResponseBody(), 200, { 'Content-Type': 'text/xml' });
+}
+
+function withLoggedBackgroundCatch<T>(
+  prefix: SmsLogPrefix,
+  label: string,
+  task: Promise<T>,
+  options: {
+    context?: StructuredLogContext;
+    data?: Record<string, unknown>;
+  } = {}
+): Promise<T | null> {
+  return task.catch((error) => {
+    getLogger(prefix).error(`${label} failed`, {
+      error,
+      context: options.context,
+      data: {
+        label,
+        ...(options.data ?? {}),
+      },
+    });
+    return null;
+  });
+}
+
+function scheduleSettledBackgroundTasks(
+  executionCtx: Pick<ExecutionContext, 'waitUntil'> | undefined,
+  tasks: Promise<unknown>[]
+): void {
+  const backgroundWork = Promise.allSettled(tasks).then(() => undefined);
+
+  if (executionCtx?.waitUntil) {
+    executionCtx.waitUntil(backgroundWork);
+    return;
+  }
+
+  void backgroundWork;
+}
+
+async function hasExistingMessageSid(env: Bindings, providerMessageId: string): Promise<boolean> {
+  if (!providerMessageId) return false;
+
+  try {
+    const existing = await getDb(env)
+      .prepare(
+        `
+        SELECT 1 AS seen
+        FROM messages
+        WHERE provider = ?
+          AND provider_message_id = ?
+        LIMIT 1
+      `
+      )
+      .bind(PROVIDER, providerMessageId)
+      .first<{ seen?: number }>();
+
+    return Boolean(existing);
+  } catch (error) {
+    d1Log.error('MessageSid precheck failed', {
+      error,
+      context: {
+        handler: 'hasExistingMessageSid',
+        messageSid: providerMessageId,
+      },
+    });
+    return false;
+  }
 }
 
 async function ensureSwitchboardSchema(env: Bindings): Promise<void> {
@@ -596,6 +653,229 @@ async function resolveBusinessContext(env: Bindings, toPhone: string): Promise<B
     ownerPhone: normalizePhone(businessRow.owner_phone_number || ''),
     displayName: (businessRow.display_name || '').trim(),
   };
+}
+
+function getInboundComplianceResponseSource(action: InboundSmsComplianceAction): string {
+  if (action === 'opt_out') return 'sms_compliance_opt_out_confirmation';
+  if (action === 'opt_in') return 'sms_compliance_opt_in_confirmation';
+  return 'sms_compliance_help_response';
+}
+
+function buildInboundComplianceResponseBody(input: {
+  action: InboundSmsComplianceAction;
+  displayName: string;
+  businessNumber: string;
+}): string {
+  if (input.action === 'opt_out') {
+    return buildSmsOptOutConfirmationMessage(input.displayName, input.businessNumber);
+  }
+
+  if (input.action === 'opt_in') {
+    return buildSmsOptInConfirmationMessage();
+  }
+
+  return buildSmsHelpMessage(input.displayName, input.businessNumber);
+}
+
+function isSmsSuppressed(result: { suppressed?: boolean } | null | undefined): boolean {
+  return result?.suppressed === true;
+}
+
+function buildComplianceCommandBackgroundTasks(input: {
+  env: Bindings;
+  twilioClient: TwilioRestClient;
+  action: InboundSmsComplianceAction;
+  businessNumber: string;
+  displayName: string;
+  inboundFrom: string;
+  inboundTo: string;
+  body: string;
+  providerMessageId: string;
+  rawJson: string;
+}): Promise<unknown>[] {
+  const responseBody = buildInboundComplianceResponseBody({
+    action: input.action,
+    displayName: input.displayName,
+    businessNumber: input.businessNumber,
+  });
+
+  const saveInboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist inbound MessageSid',
+    saveInboundSms(
+      input.env,
+      input.inboundFrom,
+      input.inboundTo,
+      input.body,
+      input.providerMessageId,
+      input.rawJson
+    ).then((saved) => {
+      d1Log.log('Inbound MessageSid stored', {
+        context: {
+          handler: 'buildComplianceCommandBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.inboundFrom,
+          toNumber: input.inboundTo,
+        },
+        data: {
+          action: input.action,
+          saved: saved.saved,
+        },
+      });
+      return saved;
+    }),
+    {
+      context: {
+        handler: 'buildComplianceCommandBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.inboundFrom,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  const optOutUpdateTask =
+    input.action === 'help'
+      ? null
+      : withLoggedBackgroundCatch(
+          '[D1]',
+          'Persist SMS opt-out state',
+          upsertSmsOptOut(
+            input.env.SYSTEMIX,
+            input.businessNumber,
+            input.inboundFrom,
+            input.action === 'opt_out'
+          ).then(() => {
+            d1Log.log('SMS opt-out state updated', {
+              context: {
+                handler: 'buildComplianceCommandBackgroundTasks',
+                messageSid: input.providerMessageId || null,
+                fromNumber: input.inboundFrom,
+                toNumber: input.businessNumber,
+              },
+              data: {
+                action: input.action,
+                isOptedOut: input.action === 'opt_out',
+              },
+            });
+            return true;
+          }),
+          {
+            context: {
+              handler: 'buildComplianceCommandBackgroundTasks',
+              messageSid: input.providerMessageId || null,
+              fromNumber: input.inboundFrom,
+              toNumber: input.businessNumber,
+            },
+          }
+        );
+
+  const sendResponseTask = withLoggedBackgroundCatch(
+    '[TWILIO]',
+    'Send compliance response',
+    (optOutUpdateTask ? optOutUpdateTask.then(() => undefined) : Promise.resolve()).then(async () => {
+      const sms = await input.twilioClient.sendSms({
+        toPhone: input.inboundFrom,
+        fromPhone: input.businessNumber,
+        businessNumber: input.businessNumber,
+        body: responseBody,
+        skipOptOutCheck: true,
+      });
+
+      if (!sms.ok) {
+        throw new Error(sms.detail || 'sms_failed');
+      }
+
+      if (sms.suppressed) {
+        twilioLog.log('Compliance response bypassed suppression and no outbound send was required', {
+          context: {
+            handler: 'buildComplianceCommandBackgroundTasks',
+            fromNumber: input.businessNumber,
+            toNumber: input.inboundFrom,
+          },
+          data: {
+            action: input.action,
+          },
+        });
+      } else {
+        twilioLog.log('Compliance response sent', {
+          context: {
+            handler: 'buildComplianceCommandBackgroundTasks',
+            messageSid: sms.sid || null,
+            fromNumber: input.businessNumber,
+            toNumber: input.inboundFrom,
+          },
+          data: {
+            action: input.action,
+          },
+        });
+      }
+
+      return {
+        sid: sms.sid || '',
+        body: responseBody,
+      };
+    }),
+    {
+      context: {
+        handler: 'buildComplianceCommandBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.inboundFrom,
+      },
+      data: {
+        action: input.action,
+      },
+    }
+  );
+
+  const persistOutboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist compliance response',
+    sendResponseTask.then(async (responseSms) => {
+      if (!responseSms?.sid) return null;
+
+      await saveOutboundSms(
+        input.env,
+        responseSms.sid,
+        input.businessNumber,
+        input.inboundFrom,
+        responseSms.body,
+        JSON.stringify({
+          source: getInboundComplianceResponseSource(input.action),
+          providerMessageId: input.providerMessageId || null,
+        })
+      );
+
+      d1Log.log('Compliance response persisted', {
+        context: {
+          handler: 'buildComplianceCommandBackgroundTasks',
+          messageSid: responseSms.sid || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.inboundFrom,
+        },
+        data: {
+          action: input.action,
+        },
+      });
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildComplianceCommandBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.inboundFrom,
+      },
+    }
+  );
+
+  return [
+    saveInboundTask,
+    ...(optOutUpdateTask ? [optOutUpdateTask] : []),
+    sendResponseTask,
+    persistOutboundTask,
+  ];
 }
 
 function getOwnerThreadId(businessNumber: string): string {
@@ -991,7 +1271,11 @@ async function getOwnerAlertPauseState(
     };
   } catch (error) {
     if (isMissingColumnError(error, 'alerts_paused_until')) {
-      console.warn('[PAUSE CHECK] alerts_paused_until column missing on businesses table');
+      d1Log.warn('alerts_paused_until column missing on businesses table', {
+        context: {
+          handler: 'getOwnerAlertPauseState',
+        },
+      });
       return {
         isPaused: false,
         alertsPausedUntil: null,
@@ -1062,7 +1346,16 @@ async function resolveMostRecentActiveThreadForOwner(
   const activeThreads = await getActiveThreadsForOwner(env, businessNumber, ownerPhone, 50);
 
   if (activeThreads.length > 1) {
-    console.warn(`[COLLISION WARNING] Owner ${ownerPhone} has ${activeThreads.length} active threads`);
+    d1Log.warn('Owner has multiple active threads', {
+      context: {
+        handler: 'resolveMostRecentActiveThreadForOwner',
+        fromNumber: businessNumber,
+        toNumber: ownerPhone,
+      },
+      data: {
+        activeThreadCount: activeThreads.length,
+      },
+    });
   }
 
   const activeThread = activeThreads[0];
@@ -1289,12 +1582,32 @@ async function handleOwnerCommand(input: {
   });
 
   if (!sendResult.ok) {
-    console.error('Owner command response failed', {
-      command: input.command.type,
-      detail: sendResult.detail || 'unknown',
-      owner: maskPhone(input.ownerPhone),
+    twilioLog.error('Owner command response failed', {
+      context: {
+        handler: 'handleOwnerCommand',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        command: input.command.type,
+        detail: sendResult.detail || 'unknown',
+      },
     });
     return { ok: false, command: input.command.type, responseSid: null };
+  }
+
+  if (isSmsSuppressed(sendResult)) {
+    twilioLog.log('Owner command response suppressed because recipient is opted out', {
+      context: {
+        handler: 'handleOwnerCommand',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        command: input.command.type,
+      },
+    });
+    return { ok: true, command: input.command.type, responseSid: null };
   }
 
   await saveOutboundSms(
@@ -1379,7 +1692,7 @@ async function handleOwnerRelay(input: {
       body: noRecipientBody,
     });
 
-    if (ownerReply.ok) {
+    if (ownerReply.ok && !isSmsSuppressed(ownerReply)) {
       await saveOutboundSms(
         input.env,
         ownerReply.sid || '',
@@ -1405,7 +1718,11 @@ async function handleOwnerRelay(input: {
       });
     }
 
-    return { ok: true, mode: 'owner_relay', confirmationSid: ownerReply.sid || null };
+    return {
+      ok: true,
+      mode: 'owner_relay',
+      confirmationSid: isSmsSuppressed(ownerReply) ? null : ownerReply.sid || null,
+    };
   }
 
   if (!forwardBody) {
@@ -1434,7 +1751,7 @@ async function handleOwnerRelay(input: {
       body: emptyBodyMessage,
     });
 
-    if (ownerReply.ok) {
+    if (ownerReply.ok && !isSmsSuppressed(ownerReply)) {
       await saveOutboundSms(
         input.env,
         ownerReply.sid || '',
@@ -1461,7 +1778,11 @@ async function handleOwnerRelay(input: {
       });
     }
 
-    return { ok: true, mode: 'owner_relay', confirmationSid: ownerReply.sid || null };
+    return {
+      ok: true,
+      mode: 'owner_relay',
+      confirmationSid: isSmsSuppressed(ownerReply) ? null : ownerReply.sid || null,
+    };
   }
 
   const threadId = await getOrCreateCustomerThread(input.env, input.businessNumber, recipient);
@@ -1494,13 +1815,73 @@ async function handleOwnerRelay(input: {
   });
 
   if (!forwarded.ok) {
-    console.error('Owner relay forwarding failed', {
-      to: maskPhone(recipient),
-      detail: forwarded.detail || 'unknown',
+    twilioLog.error('Owner relay forwarding failed', {
+      context: {
+        handler: 'handleOwnerRelay',
+        fromNumber: input.businessNumber,
+        toNumber: recipient,
+      },
+      data: {
+        detail: forwarded.detail || 'unknown',
+      },
     });
     return {
       ok: false,
       mode: 'owner_relay',
+    };
+  }
+
+  if (isSmsSuppressed(forwarded)) {
+    twilioLog.log('Owner relay suppressed because customer is opted out', {
+      context: {
+        handler: 'handleOwnerRelay',
+        fromNumber: input.businessNumber,
+        toNumber: recipient,
+      },
+    });
+
+    const suppressedBody = `Message not sent to ${recipient} because that number has opted out.`;
+    const ownerSuppressedReply = await input.twilioClient.sendSms({
+      toPhone: input.ownerPhone,
+      fromPhone: input.businessNumber,
+      body: sanitizeForSms(suppressedBody),
+    });
+
+    if (ownerSuppressedReply.ok && !isSmsSuppressed(ownerSuppressedReply)) {
+      await saveOutboundSms(
+        input.env,
+        ownerSuppressedReply.sid || '',
+        input.businessNumber,
+        input.ownerPhone,
+        suppressedBody,
+        JSON.stringify({
+          source: 'owner_relay_suppressed_confirmation',
+          recipient,
+        })
+      );
+
+      await logSwitchboardMessage(input.env, {
+        providerMessageId: ownerSuppressedReply.sid || null,
+        threadId,
+        businessNumber: input.businessNumber,
+        direction: 'outbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+        messageBody: suppressedBody,
+        classification: 'owner_relay',
+        confidence: null,
+        metadata: {
+          recipient,
+          target: 'owner_suppressed_confirmation',
+        },
+      });
+    }
+
+    return {
+      ok: true,
+      mode: 'owner_relay',
+      forwardedSid: null,
+      confirmationSid: isSmsSuppressed(ownerSuppressedReply) ? null : ownerSuppressedReply.sid || null,
     };
   }
 
@@ -1542,9 +1923,32 @@ async function handleOwnerRelay(input: {
   });
 
   if (!ownerConfirmation.ok) {
-    console.error('Owner relay confirmation failed', {
-      owner: maskPhone(input.ownerPhone),
-      detail: ownerConfirmation.detail || 'unknown',
+    twilioLog.error('Owner relay confirmation failed', {
+      context: {
+        handler: 'handleOwnerRelay',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        detail: ownerConfirmation.detail || 'unknown',
+      },
+    });
+
+    return {
+      ok: true,
+      mode: 'owner_relay',
+      forwardedSid: forwarded.sid || null,
+      confirmationSid: null,
+    };
+  }
+
+  if (isSmsSuppressed(ownerConfirmation)) {
+    twilioLog.log('Owner relay confirmation suppressed because recipient is opted out', {
+      context: {
+        handler: 'handleOwnerRelay',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
     });
 
     return {
@@ -1605,13 +2009,842 @@ async function syncLeadToHubspot(input: {
 
     return { synced: true };
   } catch (error) {
-    console.error('HubSpot lead sync failed', {
-      business: maskPhone(input.businessNumber),
-      customer: maskPhone(input.customerNumber),
-      error: error instanceof Error ? error.message : String(error),
+    hubspotLog.error('HubSpot lead sync failed', {
+      error,
+      context: {
+        handler: 'syncLeadToHubspot',
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
     });
     return { synced: false, reason: 'sync_failed' };
   }
+}
+
+function buildUnknownBusinessBackgroundTasks(input: {
+  env: Bindings;
+  inboundFrom: string;
+  inboundTo: string;
+  body: string;
+  providerMessageId: string;
+  route: 'owner_proxy' | 'customer_analysis';
+  rawParams: Record<string, string>;
+  rawJson: string;
+}): Promise<unknown>[] {
+  const saveInboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist inbound MessageSid',
+    saveInboundSms(
+      input.env,
+      input.inboundFrom,
+      input.inboundTo,
+      input.body,
+      input.providerMessageId,
+      input.rawJson
+    ).then((saved) => {
+      d1Log.log('Inbound MessageSid stored', {
+        context: {
+          handler: 'buildUnknownBusinessBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.inboundFrom,
+          toNumber: input.inboundTo,
+        },
+        data: {
+          saved: saved.saved,
+        },
+      });
+      return saved;
+    }),
+    {
+      context: {
+        handler: 'buildUnknownBusinessBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.inboundFrom,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  const unresolvedLineTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Log unresolved business line',
+    saveInboundTask.then(async (savedInbound) => {
+      if (!savedInbound?.saved) return null;
+
+      await handleUnknownBusinessLine({
+        env: input.env,
+        inboundFrom: input.inboundFrom,
+        inboundTo: input.inboundTo,
+        body: input.body,
+        providerMessageId: input.providerMessageId,
+        route: input.route,
+        rawParams: input.rawParams,
+      });
+
+      d1Log.log('Unresolved business line logged', {
+        context: {
+          handler: 'buildUnknownBusinessBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.inboundFrom,
+          toNumber: input.inboundTo,
+        },
+      });
+
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildUnknownBusinessBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.inboundFrom,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  return [saveInboundTask, unresolvedLineTask];
+}
+
+function buildMissingOwnerMappingBackgroundTasks(input: {
+  env: Bindings;
+  inboundFrom: string;
+  inboundTo: string;
+  body: string;
+  providerMessageId: string;
+  rawJson: string;
+  businessNumber: string;
+}): Promise<unknown>[] {
+  const saveInboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist inbound MessageSid',
+    saveInboundSms(
+      input.env,
+      input.inboundFrom,
+      input.inboundTo,
+      input.body,
+      input.providerMessageId,
+      input.rawJson
+    ).then((saved) => {
+      d1Log.log('Inbound MessageSid stored', {
+        context: {
+          handler: 'buildMissingOwnerMappingBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.inboundFrom,
+          toNumber: input.inboundTo,
+        },
+        data: {
+          saved: saved.saved,
+        },
+      });
+      return saved;
+    }),
+    {
+      context: {
+        handler: 'buildMissingOwnerMappingBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.inboundFrom,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  const missingOwnerTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Log missing owner mapping',
+    saveInboundTask.then(async (savedInbound) => {
+      if (!savedInbound?.saved) return null;
+
+      await logSwitchboardEvent(input.env, 'missing_owner_mapping', {
+        businessNumber: input.businessNumber,
+        fromNumber: input.inboundFrom,
+        toNumber: input.inboundTo,
+        metadata: {
+          reason: 'missing_owner_phone_number_for_business',
+          providerMessageId: input.providerMessageId || null,
+        },
+      });
+
+      d1Log.log('Missing owner mapping logged', {
+        context: {
+          handler: 'buildMissingOwnerMappingBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.inboundFrom,
+          toNumber: input.inboundTo,
+        },
+        data: {
+          businessNumber: input.businessNumber,
+        },
+      });
+
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildMissingOwnerMappingBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.inboundFrom,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  return [saveInboundTask, missingOwnerTask];
+}
+
+function buildForcedLeadBackgroundTasks(input: {
+  env: Bindings;
+  businessNumber: string;
+  customerNumber: string;
+  body: string;
+  inboundTo: string;
+  providerMessageId: string;
+  rawJson: string;
+}): Promise<unknown>[] {
+  const saveInboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist inbound MessageSid',
+    saveInboundSms(
+      input.env,
+      input.customerNumber,
+      input.inboundTo,
+      input.body,
+      input.providerMessageId,
+      input.rawJson
+    ).then((saved) => {
+      d1Log.log('Inbound MessageSid stored', {
+        context: {
+          handler: 'buildForcedLeadBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.inboundTo,
+        },
+        data: {
+          saved: saved.saved,
+        },
+      });
+      return saved;
+    }),
+    {
+      context: {
+        handler: 'buildForcedLeadBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  const hubspotTask = withLoggedBackgroundCatch(
+    '[HUBSPOT]',
+    'Forced lead sync',
+    saveInboundTask.then(async (savedInbound) => {
+      if (!savedInbound?.saved) return null;
+
+      const result = await syncLeadToHubspot({
+        env: input.env,
+        businessNumber: input.businessNumber,
+        customerNumber: input.customerNumber,
+        summary: buildLeadSummary('inquiry', input.body),
+        classification: 'inquiry',
+      });
+
+      if (!result.synced) {
+        throw new Error(result.reason || 'sync_failed');
+      }
+
+      hubspotLog.log('Forced lead sync completed', {
+        context: {
+          handler: 'buildForcedLeadBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.customerNumber,
+        },
+      });
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildForcedLeadBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+    }
+  );
+
+  return [saveInboundTask, hubspotTask];
+}
+
+function buildCustomerAnalysisBackgroundTasks(input: {
+  env: Bindings;
+  twilioClient: TwilioRestClient;
+  businessNumber: string;
+  ownerPhone: string;
+  displayName: string;
+  customerNumber: string;
+  inboundTo: string;
+  body: string;
+  providerMessageId: string;
+  rawJson: string;
+  ownerAlertEligible: boolean;
+}): Promise<unknown>[] {
+  const saveInboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist inbound MessageSid',
+    saveInboundSms(
+      input.env,
+      input.customerNumber,
+      input.inboundTo,
+      input.body,
+      input.providerMessageId,
+      input.rawJson
+    ).then((saved) => {
+      d1Log.log('Inbound MessageSid stored', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.inboundTo,
+        },
+        data: {
+          saved: saved.saved,
+        },
+      });
+      return saved;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  const classifyTask = withLoggedBackgroundCatch(
+    '[CLASSIFY]',
+    'Lead classification',
+    saveInboundTask.then(async (savedInbound) => {
+      if (!savedInbound?.saved) return null;
+
+      const triage = await classifyCustomerMessage(input.body, input.env.OPENAI_API_KEY);
+      classifyLog.log('Lead classification completed', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.businessNumber,
+        },
+        data: {
+          classification: triage.aiClassification,
+          routingClassification: triage.classification,
+          confidence: triage.confidence,
+        },
+      });
+      return triage;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.businessNumber,
+      },
+    }
+  );
+
+  const threadIdTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Prepare customer thread',
+    saveInboundTask.then(async (savedInbound) => {
+      if (!savedInbound?.saved) return null;
+
+      const threadId = await getOrCreateCustomerThread(input.env, input.businessNumber, input.customerNumber);
+      d1Log.log('Customer thread ready', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.businessNumber,
+        },
+        data: {
+          threadId,
+        },
+      });
+      return threadId;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.businessNumber,
+      },
+    }
+  );
+
+  const setLastCustomerTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Update last customer pointer',
+    Promise.all([threadIdTask, classifyTask]).then(async ([threadId, triage]) => {
+      if (!threadId || !triage) return null;
+
+      await setLastCustomerForLine(input.env, input.businessNumber, input.customerNumber);
+      d1Log.log('Last customer pointer updated', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.businessNumber,
+        },
+      });
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.businessNumber,
+      },
+    }
+  );
+
+  const emergencyDedupTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Check emergency dedupe window',
+    classifyTask.then(async (triage) => {
+      if (!triage || triage.classification !== 'emergency') return false;
+
+      const isDeduped = await hasRecentEmergencyAlert(input.env, input.businessNumber, input.customerNumber);
+      d1Log.log('Emergency dedupe evaluated', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.businessNumber,
+        },
+        data: {
+          deduped: isDeduped,
+        },
+      });
+      return isDeduped;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.businessNumber,
+      },
+    }
+  );
+
+  const inboundClassificationTask = Promise.all([classifyTask, emergencyDedupTask]).then(
+    ([triage, isDeduped]): TriageLabel | null => {
+      if (!triage) return null;
+      if (triage.classification === 'standard') return 'standard';
+      return isDeduped ? 'emergency_suppressed' : 'emergency';
+    }
+  );
+
+  const logInboundTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Log inbound message',
+    Promise.all([threadIdTask, classifyTask, inboundClassificationTask]).then(
+      async ([threadId, triage, inboundClassification]) => {
+        if (!threadId || !triage || !inboundClassification) return null;
+
+        await logSwitchboardMessage(input.env, {
+          providerMessageId: input.providerMessageId || null,
+          threadId,
+          businessNumber: input.businessNumber,
+          direction: 'inbound',
+          fromNumber: input.customerNumber,
+          toNumber: input.businessNumber,
+          messageBody: input.body,
+          classification: inboundClassification,
+          confidence: triage.confidence,
+          metadata: {
+            source: triage.source,
+            aiClassification: triage.aiClassification,
+            summary: triage.summary,
+            gptUsed: triage.gptUsed,
+            keywordMatcherMs: triage.keywordMatcherMs,
+            gptClassifierMs: triage.gptClassifierMs,
+          },
+        });
+
+        d1Log.log('Inbound message logged', {
+          context: {
+            handler: 'buildCustomerAnalysisBackgroundTasks',
+            messageSid: input.providerMessageId || null,
+            fromNumber: input.customerNumber,
+            toNumber: input.businessNumber,
+          },
+          data: {
+            classification: inboundClassification,
+          },
+        });
+        return true;
+      }
+    ),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.businessNumber,
+      },
+    }
+  );
+
+  const ownerAlertTask = input.ownerAlertEligible
+    ? withLoggedBackgroundCatch(
+        '[TWILIO]',
+        'Send owner alert',
+        Promise.all([saveInboundTask, classifyTask, inboundClassificationTask]).then(
+          async ([savedInbound, triage, inboundClassification]) => {
+            if (!savedInbound?.saved) return null;
+
+            const ownerAlertBody = buildBusinessOwnerAlertMessage({
+              classification: triage?.aiClassification ?? null,
+              summary: triage?.summary ?? null,
+              customerNumber: input.customerNumber,
+              customerMessage: input.body,
+            });
+            const ownerSms = await input.twilioClient.sendSms({
+              toPhone: input.ownerPhone,
+              fromPhone: input.businessNumber,
+              body: sanitizeForSms(ownerAlertBody),
+            });
+
+            if (!ownerSms.ok) {
+              throw new Error(ownerSms.detail || 'unknown');
+            }
+
+            const ownerAlertClassification: TriageLabel = inboundClassification || 'standard';
+            if (isSmsSuppressed(ownerSms)) {
+              twilioLog.log('Owner alert suppressed because recipient is opted out', {
+                context: {
+                  handler: 'buildCustomerAnalysisBackgroundTasks',
+                  fromNumber: input.businessNumber,
+                  toNumber: input.ownerPhone,
+                },
+                data: {
+                  classification: triage?.aiClassification || null,
+                  routingClassification: ownerAlertClassification,
+                  summary: triage?.summary || null,
+                },
+              });
+            } else {
+              twilioLog.log('Owner alert sent', {
+                context: {
+                  handler: 'buildCustomerAnalysisBackgroundTasks',
+                  messageSid: ownerSms.sid || null,
+                  fromNumber: input.businessNumber,
+                  toNumber: input.ownerPhone,
+                },
+                data: {
+                  classification: triage?.aiClassification || null,
+                  routingClassification: ownerAlertClassification,
+                  summary: triage?.summary || null,
+                },
+              });
+            }
+
+            return {
+              sid: ownerSms.sid || '',
+              suppressed: isSmsSuppressed(ownerSms),
+              body: ownerAlertBody,
+              classification: ownerAlertClassification,
+              confidence: triage?.confidence ?? 'low',
+              aiClassification: triage?.aiClassification ?? null,
+              summary: triage?.summary ?? null,
+              gptUsed: triage?.gptUsed ?? false,
+              keywordMatcherMs: triage?.keywordMatcherMs ?? null,
+              gptClassifierMs: triage?.gptClassifierMs ?? null,
+            };
+          }
+        ),
+        {
+          context: {
+            handler: 'buildCustomerAnalysisBackgroundTasks',
+            messageSid: input.providerMessageId || null,
+            fromNumber: input.businessNumber,
+            toNumber: input.ownerPhone,
+          },
+        }
+      )
+    : null;
+
+  const persistOwnerAlertTask = ownerAlertTask
+    ? withLoggedBackgroundCatch(
+        '[D1]',
+        'Persist owner alert',
+        Promise.all([ownerAlertTask, threadIdTask]).then(async ([ownerAlert, threadId]) => {
+          if (!ownerAlert || !threadId || ownerAlert.suppressed) return null;
+
+          await saveOutboundSms(
+            input.env,
+            ownerAlert.sid,
+            input.businessNumber,
+            input.ownerPhone,
+            ownerAlert.body,
+            JSON.stringify({
+              source: 'post_classification_owner_alert',
+              providerMessageId: input.providerMessageId || null,
+            })
+          );
+
+          await logSwitchboardMessage(input.env, {
+            providerMessageId: ownerAlert.sid || null,
+            threadId,
+            businessNumber: input.businessNumber,
+            direction: 'outbound',
+            fromNumber: input.businessNumber,
+            toNumber: input.ownerPhone,
+            messageBody: ownerAlert.body,
+            classification: ownerAlert.classification,
+            confidence: ownerAlert.confidence,
+            metadata: {
+              source: 'post_classification_owner_alert',
+              aiClassification: ownerAlert.aiClassification,
+              summary: ownerAlert.summary,
+              gptUsed: ownerAlert.gptUsed,
+              keywordMatcherMs: ownerAlert.keywordMatcherMs,
+              gptClassifierMs: ownerAlert.gptClassifierMs,
+            },
+          });
+
+          d1Log.log('Owner alert persisted', {
+            context: {
+              handler: 'buildCustomerAnalysisBackgroundTasks',
+              messageSid: ownerAlert.sid || null,
+              fromNumber: input.businessNumber,
+              toNumber: input.ownerPhone,
+            },
+          });
+          return true;
+        }),
+        {
+          context: {
+            handler: 'buildCustomerAnalysisBackgroundTasks',
+            messageSid: input.providerMessageId || null,
+            fromNumber: input.businessNumber,
+            toNumber: input.ownerPhone,
+          },
+        }
+      )
+    : null;
+
+  const customerReplyTask = withLoggedBackgroundCatch(
+    '[TWILIO]',
+    'Send emergency customer reply',
+    Promise.all([classifyTask, inboundClassificationTask]).then(async ([triage, inboundClassification]) => {
+      if (!triage || triage.classification !== 'emergency' || !inboundClassification) return null;
+
+      const emergencyCustomerMessage = buildEmergencyPriorityMessage(triage.summary, input.displayName);
+      const preparedBody = await prepareCustomerFacingSmsBody(
+        input.env.SYSTEMIX,
+        input.businessNumber,
+        input.customerNumber,
+        emergencyCustomerMessage
+      );
+      const customerReply = await input.twilioClient.sendSms({
+        toPhone: input.customerNumber,
+        fromPhone: input.businessNumber,
+        body: preparedBody,
+      });
+
+      if (!customerReply.ok) {
+        throw new Error(customerReply.detail || 'unknown');
+      }
+
+      if (isSmsSuppressed(customerReply)) {
+        twilioLog.log('Emergency customer reply suppressed because recipient is opted out', {
+          context: {
+            handler: 'buildCustomerAnalysisBackgroundTasks',
+            fromNumber: input.businessNumber,
+            toNumber: input.customerNumber,
+          },
+          data: {
+            summary: triage.summary,
+          },
+        });
+      } else {
+        twilioLog.log('Emergency customer reply sent', {
+          context: {
+            handler: 'buildCustomerAnalysisBackgroundTasks',
+            messageSid: customerReply.sid || null,
+            fromNumber: input.businessNumber,
+            toNumber: input.customerNumber,
+          },
+          data: {
+            summary: triage.summary,
+          },
+        });
+      }
+
+      return {
+        body: emergencyCustomerMessage,
+        sid: customerReply.sid || '',
+        suppressed: isSmsSuppressed(customerReply),
+        inboundClassification,
+        confidence: triage.confidence,
+        summary: triage.summary,
+      };
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+    }
+  );
+
+  const persistCustomerReplyTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Persist emergency customer reply',
+    Promise.all([customerReplyTask, threadIdTask]).then(async ([customerReply, threadId]) => {
+      if (!customerReply || !threadId || customerReply.suppressed) return null;
+
+      await saveOutboundSms(
+        input.env,
+        customerReply.sid,
+        input.businessNumber,
+        input.customerNumber,
+        customerReply.body,
+        JSON.stringify({
+          source: 'customer_emergency_confirmation',
+          inboundClassification: customerReply.inboundClassification,
+          providerMessageId: input.providerMessageId || null,
+        })
+      );
+
+      await logSwitchboardMessage(input.env, {
+        providerMessageId: customerReply.sid || null,
+        threadId,
+        businessNumber: input.businessNumber,
+        direction: 'outbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+        messageBody: customerReply.body,
+        classification: customerReply.inboundClassification,
+        confidence: customerReply.confidence,
+        metadata: {
+          target: 'customer_confirmation',
+          summary: customerReply.summary,
+          displayName: input.displayName || null,
+        },
+      });
+
+      d1Log.log('Emergency customer reply persisted', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: customerReply.sid || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.customerNumber,
+        },
+      });
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+    }
+  );
+
+  const hubspotTask = withLoggedBackgroundCatch(
+    '[HUBSPOT]',
+    'Lead sync',
+    Promise.all([classifyTask, emergencyDedupTask]).then(async ([triage, isDeduped]) => {
+      if (!triage || !input.ownerAlertEligible) return null;
+      if (triage.classification === 'emergency' && isDeduped) return null;
+
+      const result = await syncLeadToHubspot({
+        env: input.env,
+        businessNumber: input.businessNumber,
+        customerNumber: input.customerNumber,
+        summary: triage.summary,
+        classification: triage.aiClassification,
+      });
+
+      if (!result.synced) {
+        throw new Error(result.reason || 'sync_failed');
+      }
+
+      hubspotLog.log('Lead sync completed', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.customerNumber,
+        },
+      });
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+    }
+  );
+
+  const recordEmergencyTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Record emergency alert',
+    Promise.all([classifyTask, emergencyDedupTask, ownerAlertTask ?? Promise.resolve(null)]).then(
+      async ([triage, isDeduped, ownerAlert]) => {
+      if (!triage || triage.classification !== 'emergency' || isDeduped || !input.ownerAlertEligible) return null;
+      if (ownerAlertTask && (!ownerAlert || ownerAlert.suppressed)) return null;
+
+      await recordEmergencyAlert(input.env, input.businessNumber, input.customerNumber, 'emergency');
+      d1Log.log('Emergency alert recorded', {
+        context: {
+          handler: 'buildCustomerAnalysisBackgroundTasks',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.customerNumber,
+        },
+      });
+      return true;
+      }
+    ),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+    }
+  );
+
+  return [
+    saveInboundTask,
+    classifyTask,
+    threadIdTask,
+    setLastCustomerTask,
+    emergencyDedupTask,
+    logInboundTask,
+    ...(ownerAlertTask ? [ownerAlertTask] : []),
+    customerReplyTask,
+    persistCustomerReplyTask,
+    hubspotTask,
+    recordEmergencyTask,
+    ...(persistOwnerAlertTask ? [persistOwnerAlertTask] : []),
+  ];
 }
 
 async function handleCustomerInbound(input: {
@@ -1638,17 +2871,22 @@ async function handleCustomerInbound(input: {
   const threadId = await getOrCreateCustomerThread(input.env, input.businessNumber, input.customerNumber);
   const triage = await classifyCustomerMessage(input.body, input.env.OPENAI_API_KEY);
 
-  console.log('Switchboard Trace: classification timing', {
-    messageId: input.providerMessageId || null,
-    business: maskPhone(input.businessNumber),
-    customer: maskPhone(input.customerNumber),
-    keywordMatcherMs: triage.keywordMatcherMs,
-    gptClassifierMs: triage.gptClassifierMs,
-    gptUsed: triage.gptUsed,
-    classification: triage.aiClassification,
-    routingClassification: triage.classification,
-    summary: triage.summary,
-    confidence: triage.confidence,
+  classifyLog.log('Classification timing trace recorded', {
+    context: {
+      handler: 'handleCustomerInbound',
+      messageSid: input.providerMessageId || null,
+      fromNumber: input.customerNumber,
+      toNumber: input.businessNumber,
+    },
+    data: {
+      keywordMatcherMs: triage.keywordMatcherMs,
+      gptClassifierMs: triage.gptClassifierMs,
+      gptUsed: triage.gptUsed,
+      classification: triage.aiClassification,
+      routingClassification: triage.classification,
+      summary: triage.summary,
+      confidence: triage.confidence,
+    },
   });
 
   await setLastCustomerForLine(input.env, input.businessNumber, input.customerNumber);
@@ -1685,7 +2923,14 @@ async function handleCustomerInbound(input: {
       input.executionCtx,
       'HubSpot sync',
       syncToHubspot(customerPhone, classification, summary).then(() => {
-        console.log('[HUBSPOT] SUCCESS');
+        hubspotLog.log('Lead sync completed', {
+          context: {
+            handler: 'handleCustomerInbound',
+            messageSid: input.providerMessageId || null,
+            fromNumber: input.businessNumber,
+            toNumber: customerPhone,
+          },
+        });
       })
     );
   };
@@ -1724,9 +2969,17 @@ async function handleCustomerInbound(input: {
     }
 
     if (pauseState.isPaused) {
-      console.log(
-        `[PAUSED] Skipping alert for ${input.ownerPhone} - paused until ${pauseState.alertsPausedUntil || 'unknown'}`
-      );
+      twilioLog.log('Owner alert skipped because alerts are paused', {
+        context: {
+          handler: 'handleCustomerInbound',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.ownerPhone,
+        },
+        data: {
+          alertsPausedUntil: pauseState.alertsPausedUntil || 'unknown',
+        },
+      });
 
       return {
         ok: true,
@@ -1752,9 +3005,16 @@ async function handleCustomerInbound(input: {
     });
 
     if (!ownerSms.ok) {
-      console.error('Standard owner alert failed', {
-        customer: maskPhone(input.customerNumber),
-        detail: ownerSms.detail || 'unknown',
+      twilioLog.error('Standard owner alert failed', {
+        context: {
+          handler: 'handleCustomerInbound',
+          fromNumber: input.businessNumber,
+          toNumber: input.ownerPhone,
+        },
+        data: {
+          customerNumber: input.customerNumber,
+          detail: ownerSms.detail || 'unknown',
+        },
       });
 
       return {
@@ -1768,46 +3028,67 @@ async function handleCustomerInbound(input: {
       };
     }
 
-    console.log('[TWILIO] OWNER ALERT', {
-      sid: ownerSms.sid || null,
-      to: maskPhone(input.ownerPhone),
-      from: maskPhone(input.businessNumber),
-      classification: triage.aiClassification,
-      summary: triage.summary,
-    });
+    if (isSmsSuppressed(ownerSms)) {
+      twilioLog.log('Standard owner alert suppressed because recipient is opted out', {
+        context: {
+          handler: 'handleCustomerInbound',
+          fromNumber: input.businessNumber,
+          toNumber: input.ownerPhone,
+        },
+        data: {
+          classification: triage.aiClassification,
+          summary: triage.summary,
+        },
+      });
+    } else {
+      twilioLog.log('Owner alert sent', {
+        context: {
+          handler: 'handleCustomerInbound',
+          messageSid: ownerSms.sid || null,
+          fromNumber: input.businessNumber,
+          toNumber: input.ownerPhone,
+        },
+        data: {
+          classification: triage.aiClassification,
+          summary: triage.summary,
+        },
+      });
+    }
 
     queueHubspotSync(triage.aiClassification, triage.summary);
 
-    await saveOutboundSms(
-      input.env,
-      ownerSms.sid || '',
-      input.businessNumber,
-      input.ownerPhone,
-      ownerAlertBody,
-      JSON.stringify({
-        source: 'standard_owner_alert',
-        providerMessageId: input.providerMessageId || null,
-      })
-    );
+    if (!isSmsSuppressed(ownerSms)) {
+      await saveOutboundSms(
+        input.env,
+        ownerSms.sid || '',
+        input.businessNumber,
+        input.ownerPhone,
+        ownerAlertBody,
+        JSON.stringify({
+          source: 'standard_owner_alert',
+          providerMessageId: input.providerMessageId || null,
+        })
+      );
 
-    await logSwitchboardMessage(input.env, {
-      providerMessageId: ownerSms.sid || null,
-      threadId,
-      businessNumber: input.businessNumber,
-      direction: 'outbound',
-      fromNumber: input.businessNumber,
-      toNumber: input.ownerPhone,
-      messageBody: ownerAlertBody,
-      classification: 'standard',
-      confidence: triage.confidence,
-      metadata: {
-        source: 'existing_standard_auto_reply_logic',
-        aiClassification: triage.aiClassification,
-        summary: triage.summary,
-        keywordMatcherMs: triage.keywordMatcherMs,
-        gptClassifierMs: triage.gptClassifierMs,
-      },
-    });
+      await logSwitchboardMessage(input.env, {
+        providerMessageId: ownerSms.sid || null,
+        threadId,
+        businessNumber: input.businessNumber,
+        direction: 'outbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+        messageBody: ownerAlertBody,
+        classification: 'standard',
+        confidence: triage.confidence,
+        metadata: {
+          source: 'existing_standard_auto_reply_logic',
+          aiClassification: triage.aiClassification,
+          summary: triage.summary,
+          keywordMatcherMs: triage.keywordMatcherMs,
+          gptClassifierMs: triage.gptClassifierMs,
+        },
+      });
+    }
 
     return {
       ok: true,
@@ -1817,7 +3098,7 @@ async function handleCustomerInbound(input: {
       summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
-      ownerAlertSid: ownerSms.sid || null,
+      ownerAlertSid: isSmsSuppressed(ownerSms) ? null : ownerSms.sid || null,
     };
   }
 
@@ -1858,9 +3139,15 @@ async function handleCustomerInbound(input: {
   });
 
   if (!customerReply.ok) {
-    console.error('Customer emergency confirmation failed', {
-      customer: maskPhone(input.customerNumber),
-      detail: customerReply.detail || 'unknown',
+    twilioLog.error('Customer emergency confirmation failed', {
+      context: {
+        handler: 'handleCustomerInbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+      data: {
+        detail: customerReply.detail || 'unknown',
+      },
     });
 
     return {
@@ -1874,42 +3161,61 @@ async function handleCustomerInbound(input: {
     };
   }
 
-  console.log('[TWILIO] EMERGENCY SMS SENT', {
-    sid: customerReply.sid || null,
-    customer_number: input.customerNumber,
-    summary: triage.summary,
-  });
+  if (isSmsSuppressed(customerReply)) {
+    twilioLog.log('Emergency customer reply suppressed because recipient is opted out', {
+      context: {
+        handler: 'handleCustomerInbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+      data: {
+        summary: triage.summary,
+      },
+    });
+  } else {
+    twilioLog.log('Emergency customer reply sent', {
+      context: {
+        handler: 'handleCustomerInbound',
+        messageSid: customerReply.sid || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.customerNumber,
+      },
+      data: {
+        summary: triage.summary,
+      },
+    });
 
-  await saveOutboundSms(
-    input.env,
-    customerReply.sid || '',
-    input.businessNumber,
-    input.customerNumber,
-    emergencyCustomerMessage,
-    JSON.stringify({
-      source: 'customer_emergency_confirmation',
-      inboundClassification,
-      providerMessageId: input.providerMessageId || null,
-    })
-  );
+    await saveOutboundSms(
+      input.env,
+      customerReply.sid || '',
+      input.businessNumber,
+      input.customerNumber,
+      emergencyCustomerMessage,
+      JSON.stringify({
+        source: 'customer_emergency_confirmation',
+        inboundClassification,
+        providerMessageId: input.providerMessageId || null,
+      })
+    );
 
-  await logSwitchboardMessage(input.env, {
-    providerMessageId: customerReply.sid || null,
-    threadId,
-    businessNumber: input.businessNumber,
-    direction: 'outbound',
-    fromNumber: input.businessNumber,
-    toNumber: input.customerNumber,
-    messageBody: emergencyCustomerMessage,
-    classification: inboundClassification,
-    confidence: triage.confidence,
-    metadata: {
-      target: 'customer_confirmation',
-      deduped: isDeduped,
-      summary: triage.summary,
-      displayName: input.displayName || null,
-    },
-  });
+    await logSwitchboardMessage(input.env, {
+      providerMessageId: customerReply.sid || null,
+      threadId,
+      businessNumber: input.businessNumber,
+      direction: 'outbound',
+      fromNumber: input.businessNumber,
+      toNumber: input.customerNumber,
+      messageBody: emergencyCustomerMessage,
+      classification: inboundClassification,
+      confidence: triage.confidence,
+      metadata: {
+        target: 'customer_confirmation',
+        deduped: isDeduped,
+        summary: triage.summary,
+        displayName: input.displayName || null,
+      },
+    });
+  }
 
   if (isDeduped) {
     return {
@@ -1920,7 +3226,7 @@ async function handleCustomerInbound(input: {
       summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
-      customerReplySid: customerReply.sid || null,
+      customerReplySid: isSmsSuppressed(customerReply) ? null : customerReply.sid || null,
     };
   }
 
@@ -1933,7 +3239,7 @@ async function handleCustomerInbound(input: {
       summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
-      customerReplySid: customerReply.sid || null,
+      customerReplySid: isSmsSuppressed(customerReply) ? null : customerReply.sid || null,
     };
   }
 
@@ -1953,9 +3259,17 @@ async function handleCustomerInbound(input: {
     : baseOwnerAlertBody;
 
   if (pauseState.isPaused) {
-    console.log(
-      `[PAUSED] Skipping alert for ${input.ownerPhone} - paused until ${pauseState.alertsPausedUntil || 'unknown'}`
-    );
+    twilioLog.log('Owner alert skipped because alerts are paused', {
+      context: {
+        handler: 'handleCustomerInbound',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        alertsPausedUntil: pauseState.alertsPausedUntil || 'unknown',
+      },
+    });
 
     return {
       ok: true,
@@ -1965,7 +3279,7 @@ async function handleCustomerInbound(input: {
       summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
-      customerReplySid: customerReply.sid || null,
+      customerReplySid: isSmsSuppressed(customerReply) ? null : customerReply.sid || null,
       ownerAlertSid: null,
     };
   }
@@ -1977,9 +3291,16 @@ async function handleCustomerInbound(input: {
   });
 
   if (!ownerAlert.ok) {
-    console.error('Emergency owner alert failed', {
-      customer: maskPhone(input.customerNumber),
-      detail: ownerAlert.detail || 'unknown',
+    twilioLog.error('Emergency owner alert failed', {
+      context: {
+        handler: 'handleCustomerInbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        customerNumber: input.customerNumber,
+        detail: ownerAlert.detail || 'unknown',
+      },
     });
 
     return {
@@ -1990,57 +3311,78 @@ async function handleCustomerInbound(input: {
       summary: triage.summary,
       confidence: triage.confidence,
       gptUsed: triage.gptUsed,
-      customerReplySid: customerReply.sid || null,
+      customerReplySid: isSmsSuppressed(customerReply) ? null : customerReply.sid || null,
     };
   }
 
-  console.log('[TWILIO] OWNER ALERT', {
-    sid: ownerAlert.sid || null,
-    to: maskPhone(input.ownerPhone),
-    from: maskPhone(input.businessNumber),
-    classification: triage.aiClassification,
-    summary: triage.summary,
-  });
+  if (isSmsSuppressed(ownerAlert)) {
+    twilioLog.log('Emergency owner alert suppressed because recipient is opted out', {
+      context: {
+        handler: 'handleCustomerInbound',
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        classification: triage.aiClassification,
+        summary: triage.summary,
+      },
+    });
+  } else {
+    twilioLog.log('Owner alert sent', {
+      context: {
+        handler: 'handleCustomerInbound',
+        messageSid: ownerAlert.sid || null,
+        fromNumber: input.businessNumber,
+        toNumber: input.ownerPhone,
+      },
+      data: {
+        classification: triage.aiClassification,
+        summary: triage.summary,
+      },
+    });
+  }
 
   queueHubspotSync(triage.aiClassification, triage.summary);
 
-  await saveOutboundSms(
-    input.env,
-    ownerAlert.sid || '',
-    input.businessNumber,
-    input.ownerPhone,
-    ownerAlertBody,
-    JSON.stringify({
-      source: 'owner_emergency_alert',
-      triageConfidence: triage.confidence,
-      providerMessageId: input.providerMessageId || null,
-      hasMultipleActiveThreads,
-    })
-  );
-
   const ownerAlertClassification: TriageLabel = 'emergency';
 
-  await logSwitchboardMessage(input.env, {
-    providerMessageId: ownerAlert.sid || null,
-    threadId,
-    businessNumber: input.businessNumber,
-    direction: 'outbound',
-    fromNumber: input.businessNumber,
-    toNumber: input.ownerPhone,
-    messageBody: ownerAlertBody,
-    classification: ownerAlertClassification,
-    confidence: triage.confidence,
-    metadata: {
-      source: 'owner_emergency_alert',
-      hasMultipleActiveThreads,
-      aiClassification: triage.aiClassification,
-      summary: triage.summary,
-      keywordMatcherMs: triage.keywordMatcherMs,
-      gptClassifierMs: triage.gptClassifierMs,
-    },
-  });
+  if (!isSmsSuppressed(ownerAlert)) {
+    await saveOutboundSms(
+      input.env,
+      ownerAlert.sid || '',
+      input.businessNumber,
+      input.ownerPhone,
+      ownerAlertBody,
+      JSON.stringify({
+        source: 'owner_emergency_alert',
+        triageConfidence: triage.confidence,
+        providerMessageId: input.providerMessageId || null,
+        hasMultipleActiveThreads,
+      })
+    );
 
-  await recordEmergencyAlert(input.env, input.businessNumber, input.customerNumber, ownerAlertClassification);
+    await logSwitchboardMessage(input.env, {
+      providerMessageId: ownerAlert.sid || null,
+      threadId,
+      businessNumber: input.businessNumber,
+      direction: 'outbound',
+      fromNumber: input.businessNumber,
+      toNumber: input.ownerPhone,
+      messageBody: ownerAlertBody,
+      classification: ownerAlertClassification,
+      confidence: triage.confidence,
+      metadata: {
+        source: 'owner_emergency_alert',
+        hasMultipleActiveThreads,
+        aiClassification: triage.aiClassification,
+        summary: triage.summary,
+        keywordMatcherMs: triage.keywordMatcherMs,
+        gptClassifierMs: triage.gptClassifierMs,
+      },
+    });
+
+    await recordEmergencyAlert(input.env, input.businessNumber, input.customerNumber, ownerAlertClassification);
+  }
 
   return {
     ok: true,
@@ -2050,8 +3392,8 @@ async function handleCustomerInbound(input: {
     summary: triage.summary,
     confidence: triage.confidence,
     gptUsed: triage.gptUsed,
-    customerReplySid: customerReply.sid || null,
-    ownerAlertSid: ownerAlert.sid || null,
+    customerReplySid: isSmsSuppressed(customerReply) ? null : customerReply.sid || null,
+    ownerAlertSid: isSmsSuppressed(ownerAlert) ? null : ownerAlert.sid || null,
   };
 }
 
@@ -2060,7 +3402,11 @@ export async function checkEmergencyTimeouts(env: Bindings): Promise<void> {
 
   const twilioClient = createTwilioRestClient(env);
   if (!twilioClient) {
-    console.error('Emergency timeout check skipped: missing Twilio credentials');
+    twilioLog.error('Emergency timeout check skipped because Twilio credentials are missing', {
+      context: {
+        handler: 'checkEmergencyTimeouts',
+      },
+    });
     return;
   }
 
@@ -2138,10 +3484,26 @@ export async function checkEmergencyTimeouts(env: Bindings): Promise<void> {
     });
 
     if (!timeoutReply.ok) {
-      console.error('Emergency timeout auto-reply failed', {
-        business: maskPhone(businessNumber),
-        customer: maskPhone(customerNumber),
-        detail: timeoutReply.detail || 'unknown',
+      twilioLog.error('Emergency timeout auto-reply failed', {
+        context: {
+          handler: 'checkEmergencyTimeouts',
+          fromNumber: businessNumber,
+          toNumber: customerNumber,
+        },
+        data: {
+          detail: timeoutReply.detail || 'unknown',
+        },
+      });
+      continue;
+    }
+
+    if (isSmsSuppressed(timeoutReply)) {
+      twilioLog.log('Emergency timeout auto-reply suppressed because recipient is opted out', {
+        context: {
+          handler: 'checkEmergencyTimeouts',
+          fromNumber: businessNumber,
+          toNumber: customerNumber,
+        },
       });
       continue;
     }
@@ -2180,10 +3542,28 @@ export async function checkEmergencyTimeouts(env: Bindings): Promise<void> {
 
 export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
   try {
+    const formData = await c.req.formData();
+    const providerMessageId =
+      ((formData.get('MessageSid') as string) || (formData.get('SmsSid') as string) || '').trim();
+
+    if (await hasExistingMessageSid(c.env, providerMessageId)) {
+      d1Log.log('Duplicate MessageSid ignored', {
+        context: {
+          handler: 'twilioSmsHandler',
+          messageSid: providerMessageId,
+        },
+      });
+      return respondWithEmptyTwiml(c);
+    }
+
     await ensureSwitchboardSchema(c.env);
 
-    const formData = await c.req.formData();
     const params = formDataToParams(formData);
+    const from = ((formData.get('From') as string) || '').trim();
+    const to = ((formData.get('To') as string) || '').trim();
+    const body = ((formData.get('Body') as string) || '').trim();
+    const inboundFrom = normalizePhone(from) || from || 'unknown';
+    const inboundTo = normalizePhone(to) || to || 'unknown';
 
     const sig = await checkTwilioSignature(
       c.env,
@@ -2192,102 +3572,118 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      console.error('Twilio SMS signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
+      twilioLog.error('Twilio SMS signature rejected and request processing continued', {
+        context: {
+          handler: 'twilioSmsHandler',
+          messageSid: providerMessageId,
+          fromNumber: inboundFrom,
+          toNumber: inboundTo,
+        },
+        data: {
+          mode: sig.mode,
+          reason: sig.reason,
+        },
+      });
     }
 
-    const from = ((formData.get('From') as string) || '').trim();
-    const to = ((formData.get('To') as string) || '').trim();
-    const body = ((formData.get('Body') as string) || '').trim();
-    const providerMessageId =
-      ((formData.get('MessageSid') as string) || (formData.get('SmsSid') as string) || '').trim();
-
-    const inboundFrom = normalizePhone(from) || from || 'unknown';
-    const inboundTo = normalizePhone(to) || to || 'unknown';
     const businessContext = await resolveBusinessContext(c.env, inboundTo);
-    const ownerPhone = businessContext?.ownerPhone || '';
-    const isForcedTestLead = body.toUpperCase().includes('TEST LEAD');
-    const route: 'owner_proxy' | 'customer_analysis' = ownerPhone && phonesEqual(inboundFrom, ownerPhone) && !isForcedTestLead
-      ? 'owner_proxy'
-      : 'customer_analysis';
+    const resolvedBusinessNumber = businessContext?.businessNumber || inboundTo;
+    const complianceAction = resolveInboundSmsComplianceAction(body);
 
     const rawJson = JSON.stringify({
       source: 'twilio_sms_webhook',
-      route,
       from: inboundFrom,
       to: inboundTo,
       body,
       providerMessageId,
-      isForcedTestLead,
       form: params,
+      route: complianceAction ? 'compliance_gate' : 'sms_router',
+      complianceAction,
     });
-
-    const savedInbound = await saveInboundSms(c.env, inboundFrom, inboundTo, body, providerMessageId, rawJson);
-    if (!savedInbound.saved) {
-      return c.json({ ok: true, deduped: true }, 200);
-    }
-
-    if (!businessContext) {
-      await handleUnknownBusinessLine({
-        env: c.env,
-        inboundFrom,
-        inboundTo,
-        body,
-        providerMessageId,
-        route,
-        rawParams: params,
-      });
-
-      return c.json({ ok: false, error: 'unresolved_business_line' }, 200);
-    }
-
-    if (!ownerPhone) {
-      await logSwitchboardEvent(c.env, 'missing_owner_mapping', {
-        businessNumber: businessContext.businessNumber,
-        fromNumber: inboundFrom,
-        toNumber: inboundTo,
-        metadata: {
-          reason: 'missing_owner_phone_number_for_business',
-          providerMessageId: providerMessageId || null,
-        },
-      });
-      return c.json({ ok: false, error: 'missing_owner_phone_number_for_business' }, 200);
-    }
-
-    const resolvedBusinessNumber = businessContext.businessNumber;
-
-    if (isForcedTestLead) {
-      scheduleTwilioBackgroundTask(
-        c.executionCtx,
-        'Forced lead HubSpot sync',
-        syncLeadToHubspot({
-          env: c.env,
-          businessNumber: resolvedBusinessNumber,
-          customerNumber: inboundFrom,
-          summary: buildLeadSummary('inquiry', body),
-          classification: 'inquiry',
-        })
-          .then((result) => {
-            if (!result.synced) {
-              throw new Error(result.reason || 'sync_failed');
-            }
-            console.log('[HUBSPOT] SUCCESS');
-          })
-      );
-
-      return c.json(
-        {
-          ok: true,
-          mode: 'customer_analysis',
-          handledAs: 'forced_test_lead',
-          hubspotQueued: true,
-        },
-        200
-      );
-    }
 
     const twilioClient = createTwilioRestClient(c.env);
     if (!twilioClient) {
       return c.json({ ok: false, error: 'missing_twilio_credentials' }, 200);
+    }
+
+    if (complianceAction) {
+      scheduleSettledBackgroundTasks(
+        c.executionCtx,
+        buildComplianceCommandBackgroundTasks({
+          env: c.env,
+          twilioClient,
+          action: complianceAction,
+          businessNumber: resolvedBusinessNumber,
+          displayName: businessContext?.displayName || '',
+          inboundFrom,
+          inboundTo,
+          body,
+          providerMessageId,
+          rawJson,
+        })
+      );
+
+      return respondWithEmptyTwiml(c);
+    }
+
+    const ownerPhone = businessContext?.ownerPhone || '';
+    const isForcedTestLead = body.toUpperCase().includes('TEST LEAD');
+    const route: 'owner_proxy' | 'customer_analysis' =
+      ownerPhone && phonesEqual(inboundFrom, ownerPhone) && !isForcedTestLead
+        ? 'owner_proxy'
+        : 'customer_analysis';
+
+    if (!businessContext) {
+      scheduleSettledBackgroundTasks(
+        c.executionCtx,
+        buildUnknownBusinessBackgroundTasks({
+          env: c.env,
+          inboundFrom,
+          inboundTo,
+          body,
+          providerMessageId,
+          route,
+          rawParams: params,
+          rawJson,
+        })
+      );
+
+      return respondWithEmptyTwiml(c);
+    }
+
+    if (!ownerPhone) {
+      scheduleSettledBackgroundTasks(
+        c.executionCtx,
+        buildMissingOwnerMappingBackgroundTasks({
+          env: c.env,
+          inboundFrom,
+          inboundTo,
+          body,
+          providerMessageId,
+          rawJson,
+          businessNumber: businessContext.businessNumber,
+        })
+      );
+      return respondWithEmptyTwiml(c);
+    }
+
+    const activeBusinessNumber = businessContext.businessNumber;
+
+    if (isForcedTestLead) {
+      scheduleSettledBackgroundTasks(
+        c.executionCtx,
+        buildForcedLeadBackgroundTasks({
+          env: c.env,
+          businessNumber: activeBusinessNumber,
+          customerNumber: inboundFrom,
+          body,
+          inboundTo,
+          providerMessageId,
+          rawJson,
+        })
+      );
+
+      return respondWithEmptyTwiml(c);
     }
 
     if (route === 'owner_proxy') {
@@ -2295,12 +3691,17 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
         return c.json({ ok: false, error: 'missing_owner_phone_number' }, 200);
       }
 
+      const savedInbound = await saveInboundSms(c.env, inboundFrom, inboundTo, body, providerMessageId, rawJson);
+      if (!savedInbound.saved) {
+        return respondWithEmptyTwiml(c);
+      }
+
       const command = parseOwnerCommand(body);
       if (command) {
         const commandResult = await handleOwnerCommand({
           env: c.env,
           command,
-          businessNumber: resolvedBusinessNumber,
+          businessNumber: activeBusinessNumber,
           ownerPhone,
           inboundBody: body,
           providerMessageId,
@@ -2325,7 +3726,7 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
 
       const relayResult = await handleOwnerRelay({
         env: c.env,
-        businessNumber: resolvedBusinessNumber,
+        businessNumber: activeBusinessNumber,
         ownerPhone,
         inboundBody: body,
         providerMessageId,
@@ -2348,39 +3749,64 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
       );
     }
 
-    const customerResult = await handleCustomerInbound({
-      env: c.env,
-      twilioClient,
-      businessNumber: resolvedBusinessNumber,
-      ownerPhone,
-      displayName: businessContext.displayName,
-      customerNumber: inboundFrom,
-      body,
-      providerMessageId,
-      executionCtx: c.executionCtx,
-    });
+    const pauseState = ownerPhone
+      ? await getOwnerAlertPauseState(c.env, activeBusinessNumber, ownerPhone)
+      : {
+          isPaused: false,
+          alertsPausedUntil: null,
+          pauseColumnAvailable: true,
+        };
 
-    if (!customerResult.ok) {
-      return c.json({ ok: false, error: 'customer_analysis_failed' }, 200);
+    const ownerAlertEligible = !pauseState.isPaused;
+
+    if (!ownerAlertEligible) {
+      twilioLog.log('Owner alert skipped because alerts are paused', {
+        context: {
+          handler: 'twilioSmsHandler',
+          messageSid: providerMessageId,
+          fromNumber: resolvedBusinessNumber,
+          toNumber: ownerPhone,
+        },
+        data: {
+          alertsPausedUntil: pauseState.alertsPausedUntil || 'unknown',
+        },
+      });
     }
 
-    return c.json(
-      {
-        ok: true,
-        mode: customerResult.mode,
-        classification: customerResult.aiClassification,
-        routingClassification: customerResult.routingClassification,
-        summary: customerResult.summary,
-        confidence: customerResult.confidence,
-        gptUsed: customerResult.gptUsed,
-        customerReplySid: customerResult.customerReplySid || null,
-        ownerAlertSid: customerResult.ownerAlertSid || null,
-      },
-      200
+    scheduleSettledBackgroundTasks(
+      c.executionCtx,
+        buildCustomerAnalysisBackgroundTasks({
+          env: c.env,
+          twilioClient,
+          businessNumber: activeBusinessNumber,
+          ownerPhone,
+          displayName: businessContext.displayName,
+        customerNumber: inboundFrom,
+        inboundTo,
+        body,
+        providerMessageId,
+        rawJson,
+        ownerAlertEligible,
+      })
     );
+
+    twilioLog.log('Returning empty SMS TwiML', {
+      context: {
+        handler: 'twilioSmsHandler',
+        messageSid: providerMessageId || null,
+        fromNumber: resolvedBusinessNumber,
+        toNumber: inboundFrom,
+      },
+    });
+
+    return respondWithEmptyTwiml(c);
   } catch (error) {
-    console.error('Twilio SMS handler error');
-    console.error(error);
+    twilioLog.error('Twilio SMS handler failed', {
+      error,
+      context: {
+        handler: 'twilioSmsHandler',
+      },
+    });
     return c.json({ ok: false, error: 'processing_failed' }, 200);
   }
 }

@@ -1,4 +1,4 @@
-import { processCall } from '../services/processCall';
+import { processCall } from '../services/processCall.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;

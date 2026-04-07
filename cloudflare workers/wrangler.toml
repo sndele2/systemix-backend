@@ -12,6 +12,12 @@ migrations_dir = "api-main/api/migrations"
 database_name = "systemix"
 database_id = "b6573bdd-c88d-4480-a882-745fb10177c7"  # Get this from: wrangler d1 list
 
+[[d1_databases]]
+binding = "DB"
+migrations_dir = "api-main/api/migrations"
+database_name = "systemix"
+database_id = "b6573bdd-c88d-4480-a882-745fb10177c7"
+
 [[kv_namespaces]]
 binding = "SYSTEMIX_KV"
 id = "8daf7908b2534de989c486d3e98f5216"
@@ -30,6 +36,7 @@ VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but
 TWILIO_SIGNATURE_MODE = "log"
 ENVIRONMENT = "production"
 SYSTEMIX_NUMBER = "+18443217137"
+WORKER_URL = "https://systemix-backend.sean-ndele.workers.dev"
 
 [env.production]
 name = "systemix-backend"
@@ -39,9 +46,16 @@ VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but
 TWILIO_SIGNATURE_MODE = "log"
 ENVIRONMENT = "production"
 SYSTEMIX_NUMBER = "+18443217137"
+WORKER_URL = "https://systemix-backend.sean-ndele.workers.dev"
 
 [[env.production.d1_databases]]
 binding = "SYSTEMIX"
+migrations_dir = "api-main/api/migrations"
+database_name = "systemix"
+database_id = "b6573bdd-c88d-4480-a882-745fb10177c7"
+
+[[env.production.d1_databases]]
+binding = "DB"
 migrations_dir = "api-main/api/migrations"
 database_name = "systemix"
 database_id = "b6573bdd-c88d-4480-a882-745fb10177c7"
@@ -62,6 +76,12 @@ SYSTEMIX_NUMBER = "+1XXXXXXXXXX"
 
 [[env.dev.d1_databases]]
 binding = "SYSTEMIX"
+migrations_dir = "api-main/api/migrations"
+database_name = "systemix-dev"
+database_id = "82088792-6c4a-41fc-95a0-1d5129c1c3f3"
+
+[[env.dev.d1_databases]]
+binding = "DB"
 migrations_dir = "api-main/api/migrations"
 database_name = "systemix-dev"
 database_id = "82088792-6c4a-41fc-95a0-1d5129c1c3f3"

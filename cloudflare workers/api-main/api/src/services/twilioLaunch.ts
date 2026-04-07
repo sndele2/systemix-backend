@@ -1,4 +1,6 @@
-import type { AiLeadClassification } from './openai';
+import type { AiLeadClassification } from './openai.ts';
+import { createLogger } from '../core/logging.ts';
+import type { TwilioRestClient } from '../core/sms.ts';
 import { prepareCustomerFacingSmsBody } from './smsCompliance.ts';
 
 export const MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER = '+18443217137';
@@ -6,12 +8,15 @@ export const MISSED_CALL_VOICE_HOOK_MESSAGE =
   "Sorry we missed your call! What's going on? We can get a tech out faster if we have the details here.";
 
 const MISSED_CALL_VOICE_HOOK_STATUSES = new Set(['busy', 'no-answer']);
-
-type TwilioRestClient = {
-  sendSms: (
-    input: { toPhone: string; fromPhone: string; body: string }
-  ) => Promise<{ ok: boolean; sid?: string; detail?: string }>;
-};
+const OWNER_ALERT_MAX_SMS_BODY = 1500;
+const DEFAULT_OWNER_ISSUE_LABEL = 'General Inquiry';
+const UNKNOWN_PHONE_LABEL = 'Unknown';
+const OWNER_ALERT_SUMMARY_PREFIXES = [
+  'Customer reports an emergency home-service issue:',
+  'Customer is requesting home-service help or information:',
+  'Message appears unrelated to a legitimate home-service lead:',
+  'Customer needs follow-up:',
+] as const;
 
 type OnboardNewLeadInput = {
   db: D1Database;
@@ -39,17 +44,14 @@ type OnboardNewLeadResult =
       detail: string;
     };
 
-function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.stack || error.message;
-  }
+export type BusinessOwnerAlertInput = {
+  classification?: AiLeadClassification | null;
+  summary?: string | null;
+  customerNumber?: string | null;
+  customerMessage: string;
+};
 
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
-}
+const twilioLog = createLogger('[TWILIO]', 'scheduleTwilioBackgroundTask');
 
 export function normalizePhone(value: string | null | undefined): string {
   const raw = (value || '').trim();
@@ -67,6 +69,66 @@ export function normalizePhone(value: string | null | undefined): string {
 
 export function normalizeCallStatus(value: string | null | undefined): string {
   return (value || '').trim().toLowerCase();
+}
+
+export function formatDisplayPhoneNumber(value: string | null | undefined): string {
+  const normalizedPhone = normalizePhone(value);
+  if (!normalizedPhone) {
+    return UNKNOWN_PHONE_LABEL;
+  }
+
+  const digits = normalizedPhone.replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) {
+    return `(${digits.slice(1, 4)}) ${digits.slice(4, 7)}-${digits.slice(7)}`;
+  }
+
+  return normalizedPhone;
+}
+
+function cleanBusinessOwnerIssueLabel(summary: string | null | undefined): string {
+  let cleaned = (summary || '').trim();
+
+  for (const prefix of OWNER_ALERT_SUMMARY_PREFIXES) {
+    if (cleaned.startsWith(prefix)) {
+      cleaned = cleaned.slice(prefix.length).trim();
+      break;
+    }
+  }
+
+  cleaned = cleaned.replace(/\s+/g, ' ').trim().replace(/[.!?]+$/g, '').trim();
+  return cleaned || DEFAULT_OWNER_ISSUE_LABEL;
+}
+
+function truncateOwnerAlertMessage(message: string, maxLength: number): string {
+  if (maxLength <= 0) {
+    return '';
+  }
+
+  if (message.length <= maxLength) {
+    return message;
+  }
+
+  if (maxLength <= 3) {
+    return '.'.repeat(maxLength);
+  }
+
+  return `${message.slice(0, maxLength - 3).replace(/\s+$/u, '')}...`;
+}
+
+export function buildBusinessOwnerAlertMessage(input: BusinessOwnerAlertInput): string {
+  const isEmergency = input.classification === 'emergency';
+  const heading = isEmergency ? '🚨 EMERGENCY LEAD' : '📩 NEW LEAD';
+  const issueLabel = cleanBusinessOwnerIssueLabel(input.summary);
+  const customerPhone = formatDisplayPhoneNumber(input.customerNumber);
+  const actionLine = isEmergency ? 'Call now' : 'Reply or call';
+  const prefix = `${heading}\n\nIssue: ${issueLabel}\nCustomer: ${customerPhone}\n\nMessage:\n"`;
+  const suffix = `"\n\n${actionLine}: ${customerPhone}`;
+  const truncatedMessage = truncateOwnerAlertMessage(
+    input.customerMessage,
+    Math.max(0, OWNER_ALERT_MAX_SMS_BODY - prefix.length - suffix.length)
+  );
+
+  return `${prefix}${truncatedMessage}${suffix}`;
 }
 
 export function shouldFireMissedCallVoiceHook(status: string, toPhone: string): boolean {
@@ -116,12 +178,7 @@ export function buildEmergencyPriorityMessage(
   summary: string | null | undefined,
   displayName: string | null | undefined
 ): string {
-  const resolvedSummary = (summary || '').trim() || 'your request';
-  const resolvedTeamName = (displayName || '').trim()
-    ? `the ${(displayName || '').trim()} team`
-    : 'the team';
-
-  return `Emergency Priority: I've escalated your '${resolvedSummary}' to ${resolvedTeamName}. Expect a call in the next few minutes.`;
+  return "🚨 Got it - we're on this. A local service provider has been notified and will call shortly. If not, reply here and we'll follow up.";
 }
 
 export function buildOwnerAlertMessage(
@@ -148,10 +205,19 @@ export function scheduleTwilioBackgroundTask(
   task: Promise<void>
 ): void {
   const wrappedTask = task
-    .then(() => console.log(`[TWILIO] ${label} complete`))
+    .then(() =>
+      twilioLog.log('Background task complete', {
+        data: {
+          label,
+        },
+      })
+    )
     .catch((error) =>
-      console.log(`[TWILIO] ${label} failed`, {
-        error: describeError(error),
+      twilioLog.error('Background task failed', {
+        error,
+        data: {
+          label,
+        },
       })
     );
 
@@ -222,6 +288,7 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
   const sms = await input.twilioClient.sendSms({
     toPhone: callerNumber,
     fromPhone: smsFrom,
+    businessNumber: business.business_number,
     body: await prepareCustomerFacingSmsBody(
       input.db,
       business.business_number,

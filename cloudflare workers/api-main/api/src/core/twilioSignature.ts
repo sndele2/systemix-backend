@@ -1,10 +1,15 @@
+import { createLogger } from './logging.ts';
+
 export type TwilioSignatureMode = 'off' | 'log' | 'enforce';
 
 type TwilioSignatureEnv = {
   TWILIO_AUTH_TOKEN: string;
   TWILIO_SIGNATURE_MODE?: string;
   ENVIRONMENT?: string;
+  WORKER_URL?: string;
 };
+
+const twilioLog = createLogger('[TWILIO]', 'checkTwilioSignature');
 
 function toBase64(bytes: Uint8Array): string {
   let binary = '';
@@ -46,6 +51,41 @@ function resolveMode(env: TwilioSignatureEnv): TwilioSignatureMode {
   return env.ENVIRONMENT === 'production' ? 'enforce' : 'off';
 }
 
+function resolveWorkerBaseUrl(env: Pick<TwilioSignatureEnv, 'WORKER_URL'>, requestUrl: string): URL {
+  const configuredWorkerUrl = (env.WORKER_URL || '').trim();
+  const baseUrl = new URL(configuredWorkerUrl || requestUrl);
+  baseUrl.protocol = 'https:';
+  baseUrl.username = '';
+  baseUrl.password = '';
+  baseUrl.pathname = '/';
+  baseUrl.search = '';
+  baseUrl.hash = '';
+  return baseUrl;
+}
+
+export function buildTwilioValidationUrl(
+  env: Pick<TwilioSignatureEnv, 'WORKER_URL'>,
+  requestUrl: string
+): string {
+  const incomingUrl = new URL(requestUrl);
+  const publicUrl = resolveWorkerBaseUrl(env, requestUrl);
+  publicUrl.pathname = incomingUrl.pathname;
+  publicUrl.search = incomingUrl.search;
+  return publicUrl.toString();
+}
+
+export function buildWorkerCallbackUrl(
+  env: Pick<TwilioSignatureEnv, 'WORKER_URL'>,
+  requestUrl: string,
+  pathname: string,
+  params?: URLSearchParams
+): string {
+  const publicUrl = resolveWorkerBaseUrl(env, requestUrl);
+  publicUrl.pathname = pathname;
+  publicUrl.search = params && params.size > 0 ? `?${params.toString()}` : '';
+  return publicUrl.toString();
+}
+
 export async function verifyTwilioSignature(
   authToken: string,
   url: string,
@@ -66,22 +106,55 @@ export async function verifyTwilioSignature(
 
 export async function checkTwilioSignature(
   env: TwilioSignatureEnv,
-  url: string,
+  requestUrl: string,
   params: Record<string, string>,
   signatureHeader?: string
 ): Promise<{ ok: boolean; mode: TwilioSignatureMode; reason?: string }> {
   const mode = resolveMode(env);
   if (mode === 'off') return { ok: true, mode };
 
+  const urlUsedForSignature = buildTwilioValidationUrl(env, requestUrl);
+  twilioLog.log('Resolved Twilio signature validation URL', {
+    data: {
+      mode,
+      urlUsedForSignature,
+    },
+  });
+
   if (!signatureHeader) {
     const reason = 'missing_signature';
-    if (mode === 'log') console.warn('Twilio signature missing');
+    twilioLog.error('Twilio signature validation failed', {
+      data: {
+        mode,
+        reason,
+        urlUsedForSignature,
+      },
+    });
     return { ok: mode !== 'enforce', mode, reason };
   }
 
-  const valid = await verifyTwilioSignature(env.TWILIO_AUTH_TOKEN, url, params, signatureHeader);
-  if (!valid && mode === 'log') {
-    console.warn('Twilio signature verification failed');
+  const valid = await verifyTwilioSignature(
+    env.TWILIO_AUTH_TOKEN,
+    urlUsedForSignature,
+    params,
+    signatureHeader
+  );
+
+  if (valid) {
+    twilioLog.log('Twilio signature validated', {
+      data: {
+        mode,
+        urlUsedForSignature,
+      },
+    });
+  } else {
+    twilioLog.error('Twilio signature validation failed', {
+      data: {
+        mode,
+        reason: 'invalid_signature',
+        urlUsedForSignature,
+      },
+    });
   }
 
   return { ok: valid || mode === 'log', mode, reason: valid ? undefined : 'invalid_signature' };

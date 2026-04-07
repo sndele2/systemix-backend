@@ -1,11 +1,12 @@
-import { Context } from 'hono';
-import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature';
+import type { Context } from 'hono';
+import { createLogger } from '../core/logging.ts';
+import { createTwilioRestClient } from '../core/sms.ts';
+import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature.ts';
 import {
   normalizeCallStatus,
   onboardNewLead,
-  scheduleTwilioBackgroundTask,
   shouldFireMissedCallVoiceHook,
-} from '../services/twilioLaunch';
+} from '../services/twilioLaunch.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -14,60 +15,11 @@ type Bindings = {
   TWILIO_PHONE_NUMBER?: string;
   TWILIO_SIGNATURE_MODE?: string;
   ENVIRONMENT?: string;
+  WORKER_URL?: string;
 };
 
 const CALL_PROVIDER = 'twilio';
-
-function maskPhone(phone: string): string {
-  if (!phone) return 'unknown';
-  const digits = phone.replace(/\D/g, '');
-  if (digits.length <= 4) return '***';
-  return `***${digits.slice(-4)}`;
-}
-
-type TwilioRestClient = {
-  sendSms: (
-    input: { toPhone: string; fromPhone: string; body: string }
-  ) => Promise<{ ok: boolean; sid?: string; detail?: string }>;
-};
-
-function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) {
-    return null;
-  }
-
-  const accountSid = env.TWILIO_ACCOUNT_SID;
-  const authHeader = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
-
-  return {
-    async sendSms(input: {
-      toPhone: string;
-      fromPhone: string;
-      body: string;
-    }): Promise<{ ok: boolean; sid?: string; detail?: string }> {
-      const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
-        method: 'POST',
-        headers: {
-          Authorization: authHeader,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          To: input.toPhone,
-          From: input.fromPhone,
-          Body: input.body,
-        }).toString(),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        return { ok: false, detail: `twilio_sms_failed_${response.status}:${errorText}` };
-      }
-
-      const payload = (await response.json()) as { sid?: string };
-      return { ok: true, sid: payload.sid };
-    },
-  };
-}
+const twilioLog = createLogger('[TWILIO]', 'twilioStatusHandler');
 
 async function releaseCustomerWelcomeLock(env: Bindings, providerCallId: string): Promise<void> {
   await env.SYSTEMIX.prepare(
@@ -88,17 +40,6 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
     const env = c.env;
     const formData = await c.req.formData();
     const params = formDataToParams(formData);
-
-    const sig = await checkTwilioSignature(
-      env,
-      c.req.url,
-      params,
-      c.req.header('X-Twilio-Signature') || undefined
-    );
-    if (!sig.ok) {
-      console.error('Twilio status signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
-    }
-
     const callSid = (formData.get('CallSid') as string) || '';
     const fromPhone = (formData.get('From') as string) || '';
     const toPhone = (formData.get('To') as string) || '';
@@ -107,11 +48,35 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
     const parentCallSid = (formData.get('ParentCallSid') as string) || '';
     const providerCallId = (callSid || parentCallSid || '').trim();
 
+    const sig = await checkTwilioSignature(
+      env,
+      c.req.url,
+      params,
+      c.req.header('X-Twilio-Signature') || undefined
+    );
+    if (!sig.ok) {
+      twilioLog.error('Twilio status signature rejected and request processing continued', {
+        context: {
+          callSid: providerCallId || callSid,
+          fromNumber: fromPhone,
+          toNumber: toPhone,
+        },
+        data: {
+          mode: sig.mode,
+          reason: sig.reason,
+        },
+      });
+    }
+
     if (!providerCallId) {
-      console.error('Customer welcome SMS skipped: missing call identifier', {
-        from: maskPhone(fromPhone),
-        to: maskPhone(toPhone),
-        status,
+      twilioLog.error('Customer welcome SMS skipped because no call identifier was provided', {
+        context: {
+          fromNumber: fromPhone,
+          toNumber: toPhone,
+        },
+        data: {
+          status,
+        },
       });
       return c.json({ ok: false, error: 'missing_call_sid' }, 200);
     }
@@ -174,10 +139,8 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       return c.json({ ok: true, deduped: true, status }, 200);
     }
 
-    scheduleTwilioBackgroundTask(
-      c.executionCtx,
-      'Status hook onboard new lead',
-      (async () => {
+    const backgroundTask = (async () => {
+      try {
         const twilioClient = createTwilioRestClient(env);
         if (!twilioClient) {
           await releaseCustomerWelcomeLock(env, providerCallId);
@@ -202,19 +165,40 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
           throw new Error(result.detail);
         }
 
-        console.log('[TWILIO] VOICE HOOK FIRED', {
-          caller_number: result.callerNumber,
-          business_number: result.businessNumber,
-          status,
-          sid: result.messageSid,
+        twilioLog.log('Voice hook background task completed', {
+          context: {
+            callSid: providerCallId,
+            messageSid: result.messageSid || null,
+            fromNumber: result.businessNumber,
+            toNumber: result.callerNumber,
+          },
+          data: {
+            status,
+          },
         });
-      })()
-    );
+      } catch (error) {
+        twilioLog.error('Voice hook background task failed', {
+          error,
+          context: {
+            callSid: providerCallId,
+            fromNumber: fromPhone,
+            toNumber: toPhone,
+          },
+        });
+      }
+    })();
+
+    if (c.executionCtx?.waitUntil) {
+      c.executionCtx.waitUntil(backgroundTask);
+    } else {
+      void backgroundTask;
+    }
 
     return c.json({ ok: true, queued: true, status }, 200);
   } catch (error) {
-    console.error('Twilio status handler error');
-    console.error(error);
+    twilioLog.error('Twilio status handler failed', {
+      error,
+    });
     return c.json({ ok: false, error: 'processing_failed' }, 200);
   }
 }

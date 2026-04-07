@@ -1,3 +1,7 @@
+import { createLogger } from './logging.ts';
+
+const d1Log = createLogger('[D1]', 'db');
+
 export async function getTenantName(db: D1Database, toPhone?: string | null): Promise<string | null> {
   if (!toPhone) return null;
   try {
@@ -7,7 +11,13 @@ export async function getTenantName(db: D1Database, toPhone?: string | null): Pr
     const tenantRow = tenantRes.results && tenantRes.results[0];
     return tenantRow?.company_name ? String(tenantRow.company_name) : null;
   } catch (e) {
-    console.error('Tenant lookup failed:', e);
+    d1Log.error('Tenant lookup failed', {
+      error: e,
+      context: {
+        handler: 'getTenantName',
+        toNumber: toPhone,
+      },
+    });
     return null;
   }
 }

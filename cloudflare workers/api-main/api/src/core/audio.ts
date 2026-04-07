@@ -1,7 +1,11 @@
+import { createLogger } from './logging.ts';
+
 export type AudioFetchResult = {
   blob: Blob | null;
   status: number | null;
 };
+
+const voiceLog = createLogger('[VOICE]', 'audio');
 
 function isTrustedTwilioHost(recordingUrl: string): boolean {
   try {
@@ -26,25 +30,44 @@ export async function fetchRecordingAudio(
   }
 
   const audioUrl = recordingUrl.endsWith('.wav') ? recordingUrl : `${recordingUrl}.wav`;
-  console.log('Fetching recording URL:', audioUrl);
-  console.log('Recording auth attached:', Boolean(headers.Authorization));
+  voiceLog.log('Fetching recording audio', {
+    data: {
+      audioUrl,
+      authAttached: Boolean(headers.Authorization),
+    },
+  });
 
   try {
     const response = await fetch(audioUrl, {
       headers,
       signal: AbortSignal.timeout(15000),
     });
-    console.log(`Audio fetch status: ${response.status}`);
+    voiceLog.log('Recording audio fetch completed', {
+      data: {
+        audioUrl,
+        status: response.status,
+      },
+    });
 
     if (response.status !== 200) {
-      console.error(`Audio fetch failed: HTTP ${response.status}`);
+      voiceLog.error('Recording audio fetch returned a non-200 response', {
+        data: {
+          audioUrl,
+          status: response.status,
+        },
+      });
       return { blob: null, status: response.status };
     }
 
     const blob = await response.blob();
     return { blob, status: response.status };
   } catch (e: any) {
-    console.error(`Audio fetch error: ${e?.message || e}`);
+    voiceLog.error('Recording audio fetch failed', {
+      error: e,
+      data: {
+        audioUrl,
+      },
+    });
     return { blob: null, status: null };
   }
 }

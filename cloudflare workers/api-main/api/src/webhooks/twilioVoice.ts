@@ -1,11 +1,19 @@
 import type { Context } from 'hono';
-import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature.ts';
+import { createLogger } from '../core/logging.ts';
+import { createTwilioRestClient, type TwilioRestClient, type TwilioSendResult } from '../core/sms.ts';
+import {
+  buildWorkerCallbackUrl,
+  checkTwilioSignature,
+  formDataToParams,
+} from '../core/twilioSignature.ts';
 import {
   normalizeCallStatus,
+  normalizePhone,
   onboardNewLead,
   scheduleTwilioBackgroundTask,
   shouldFireMissedCallVoiceHook,
 } from '../services/twilioLaunch.ts';
+import { logConsentEvent } from '../services/smsCompliance.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
@@ -19,10 +27,15 @@ type Bindings = {
   WORKER_URL?: string;
   SYSTEMIX_NUMBER?: string;
   VOICE_CONSENT_SCRIPT?: string;
+  FALLBACK_NUMBER?: string;
 };
 
 const CALL_PROVIDER = 'twilio';
-const CUSTOMER_MISSED_STATUSES = new Set(['busy', 'no-answer']);
+const DEFAULT_VOICE_CONSENT_SCRIPT =
+  "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts.";
+const DEFAULT_VOICE_FAILURE_MESSAGE =
+  'Thank you for calling. We have noted your call and will be in touch shortly.';
+const voiceLog = createLogger('[VOICE]', 'twilioVoice');
 
 function getDb(env: Bindings) {
   return env.SYSTEMIX;
@@ -46,8 +59,36 @@ function maskPhone(phone: string): string {
 
 async function lookupBusinessNameByDialedNumber(env: Bindings, toPhone: string): Promise<string> {
   const fallback = 'the office';
-  const dialedNumber = (toPhone || '').trim();
+  const dialedNumber = normalizePhone(toPhone);
   if (!dialedNumber) return fallback;
+
+  try {
+    const businessRow = await getDb(env)
+      .prepare(
+        `
+        SELECT display_name
+        FROM businesses
+        WHERE business_number = ?
+          AND is_active = 1
+        LIMIT 1
+      `
+      )
+      .bind(dialedNumber)
+      .first<{ display_name?: string | null }>();
+
+    const displayName = (businessRow?.display_name || '').trim();
+    if (displayName) {
+      return displayName;
+    }
+  } catch (error) {
+    voiceLog.warn('Business display name lookup failed', {
+      error,
+      context: {
+        handler: 'lookupBusinessNameByDialedNumber',
+        toNumber: dialedNumber,
+      },
+    });
+  }
 
   try {
     const companyRow = await getDb(env)
@@ -59,9 +100,12 @@ async function lookupBusinessNameByDialedNumber(env: Bindings, toPhone: string):
       return String(companyRow.company_name);
     }
   } catch (error) {
-    console.warn('Tenant lookup via company_name failed', {
-      to: maskPhone(dialedNumber),
-      error: error instanceof Error ? error.message : String(error),
+    voiceLog.warn('Tenant lookup via company name failed', {
+      error,
+      context: {
+        handler: 'lookupBusinessNameByDialedNumber',
+        toNumber: dialedNumber,
+      },
     });
   }
 
@@ -75,13 +119,63 @@ async function lookupBusinessNameByDialedNumber(env: Bindings, toPhone: string):
       return String(nameRow.name);
     }
   } catch (error) {
-    console.warn('Tenant lookup via name failed', {
-      to: maskPhone(dialedNumber),
-      error: error instanceof Error ? error.message : String(error),
+    voiceLog.warn('Tenant lookup via name failed', {
+      error,
+      context: {
+        handler: 'lookupBusinessNameByDialedNumber',
+        toNumber: dialedNumber,
+      },
     });
   }
 
   return fallback;
+}
+
+function resolveVoiceConsentScript(env: Bindings): string {
+  return (env.VOICE_CONSENT_SCRIPT || '').trim() || DEFAULT_VOICE_CONSENT_SCRIPT;
+}
+
+function getVoiceConsentScript(env: Bindings): string {
+  return escapeXml(resolveVoiceConsentScript(env));
+}
+
+function buildFallbackTwiml(message = DEFAULT_VOICE_FAILURE_MESSAGE): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna-Neural">${escapeXml(message)}</Say>
+</Response>`;
+}
+
+function buildVoicemailTwiml(env: Bindings, requestUrl: string, from: string, to: string): string {
+  const consentScript = getVoiceConsentScript(env);
+  const recordingStatusCallback = buildWorkerCallbackUrl(
+    env,
+    requestUrl,
+    '/v1/webhooks/twilio/recording',
+    new URLSearchParams({
+      from,
+      to,
+    })
+  );
+  const transcriptionCallback = buildWorkerCallbackUrl(env, requestUrl, '/voicemail-transcription');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna-Neural">${consentScript}</Say>
+  <Record
+    maxLength="120"
+    timeout="10"
+    playBeep="true"
+    transcribe="true"
+    transcribeCallback="${transcriptionCallback}"
+    recordingStatusCallback="${recordingStatusCallback.replace(/&/g, '&amp;')}"
+    recordingStatusCallbackEvent="completed"
+  />
+</Response>`;
+}
+
+function buildImmediateVoiceResponse(env: Bindings, requestUrl: string, from: string, to: string): string {
+  return buildVoicemailTwiml(env, requestUrl, from, to);
 }
 
 function isTrustedTwilioHost(urlValue: string): boolean {
@@ -94,56 +188,13 @@ function isTrustedTwilioHost(urlValue: string): boolean {
   }
 }
 
-type TwilioRestClient = {
-  sendSms: (
-    input: { toPhone: string; fromPhone: string; body: string }
-  ) => Promise<{ ok: boolean; sid?: string; detail?: string }>;
-};
-
-function createTwilioRestClient(env: Bindings): TwilioRestClient | null {
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) {
-    return null;
-  }
-
-  const accountSid = env.TWILIO_ACCOUNT_SID;
-  const authHeader = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
-
-  return {
-    async sendSms(input: {
-      toPhone: string;
-      fromPhone: string;
-      body: string;
-    }): Promise<{ ok: boolean; sid?: string; detail?: string }> {
-      const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
-        method: 'POST',
-        headers: {
-          Authorization: authHeader,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          To: input.toPhone,
-          From: input.fromPhone,
-          Body: input.body,
-        }).toString(),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        return { ok: false, detail: `twilio_sms_failed_${response.status}:${errorText}` };
-      }
-
-      const payload = (await response.json()) as { sid?: string };
-      return { ok: true, sid: payload.sid };
-    },
-  };
-}
-
 async function sendOwnerTranscriptSms(
   client: TwilioRestClient,
   toPhone: string,
   fromPhone: string,
-  body: string
-): Promise<{ ok: boolean; sid?: string; detail?: string }> {
+  body: string,
+  businessNumber?: string
+): Promise<TwilioSendResult> {
   if (!fromPhone) {
     return { ok: false, detail: 'missing_twilio_phone_number' };
   }
@@ -153,30 +204,7 @@ async function sendOwnerTranscriptSms(
       toPhone,
       fromPhone,
       body,
-    });
-  } catch (error) {
-    return {
-      ok: false,
-      detail: `twilio_sms_error:${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-}
-
-async function sendCustomerWelcomeSms(
-  client: TwilioRestClient,
-  toPhone: string,
-  fromPhone: string,
-  body: string
-): Promise<{ ok: boolean; sid?: string; detail?: string }> {
-  if (!fromPhone) {
-    return { ok: false, detail: 'missing_twilio_phone_number' };
-  }
-
-  try {
-    return await client.sendSms({
-      toPhone,
-      fromPhone,
-      body,
+      businessNumber,
     });
   } catch (error) {
     return {
@@ -220,21 +248,12 @@ async function releaseOwnerTranscriptLock(env: Bindings, providerCallId: string)
 // /voice ENDPOINT (Instant response)
 // ==========================================
 export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
+  let twiml = buildFallbackTwiml();
+
   try {
     const env = c.env;
     const formData = await c.req.formData();
     const params = formDataToParams(formData);
-
-    const sig = await checkTwilioSignature(
-      env,
-      c.req.url,
-      params,
-      c.req.header('X-Twilio-Signature') || undefined
-    );
-    if (!sig.ok) {
-      console.error('Twilio voice signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
-    }
-
     const from = (formData.get('From') as string) || '';
     const to = (formData.get('To') as string) || '';
     const rawStatus = ((formData.get('CallStatus') as string) || (formData.get('DialCallStatus') as string) || '')
@@ -243,78 +262,125 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
     const callSid = ((formData.get('CallSid') as string) || '').trim();
     const parentCallSid = ((formData.get('ParentCallSid') as string) || '').trim();
 
-    if (shouldFireMissedCallVoiceHook(callStatus, to)) {
-      const providerCallId = callSid || parentCallSid;
-      if (!providerCallId) {
-        console.error('Customer SMS skipped in voice handler: missing call identifier', {
-          status: callStatus,
-          from: maskPhone(from),
-          to: maskPhone(to),
-        });
-        return c.json({ ok: false, error: 'missing_call_sid' }, 200);
-      }
+    const sig = await checkTwilioSignature(
+      env,
+      c.req.url,
+      params,
+      c.req.header('X-Twilio-Signature') || undefined
+    );
+    if (!sig.ok) {
+      voiceLog.error('Twilio voice signature rejected and request processing continued', {
+        context: {
+          handler: 'twilioVoiceHandler',
+          callSid: callSid || parentCallSid,
+          fromNumber: from,
+          toNumber: to,
+        },
+        data: {
+          mode: sig.mode,
+          reason: sig.reason,
+        },
+      });
+    }
 
-      await getDb(env)
-        .prepare(
-          `
-          INSERT INTO calls (
-            id,
-            provider,
-            provider_call_id,
-            call_sid,
-            from_phone,
-            to_phone,
-            status,
-            raw_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(provider, provider_call_id) DO UPDATE SET
-            call_sid = excluded.call_sid,
-            from_phone = excluded.from_phone,
-            to_phone = excluded.to_phone,
-            status = excluded.status,
-            raw_json = excluded.raw_json
-        `
-        )
-        .bind(
-          crypto.randomUUID(),
-          CALL_PROVIDER,
-          providerCallId,
-          callSid || null,
-          from || 'unknown',
-          to || 'unknown',
+    twiml = buildImmediateVoiceResponse(env, c.req.url, from, to);
+
+    scheduleTwilioBackgroundTask(
+      c.executionCtx,
+      'Voice consent log',
+      logConsentEvent(getDb(env), {
+        businessNumber: to,
+        phoneNumber: from,
+        source: 'voice_call',
+        consentGiven: true,
+        consentText: resolveVoiceConsentScript(env),
+        metadata: {
+          callSid: callSid || null,
+          parentCallSid: parentCallSid || null,
           callStatus,
-          JSON.stringify({
-            source: 'twilio_voice_status_callback',
-            callSid,
-            parentCallSid,
-            from,
-            to,
-            callStatus: rawStatus,
-          })
-        )
-        .run();
+          rawStatus,
+          handler: 'twilioVoiceHandler',
+        },
+      })
+    );
 
-      const lock = await getDb(env)
-        .prepare(
-          `
-          UPDATE calls
-          SET customer_welcome_sent_at = datetime('now')
-          WHERE provider = ?
-            AND provider_call_id = ?
-            AND customer_welcome_sent_at IS NULL
-        `
-        )
-        .bind(CALL_PROVIDER, providerCallId)
-        .run();
+    if (shouldFireMissedCallVoiceHook(callStatus, to)) {
+      const backgroundTask = (async () => {
+        try {
+          const providerCallId = callSid || parentCallSid;
+          if (!providerCallId) {
+            throw new Error('missing_call_sid');
+          }
 
-      if (Number(lock.meta?.changes || 0) === 0) {
-        return c.json({ ok: true, deduped: true, status: callStatus }, 200);
-      }
+          await getDb(env)
+            .prepare(
+              `
+              INSERT INTO calls (
+                id,
+                provider,
+                provider_call_id,
+                call_sid,
+                from_phone,
+                to_phone,
+                status,
+                raw_json
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(provider, provider_call_id) DO UPDATE SET
+                call_sid = excluded.call_sid,
+                from_phone = excluded.from_phone,
+                to_phone = excluded.to_phone,
+                status = excluded.status,
+                raw_json = excluded.raw_json
+            `
+            )
+            .bind(
+              crypto.randomUUID(),
+              CALL_PROVIDER,
+              providerCallId,
+              callSid || null,
+              from || 'unknown',
+              to || 'unknown',
+              callStatus,
+              JSON.stringify({
+                source: 'twilio_voice_status_callback',
+                callSid,
+                parentCallSid,
+                from,
+                to,
+                callStatus: rawStatus,
+              })
+            )
+            .run();
 
-      scheduleTwilioBackgroundTask(
-        c.executionCtx,
-        'Voice hook onboard new lead',
-        (async () => {
+          const lock = await getDb(env)
+            .prepare(
+              `
+              UPDATE calls
+              SET customer_welcome_sent_at = datetime('now')
+              WHERE provider = ?
+                AND provider_call_id = ?
+                AND customer_welcome_sent_at IS NULL
+            `
+            )
+            .bind(CALL_PROVIDER, providerCallId)
+            .run();
+
+          if (Number(lock.meta?.changes || 0) === 0) {
+            voiceLog.log('Voice hook background task deduped', {
+              context: {
+                handler: 'twilioVoiceHandler',
+                callSid: providerCallId,
+                fromNumber: from,
+                toNumber: to,
+              },
+              data: {
+                status: callStatus,
+                deduped: true,
+              },
+            });
+            return;
+          }
+
           const twilioClient = createTwilioRestClient(env);
           if (!twilioClient) {
             await releaseCustomerWelcomeLock(env, providerCallId);
@@ -339,57 +405,178 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
             throw new Error(result.detail);
           }
 
-          console.log('[TWILIO] VOICE HOOK FIRED', {
-            caller_number: result.callerNumber,
-            business_number: result.businessNumber,
-            status: callStatus,
-            sid: result.messageSid,
+          voiceLog.log('Voice hook background task completed', {
+            context: {
+              handler: 'twilioVoiceHandler',
+              callSid: providerCallId,
+              messageSid: result.messageSid || null,
+              fromNumber: result.businessNumber,
+              toNumber: result.callerNumber,
+            },
+            data: {
+              status: callStatus,
+            },
           });
-        })()
-      );
+        } catch (error) {
+          voiceLog.error('Voice hook background task failed', {
+            error,
+            context: {
+              handler: 'twilioVoiceHandler',
+              callSid: callSid || parentCallSid,
+              fromNumber: from,
+              toNumber: to,
+            },
+          });
+        }
+      })();
 
-      return c.json({ ok: true, queued: true, status: callStatus }, 200);
+      if (c.executionCtx?.waitUntil) {
+        c.executionCtx.waitUntil(backgroundTask);
+      } else {
+        void backgroundTask;
+      }
     }
 
-    if (rawStatus) {
-      return c.json({ ok: true, ignored: true, status: callStatus }, 200);
-    }
-
-    const baseUrl = new URL(c.req.url).origin;
-    const workerUrl = env.WORKER_URL || baseUrl;
-    const defaultConsentScript =
-      "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts.";
-    const consentText = (env.VOICE_CONSENT_SCRIPT || '').trim() || defaultConsentScript;
-    const consentScript = escapeXml(consentText);
-
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Joanna-Neural">${consentScript}</Say>
-  <Record
-    maxLength="120"
-    timeout="10"
-    playBeep="true"
-    transcribe="false"
-    recordingStatusCallback="${workerUrl}/v1/webhooks/twilio/recording?from=${encodeURIComponent(from)}&amp;to=${encodeURIComponent(to)}"
-    recordingStatusCallbackEvent="completed"
-  />
-</Response>`;
-
-    console.log('Voice webhook accepted', {
-      from: maskPhone(from),
-      to: maskPhone(to),
-      mode: sig.mode,
+    voiceLog.log('Voice webhook accepted', {
+      context: {
+        handler: 'twilioVoiceHandler',
+        callSid: callSid || parentCallSid,
+        fromNumber: from,
+        toNumber: to,
+      },
+      data: {
+        mode: sig.mode,
+      },
     });
 
-    return c.body(twiml, 200, { 'Content-Type': 'text/xml' });
+    return c.body(twiml, 200, { 'Content-Type': 'application/xml' });
   } catch (error) {
-    console.error('Voice handler error');
-    console.error(error);
-    return c.body(
-      `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are unable to process your call right now.</Say><Hangup/></Response>`,
-      200,
-      { 'Content-Type': 'text/xml' }
+    voiceLog.error('Voice handler failed', {
+      error,
+      context: {
+        handler: 'twilioVoiceHandler',
+      },
+    });
+    return c.body(twiml, 200, { 'Content-Type': 'application/xml' });
+  }
+}
+
+// ==========================================
+// /dial-status CALLBACK ENDPOINT
+// ==========================================
+export async function twilioDialStatusHandler(c: Context<{ Bindings: Bindings }>) {
+  const env = c.env;
+
+  try {
+    const formData = await c.req.formData();
+    const params = formDataToParams(formData);
+
+    const sig = await checkTwilioSignature(
+      env,
+      c.req.url,
+      params,
+      c.req.header('X-Twilio-Signature') || undefined
     );
+    const from = (formData.get('From') as string) || '';
+    const to = (formData.get('To') as string) || '';
+    const dialCallStatus = normalizeCallStatus((formData.get('DialCallStatus') as string) || '');
+    if (!sig.ok) {
+      voiceLog.error('Twilio dial status signature rejected and request processing continued', {
+        context: {
+          handler: 'twilioDialStatusHandler',
+          fromNumber: from,
+          toNumber: to,
+        },
+        data: {
+          mode: sig.mode,
+          reason: sig.reason,
+        },
+      });
+    }
+
+    voiceLog.log('Dial status callback received', {
+      context: {
+        handler: 'twilioDialStatusHandler',
+        fromNumber: from,
+        toNumber: to,
+      },
+      data: {
+        dialCallStatus: dialCallStatus || 'missing',
+        mode: sig.mode,
+      },
+    });
+
+    if (dialCallStatus === 'completed') {
+      return c.body(`<?xml version="1.0" encoding="UTF-8"?><Response/>`, 200, {
+        'Content-Type': 'application/xml',
+      });
+    }
+
+    return c.body(buildVoicemailTwiml(env, c.req.url, from, to), 200, {
+      'Content-Type': 'application/xml',
+    });
+  } catch (error) {
+    voiceLog.error('Dial status handler failed', {
+      error,
+      context: {
+        handler: 'twilioDialStatusHandler',
+      },
+    });
+    return c.body(buildFallbackTwiml(), 200, { 'Content-Type': 'application/xml' });
+  }
+}
+
+// ==========================================
+// /voicemail-transcription CALLBACK ENDPOINT
+// ==========================================
+export async function twilioVoicemailTranscriptionHandler(c: Context<{ Bindings: Bindings }>) {
+  const env = c.env;
+
+  try {
+    const formData = await c.req.formData();
+    const params = formDataToParams(formData);
+
+    const sig = await checkTwilioSignature(
+      env,
+      c.req.url,
+      params,
+      c.req.header('X-Twilio-Signature') || undefined
+    );
+    const callSid = ((formData.get('CallSid') as string) || '').trim();
+    const transcriptionText = ((formData.get('TranscriptionText') as string) || '').trim();
+    if (!sig.ok) {
+      voiceLog.error('Twilio voicemail transcription signature rejected and request processing continued', {
+        context: {
+          handler: 'twilioVoicemailTranscriptionHandler',
+          callSid,
+        },
+        data: {
+          mode: sig.mode,
+          reason: sig.reason,
+        },
+      });
+    }
+
+    voiceLog.log('Voicemail transcription callback received', {
+      context: {
+        handler: 'twilioVoicemailTranscriptionHandler',
+        callSid,
+      },
+      data: {
+        chars: transcriptionText.length,
+        mode: sig.mode,
+      },
+    });
+
+    return c.text('', 200);
+  } catch (error) {
+    voiceLog.error('Voicemail transcription handler failed', {
+      error,
+      context: {
+        handler: 'twilioVoicemailTranscriptionHandler',
+      },
+    });
+    return c.text('', 200);
   }
 }
 
@@ -408,10 +595,6 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
       params,
       c.req.header('X-Twilio-Signature') || undefined
     );
-    if (!sig.ok) {
-      console.error('Twilio recording signature rejected (continuing)', { mode: sig.mode, reason: sig.reason });
-    }
-
     const url = new URL(c.req.url);
     const from = url.searchParams.get('from') || (formData.get('From') as string) || 'unknown';
     const to = url.searchParams.get('to') || (formData.get('To') as string) || 'unknown';
@@ -420,9 +603,30 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
     const recordingSid = formData.get('RecordingSid') as string;
     const callSid = formData.get('CallSid') as string;
     const recordingDuration = formData.get('RecordingDuration') as string;
+    if (!sig.ok) {
+      voiceLog.error('Twilio recording signature rejected and request processing continued', {
+        context: {
+          handler: 'twilioRecordingHandler',
+          callSid,
+          fromNumber: from,
+          toNumber: to,
+        },
+        data: {
+          mode: sig.mode,
+          reason: sig.reason,
+        },
+      });
+    }
 
     if (!recordingUrl) {
-      console.error('Recording callback missing recording URL', { callSid: callSid || 'unknown' });
+      voiceLog.error('Recording callback missing recording URL', {
+        context: {
+          handler: 'twilioRecordingHandler',
+          callSid,
+          fromNumber: from,
+          toNumber: to,
+        },
+      });
       return c.json({ success: false, error: 'missing_recording' }, 200);
     }
 
@@ -430,12 +634,17 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
       c.executionCtx,
       'Recording callback',
       (async () => {
-        console.log('Processing recording callback', {
-          callSid: callSid || 'unknown',
-          from: maskPhone(from),
-          to: maskPhone(to),
-          duration: recordingDuration || 'unknown',
-          mode: sig.mode,
+        voiceLog.log('Processing recording callback', {
+          context: {
+            handler: 'twilioRecordingHandler',
+            callSid,
+            fromNumber: from,
+            toNumber: to,
+          },
+          data: {
+            duration: recordingDuration || 'unknown',
+            mode: sig.mode,
+          },
         });
 
         const companyName = await lookupBusinessNameByDialedNumber(env, to);
@@ -448,8 +657,16 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
           if (isTrustedTwilioHost(audioUrl)) {
             headers.Authorization = `Basic ${btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)}`;
           } else if (env.ENVIRONMENT === 'production') {
-            console.error('Untrusted recording host blocked in production', {
-              host: new URL(audioUrl).hostname,
+            voiceLog.error('Untrusted recording host blocked in production', {
+              context: {
+                handler: 'twilioRecordingHandler',
+                callSid,
+                fromNumber: from,
+                toNumber: to,
+              },
+              data: {
+                host: new URL(audioUrl).hostname,
+              },
             });
             return;
           }
@@ -466,13 +683,40 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
 
           if (audioResponse.ok) {
             audioBlob = await audioResponse.blob();
-            console.log('Recording audio fetched', { sizeBytes: audioBlob.size });
+            voiceLog.log('Recording audio fetched', {
+              context: {
+                handler: 'twilioRecordingHandler',
+                callSid,
+                fromNumber: from,
+                toNumber: to,
+              },
+              data: {
+                sizeBytes: audioBlob.size,
+              },
+            });
           } else {
-            console.error('Audio fetch failed', { status: audioResponse.status });
+            voiceLog.error('Recording audio fetch failed', {
+              context: {
+                handler: 'twilioRecordingHandler',
+                callSid,
+                fromNumber: from,
+                toNumber: to,
+              },
+              data: {
+                status: audioResponse.status,
+              },
+            });
           }
         } catch (audioError) {
-          console.error('Audio fetch error');
-          console.error(audioError);
+          voiceLog.error('Recording audio fetch threw an exception', {
+            error: audioError,
+            context: {
+              handler: 'twilioRecordingHandler',
+              callSid,
+              fromNumber: from,
+              toNumber: to,
+            },
+          });
         }
 
         let transcription = 'Voice message received';
@@ -500,14 +744,42 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
             if (whisperResponse.ok) {
               const result = (await whisperResponse.json()) as { text?: string };
               transcription = result.text?.trim() || transcription;
-              console.log('Transcription complete', { chars: transcription.length });
+              voiceLog.log('Whisper transcription completed', {
+                context: {
+                  handler: 'twilioRecordingHandler',
+                  callSid,
+                  fromNumber: from,
+                  toNumber: to,
+                },
+                data: {
+                  chars: transcription.length,
+                },
+              });
             } else {
               const errorText = await whisperResponse.text();
-              console.error('Whisper API failed', { status: whisperResponse.status, detail: errorText });
+              voiceLog.error('Whisper API failed', {
+                context: {
+                  handler: 'twilioRecordingHandler',
+                  callSid,
+                  fromNumber: from,
+                  toNumber: to,
+                },
+                data: {
+                  status: whisperResponse.status,
+                  detail: errorText,
+                },
+              });
             }
           } catch (whisperError) {
-            console.error('Whisper transcription error');
-            console.error(whisperError);
+            voiceLog.error('Whisper transcription threw an exception', {
+              error: whisperError,
+              context: {
+                handler: 'twilioRecordingHandler',
+                callSid,
+                fromNumber: from,
+                toNumber: to,
+              },
+            });
           }
         }
 
@@ -595,12 +867,25 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
           twilioClient,
           ownerPhone,
           (env.TWILIO_PHONE_NUMBER || '').trim(),
-          smsMessage
+          smsMessage,
+          to
         );
 
         if (!sms.ok) {
           await releaseOwnerTranscriptLock(env, providerCallId);
           throw new Error(sms.detail || 'sms_failed');
+        }
+
+        if (sms.suppressed) {
+          voiceLog.log('Owner transcript SMS suppressed because recipient is opted out', {
+            context: {
+              handler: 'twilioRecordingHandler',
+              callSid,
+              fromNumber: to,
+              toNumber: ownerPhone,
+            },
+          });
+          return;
         }
 
         await getDb(env)
@@ -615,18 +900,26 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
           .bind(sms.sid || null, CALL_PROVIDER, providerCallId)
           .run();
 
-        console.log('Owner transcript SMS sent', {
-          callSid: callSid || 'unknown',
-          owner: maskPhone(ownerPhone),
-          sid: sms.sid || 'unknown',
+        voiceLog.log('Owner transcript SMS sent', {
+          context: {
+            handler: 'twilioRecordingHandler',
+            callSid,
+            messageSid: sms.sid || null,
+            fromNumber: (env.TWILIO_PHONE_NUMBER || '').trim(),
+            toNumber: ownerPhone,
+          },
         });
       })()
     );
 
     return c.json({ success: true, queued: true }, 200);
   } catch (error) {
-    console.error('Recording handler error');
-    console.error(error);
+    voiceLog.error('Recording handler failed', {
+      error,
+      context: {
+        handler: 'twilioRecordingHandler',
+      },
+    });
     return c.json({ success: false, error: 'processing_failed' }, 200);
   }
 }

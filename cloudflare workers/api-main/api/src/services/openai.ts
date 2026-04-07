@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createLogger } from '../core/logging.ts';
 
 export type AiLeadClassification = 'emergency' | 'inquiry' | 'spam';
 export type AiLeadConfidence = 'high' | 'low';
@@ -19,6 +20,7 @@ const OPENAI_RESPONSE_SCHEMA = z.object({
 });
 
 const MAX_SUMMARY_LENGTH = 140;
+const classifyLog = createLogger('[CLASSIFY]', 'classifyLeadIntent');
 
 function extractJsonObject(content: string): unknown {
   const trimmed = content.trim();
@@ -152,9 +154,11 @@ export async function classifyLeadIntent(
 
     if (!response.ok) {
       const detail = await response.text();
-      console.error('GPT lead classifier failed', {
-        status: response.status,
-        detail,
+      classifyLog.error('GPT lead classifier request failed', {
+        data: {
+          status: response.status,
+          detail,
+        },
       });
       return buildFallbackResult('emergency', messageBody, true);
     }
@@ -172,9 +176,11 @@ export async function classifyLeadIntent(
     });
 
     if (!result.success) {
-      console.error('GPT lead classifier returned invalid schema', {
-        issues: result.error.issues,
-        content,
+      classifyLog.error('GPT lead classifier returned an invalid schema', {
+        data: {
+          issues: result.error.issues,
+          content,
+        },
       });
       return buildFallbackResult('emergency', messageBody, true);
     }
@@ -191,8 +197,8 @@ export async function classifyLeadIntent(
       gptUsed: true,
     };
   } catch (error) {
-    console.error('GPT lead classifier error', {
-      error: error instanceof Error ? error.message : String(error),
+    classifyLog.error('GPT lead classifier threw an exception', {
+      error,
     });
     return buildFallbackResult('emergency', messageBody, true);
   } finally {

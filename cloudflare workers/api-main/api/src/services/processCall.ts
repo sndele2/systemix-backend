@@ -1,5 +1,6 @@
-import { fetchRecordingAudio, transcribeWhisper } from '../core/audio';
-import { sendTwilioSms } from '../core/sms';
+import { fetchRecordingAudio, transcribeWhisper } from '../core/audio.ts';
+import { createLogger } from '../core/logging.ts';
+import { sendTwilioSms } from '../core/sms.ts';
 
 type ProcessCallParams = {
   callSid: string;
@@ -20,6 +21,8 @@ type ProcessCallDeps = {
   };
 };
 
+const voiceLog = createLogger('[VOICE]', 'processCall');
+
 export async function processCall(params: ProcessCallParams, deps: ProcessCallDeps): Promise<void> {
   const { callSid, fromPhone, toPhone, recordingUrl } = params;
   const env = deps.env;
@@ -35,7 +38,14 @@ export async function processCall(params: ProcessCallParams, deps: ProcessCallDe
       tenantName = String(tenantQuery.company_name);
     }
   } catch (e) {
-    console.error('Tenant lookup failed:', e);
+    voiceLog.error('Tenant lookup failed', {
+      error: e,
+      context: {
+        callSid,
+        fromNumber: fromPhone,
+        toNumber: toPhone,
+      },
+    });
   }
 
   try {
@@ -45,7 +55,13 @@ export async function processCall(params: ProcessCallParams, deps: ProcessCallDe
       .first();
 
     if (statusRow?.status && String(statusRow.status) === 'completed') {
-      console.log('Phase 2 skipped (already completed)', { callSid });
+      voiceLog.log('Phase 2 skipped because the call is already completed', {
+        context: {
+          callSid,
+          fromNumber: fromPhone,
+          toNumber: toPhone,
+        },
+      });
       return;
     }
 
@@ -54,7 +70,16 @@ export async function processCall(params: ProcessCallParams, deps: ProcessCallDe
       .bind('recorded', recordingUrl, callSid)
       .run();
 
-    console.log('PHASE 2 START:', { recordingUrl });
+    voiceLog.log('Phase 2 processing started', {
+      context: {
+        callSid,
+        fromNumber: fromPhone,
+        toNumber: toPhone,
+      },
+      data: {
+        recordingUrl,
+      },
+    });
 
     let transcript = 'Voice message received';
     const audioResult = await fetchRecordingAudio(recordingUrl, env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
@@ -62,11 +87,24 @@ export async function processCall(params: ProcessCallParams, deps: ProcessCallDe
       try {
         transcript = await transcribeWhisper(env.OPENAI_API_KEY, audioResult.blob);
       } catch (e) {
-        console.error('Whisper transcription failed:', e);
+        voiceLog.error('Whisper transcription failed', {
+          error: e,
+          context: {
+            callSid,
+            fromNumber: fromPhone,
+            toNumber: toPhone,
+          },
+        });
         transcript = 'Voice message received';
       }
     } else {
-      console.warn('Audio unavailable; continuing without Whisper.');
+      voiceLog.warn('Audio unavailable; continuing without Whisper', {
+        context: {
+          callSid,
+          fromNumber: fromPhone,
+          toNumber: toPhone,
+        },
+      });
     }
 
     try {
@@ -74,23 +112,63 @@ export async function processCall(params: ProcessCallParams, deps: ProcessCallDe
         .prepare('UPDATE calls SET transcription = ? WHERE provider_call_id = ?')
         .bind(transcript, callSid)
         .run();
-      console.log('TRANSCRIPTION SUCCESS', { chars: transcript.length });
+      voiceLog.log('Transcription persisted', {
+        context: {
+          callSid,
+          fromNumber: fromPhone,
+          toNumber: toPhone,
+        },
+        data: {
+          chars: transcript.length,
+        },
+      });
     } catch (e) {
-      console.error('D1 transcription update failed:', e);
+      voiceLog.error('Transcription persistence failed', {
+        error: e,
+        context: {
+          callSid,
+          fromNumber: fromPhone,
+          toNumber: toPhone,
+        },
+      });
     }
 
-    const smsMessage = `Hi, this is the team at ${tenantName || 'the office'}. We missed your call regarding: "${transcript}". We will follow up shortly! Msg&data rates may apply. Reply STOP to opt out.`;
-    await sendTwilioSms(env, fromPhone, smsMessage);
-    console.log('SUCCESS: SMS SENT');
+    const smsMessage = `Hi, this is the team at ${tenantName || 'the office'}. We missed your call regarding: "${transcript}". We will follow up shortly!`;
+    await sendTwilioSms(env, fromPhone, smsMessage, {
+      businessNumber: toPhone || env.TWILIO_PHONE_NUMBER || env.SYSTEMIX_NUMBER,
+      appendComplianceFooter: true,
+    });
+    voiceLog.log('Customer SMS sent', {
+      context: {
+        callSid,
+        fromNumber: env.TWILIO_PHONE_NUMBER || env.SYSTEMIX_NUMBER,
+        toNumber: fromPhone,
+      },
+    });
 
-    await sendTwilioSms(env, env.CLIENT_PHONE, smsMessage);
-    console.log('SUCCESS: SMS SENT');
+    await sendTwilioSms(env, env.CLIENT_PHONE, smsMessage, {
+      businessNumber: toPhone || env.TWILIO_PHONE_NUMBER || env.SYSTEMIX_NUMBER,
+    });
+    voiceLog.log('Client notification SMS sent', {
+      context: {
+        callSid,
+        fromNumber: env.TWILIO_PHONE_NUMBER || env.SYSTEMIX_NUMBER,
+        toNumber: env.CLIENT_PHONE,
+      },
+    });
 
     await env.SYSTEMIX
       .prepare('UPDATE calls SET status = ? WHERE provider_call_id = ?')
       .bind('completed', callSid)
       .run();
   } catch (error) {
-    console.error('Phase 2 Error:', error);
+    voiceLog.error('Phase 2 processing failed', {
+      error,
+      context: {
+        callSid,
+        fromNumber: fromPhone,
+        toNumber: toPhone,
+      },
+    });
   }
 }

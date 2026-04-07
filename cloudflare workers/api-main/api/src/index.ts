@@ -1,14 +1,21 @@
 import { Hono, type Context } from 'hono';
-import { twilioVoiceHandler, twilioRecordingHandler } from './webhooks/twilioVoice';
-import { checkEmergencyTimeouts, twilioSmsHandler } from './webhooks/twilioSms';
-import { twilioStatusHandler } from './webhooks/twilioStatus';
-import { stripeWebhookHandler } from './webhooks/stripe';
-import { simulateCallbackHandler } from './testing/simulator';
-import { upsertBusiness } from './services/database';
-import { scheduleTwilioBackgroundTask } from './services/twilioLaunch';
+import {
+  twilioVoiceHandler,
+  twilioDialStatusHandler,
+  twilioVoicemailTranscriptionHandler,
+  twilioRecordingHandler,
+} from './webhooks/twilioVoice.ts';
+import { checkEmergencyTimeouts, twilioSmsHandler } from './webhooks/twilioSms.ts';
+import { twilioStatusHandler } from './webhooks/twilioStatus.ts';
+import { stripeWebhookHandler } from './webhooks/stripe.ts';
+import { simulateCallbackHandler } from './testing/simulator.ts';
+import { upsertBusiness } from './services/database.ts';
+import { scheduleTwilioBackgroundTask } from './services/twilioLaunch.ts';
+import { createLogger } from './core/logging.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
+  DB?: D1Database;
   OPENAI_API_KEY: string;
   CLIENT_PHONE: string;
   OWNER_PHONE_NUMBER?: string;
@@ -26,14 +33,55 @@ type Bindings = {
   INTERNAL_AUTH_KEY?: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  FALLBACK_AGENT_NUMBER?: string;
+  FALLBACK_NUMBER?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
+const routerLog = createLogger('[ROUTER]', 'router');
+
+const REQUIRED_BINDINGS = [
+  'FALLBACK_AGENT_NUMBER',
+  'FALLBACK_NUMBER',
+  'HUBSPOT_ACCESS_TOKEN',
+  'DB',
+] as const;
+
+type RequiredBindingName = (typeof REQUIRED_BINDINGS)[number];
+
+class MissingBindingError extends Error {
+  bindingName: RequiredBindingName;
+
+  constructor(bindingName: RequiredBindingName) {
+    super(`Missing required binding: ${bindingName}`);
+    this.name = 'MissingBindingError';
+    this.bindingName = bindingName;
+  }
+}
+
+function validateRequiredBindings(env: Bindings): void {
+  for (const bindingName of REQUIRED_BINDINGS) {
+    const value = env[bindingName];
+    const missing =
+      value === null ||
+      value === undefined ||
+      (typeof value === 'string' && value.trim().length === 0);
+
+    if (missing) {
+      throw new MissingBindingError(bindingName);
+    }
+  }
+}
 
 const productionOnlyStripeWebhookHandler = async (c: Context<{ Bindings: Bindings }>) => {
   if (c.env.ENVIRONMENT !== 'production') {
-    console.log('[STRIPE] Webhook route disabled outside production', {
-      environment: c.env.ENVIRONMENT ?? 'unset',
+    routerLog.log('Stripe webhook route disabled outside production', {
+      context: {
+        handler: 'productionOnlyStripeWebhookHandler',
+      },
+      data: {
+        environment: c.env.ENVIRONMENT ?? 'unset',
+      },
     });
     return c.text('Not found', 404);
   }
@@ -78,7 +126,16 @@ app.post('/v1/internal/onboard', async (c) => {
     c.executionCtx,
     'Manual onboard',
     upsertBusiness({ business_number, owner_phone_number, display_name }, c.env).then(() =>
-      console.log('[D1] Manual onboard complete')
+      routerLog.log('Manual onboard complete', {
+        context: {
+          handler: 'internalOnboard',
+          fromNumber: business_number,
+          toNumber: owner_phone_number,
+        },
+        data: {
+          displayName: display_name,
+        },
+      })
     )
   );
 
@@ -90,6 +147,8 @@ app.post('/v1/webhooks/twilio/voice', twilioVoiceHandler);
 app.post('/voice', twilioVoiceHandler);
 
 // PHASE 2: Recording callback persists transcript and notifies owner.
+app.post('/dial-status', twilioDialStatusHandler);
+app.post('/voicemail-transcription', twilioVoicemailTranscriptionHandler);
 app.post('/v1/webhooks/twilio/recording', twilioRecordingHandler);
 app.post('/recording', twilioRecordingHandler);
 
@@ -108,14 +167,55 @@ app.post('/webhooks/stripe', productionOnlyStripeWebhookHandler);
 app.post('/test/simulate-callback', simulateCallbackHandler);
 
 const worker: ExportedHandler<Bindings> = {
-  fetch: app.fetch,
+  async fetch(request, env, executionCtx) {
+    try {
+      validateRequiredBindings(env);
+    } catch (error) {
+      if (error instanceof MissingBindingError) {
+        routerLog.error('Startup validation failed', {
+          error,
+          context: {
+            handler: 'fetch',
+          },
+          data: {
+            missingBinding: error.bindingName,
+          },
+        });
+        return new Response(error.message, {
+          status: 500,
+          headers: {
+            'Content-Type': 'text/plain; charset=UTF-8',
+          },
+        });
+      }
+
+      routerLog.error('Unexpected startup validation error', {
+        error,
+        context: {
+          handler: 'fetch',
+        },
+      });
+      return new Response('startup_validation_failed', {
+        status: 500,
+        headers: {
+          'Content-Type': 'text/plain; charset=UTF-8',
+        },
+      });
+    }
+
+    return app.fetch(request, env, executionCtx);
+  },
   scheduled(_controller, env, ctx) {
     scheduleTwilioBackgroundTask(
       ctx,
       'Emergency timeout check',
       checkEmergencyTimeouts(env).catch((error) => {
-        console.error('Emergency timeout scheduled check failed');
-        console.error(error);
+        routerLog.error('Emergency timeout scheduled check failed', {
+          error,
+          context: {
+            handler: 'scheduled',
+          },
+        });
         throw error;
       })
     );
