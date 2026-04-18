@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import Stripe from 'stripe';
+import { createLogger } from '../src/core/logging.ts';
 
 type ParsedArgs = {
   priceId: string;
@@ -20,6 +21,7 @@ const envCandidates = [
   resolve(scriptDir, '../../../../.dev.vars'),
   resolve(scriptDir, '../../../../.env'),
 ];
+const stripeLog = createLogger('[STRIPE]', 'create-payment-link');
 
 function readEnvVar(name: string): string | undefined {
   const directValue = process.env[name]?.trim();
@@ -141,11 +143,20 @@ async function main() {
     throw new Error(`Unexpected Stripe payment link URL: ${paymentLink.url}`);
   }
 
-  console.log(paymentLink.url);
+  stripeLog.log('Payment link created', {
+    data: {
+      url: paymentLink.url,
+      priceId: args.priceId,
+      businessNumber: args.businessNumber,
+      ownerPhoneNumber: args.ownerPhoneNumber,
+      displayName: args.displayName,
+    },
+  });
 }
 
 main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`Failed to create payment link: ${message}`);
+  stripeLog.error('Failed to create payment link', {
+    error,
+  });
   process.exitCode = 1;
 });

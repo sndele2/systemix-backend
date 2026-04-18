@@ -151,6 +151,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
           db: env.SYSTEMIX,
           twilioClient,
           smsFrom: (env.TWILIO_PHONE_NUMBER || '').trim(),
+          businessNumber: toPhone,
           callerNumber: fromPhone,
           provider: CALL_PROVIDER,
           providerCallId,

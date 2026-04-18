@@ -2,6 +2,12 @@ import type { AiLeadClassification } from './openai.ts';
 import { createLogger } from '../core/logging.ts';
 import type { TwilioRestClient } from '../core/sms.ts';
 import { prepareCustomerFacingSmsBody } from './smsCompliance.ts';
+import {
+  buildMissedCallFollowUpMessage,
+  createMissedCallConversation,
+  getMissedCallBusinessConfig,
+  markMissedCallSmsSent,
+} from './missedCallRecovery.ts';
 
 export const MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER = '+18443217137';
 export const MISSED_CALL_VOICE_HOOK_MESSAGE =
@@ -22,6 +28,7 @@ type OnboardNewLeadInput = {
   db: D1Database;
   twilioClient: TwilioRestClient;
   smsFrom: string;
+  businessNumber: string;
   callerNumber: string;
   provider: string;
   providerCallId: string;
@@ -138,6 +145,17 @@ export function shouldFireMissedCallVoiceHook(status: string, toPhone: string): 
   );
 }
 
+function resolveMissedCallVoiceHookMessage(
+  businessNumber: string | null | undefined,
+  intakeQuestion: string | null | undefined
+): string {
+  if (normalizePhone(businessNumber) === MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER) {
+    return buildMissedCallFollowUpMessage(intakeQuestion);
+  }
+
+  return MISSED_CALL_VOICE_HOOK_MESSAGE;
+}
+
 export function buildMissedCallVoiceHookMessage(displayName: string | null | undefined): string {
   void displayName;
   return MISSED_CALL_VOICE_HOOK_MESSAGE;
@@ -146,31 +164,16 @@ export function buildMissedCallVoiceHookMessage(displayName: string | null | und
 export async function findBusinessByNumber(
   db: D1Database,
   businessNumber: string
-): Promise<{ business_number: string; display_name: string | null } | null> {
-  const normalizedBusinessNumber = normalizePhone(businessNumber);
-  if (!normalizedBusinessNumber) {
-    return null;
-  }
-
-  const row = await db
-    .prepare(
-      `
-      SELECT business_number, display_name
-      FROM businesses
-      WHERE business_number = ?
-      LIMIT 1
-    `
-    )
-    .bind(normalizedBusinessNumber)
-    .first<{ business_number?: string; display_name?: string | null }>();
-
-  if (!row?.business_number) {
+): Promise<{ business_number: string; display_name: string | null; intake_question: string | null } | null> {
+  const businessConfig = await getMissedCallBusinessConfig(db, businessNumber);
+  if (!businessConfig) {
     return null;
   }
 
   return {
-    business_number: normalizePhone(row.business_number) || normalizedBusinessNumber,
-    display_name: typeof row.display_name === 'string' ? row.display_name.trim() || null : null,
+    business_number: businessConfig.businessNumber,
+    display_name: businessConfig.displayName,
+    intake_question: businessConfig.intakeQuestion,
   };
 }
 
@@ -230,11 +233,12 @@ export function scheduleTwilioBackgroundTask(
 }
 
 export async function onboardNewLead(input: OnboardNewLeadInput): Promise<OnboardNewLeadResult> {
-  const business =
-    (await findBusinessByNumber(input.db, MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER)) || {
-      business_number: MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER,
-      display_name: null,
-    };
+  const normalizedBusinessNumber = normalizePhone(input.businessNumber) || MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER;
+  const business = (await findBusinessByNumber(input.db, normalizedBusinessNumber)) || {
+    business_number: normalizedBusinessNumber,
+    display_name: null,
+    intake_question: null,
+  };
   const callerNumber = normalizePhone(input.callerNumber);
   const smsFrom = normalizePhone(input.smsFrom);
 
@@ -254,6 +258,15 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
     };
   }
 
+  const followUpMessage = resolveMissedCallVoiceHookMessage(
+    business.business_number,
+    business.intake_question
+  );
+  await createMissedCallConversation(input.db, {
+    businessNumber: business.business_number,
+    phoneNumber: callerNumber,
+  });
+
   await input.db
     .prepare(
       `
@@ -271,7 +284,7 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
       crypto.randomUUID(),
       'voice_to_sms_hook',
       callerNumber,
-      MISSED_CALL_VOICE_HOOK_MESSAGE,
+      followUpMessage,
       JSON.stringify({
         business_number: business.business_number,
         caller_number: callerNumber,
@@ -285,16 +298,17 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
     )
     .run();
 
+  const preparedBody = await prepareCustomerFacingSmsBody(
+    input.db,
+    business.business_number,
+    callerNumber,
+    followUpMessage
+  );
   const sms = await input.twilioClient.sendSms({
     toPhone: callerNumber,
     fromPhone: smsFrom,
     businessNumber: business.business_number,
-    body: await prepareCustomerFacingSmsBody(
-      input.db,
-      business.business_number,
-      callerNumber,
-      MISSED_CALL_VOICE_HOOK_MESSAGE
-    ),
+    body: preparedBody,
   });
 
   if (!sms.ok) {
@@ -303,6 +317,14 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
       businessNumber: business.business_number,
       detail: sms.detail || 'sms_failed',
     };
+  }
+
+  if (!sms.suppressed) {
+    await markMissedCallSmsSent(input.db, {
+      businessNumber: business.business_number,
+      phoneNumber: callerNumber,
+      smsContent: preparedBody,
+    });
   }
 
   await input.db

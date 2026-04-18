@@ -22,6 +22,11 @@
 			"binding": "SYSTEMIX",
 			"database_name": "systemix",
 			"database_id": "b6573bdd-c88d-4480-a882-745fb10177c7"
+		},
+		{
+			"binding": "GTM_DB",
+			"database_name": "systemix",
+			"database_id": "b6573bdd-c88d-4480-a882-745fb10177c7"
 		}
 	],
 	"vars": {
@@ -50,6 +55,11 @@
 			"d1_databases": [
 				{
 					"binding": "SYSTEMIX",
+					"database_name": "systemix-dev",
+					"database_id": "82088792-6c4a-41fc-95a0-1d5129c1c3f3"
+				},
+				{
+					"binding": "GTM_DB",
 					"database_name": "systemix-dev",
 					"database_id": "82088792-6c4a-41fc-95a0-1d5129c1c3f3"
 				}

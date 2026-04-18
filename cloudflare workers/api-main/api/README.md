@@ -18,6 +18,20 @@ Quick start (local)
    ENVIRONMENT=development
    ```
 
+   For the GTM SMTP test route, add:
+
+   ```text
+   INTERNAL_AUTH_KEY=REPLACE_ME_INTERNAL_AUTH_KEY
+   GTM_DRY_RUN=true
+   GTM_FROM_EMAIL=REPLACE_ME_GTM_FROM_EMAIL
+   GTM_FROM_NAME=Systemix
+   GTM_MAX_TOUCHES=3
+   SMTP_HOST=smtp.office365.com
+   SMTP_PORT=587
+   SMTP_USER=REPLACE_ME_SMTP_USER
+   SMTP_PASS=REPLACE_ME_SMTP_PASS
+   ```
+
    Compute SHA-256 hex for your raw key (macOS):
 
    ```bash
@@ -38,9 +52,9 @@ Quick start (local)
 
 4. Test endpoints
 
-   - Health:
-     ```bash
-     curl -i http://127.0.0.1:8787/health
+  - Health:
+    ```bash
+    curl -i http://127.0.0.1:8787/health
      ```
 
    - Create a lead (email optional):
@@ -52,13 +66,25 @@ Quick start (local)
 
    - Protected routes require an API key. For local dev you can pass raw key as query `?api_key=...` or set the `x-api-key` header.
 
-   - Admin: create a widget site:
-     ```bash
-     curl -i -X POST http://127.0.0.1:8787/v1/admin/sites \
-       -H "Content-Type: application/json" \
-       -H "x-api-key: your-raw-api-key" \
-       -d '{"tenantName":"Acme Co","allowedDomains":["example.com","www.example.com"],"config":{"vertical":"plumbing","brandName":"Acme Plumbing","primaryColor":"#1E88E5"}}'
-     ```
+  - Admin: create a widget site:
+    ```bash
+    curl -i -X POST http://127.0.0.1:8787/v1/admin/sites \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: your-raw-api-key" \
+      -d '{"tenantName":"Acme Co","allowedDomains":["example.com","www.example.com"],"config":{"vertical":"plumbing","brandName":"Acme Plumbing","primaryColor":"#1E88E5"}}'
+    ```
+
+  - GTM SMTP test email:
+    ```bash
+    curl -i -X POST http://127.0.0.1:8787/v1/internal/gtm/send-test-email \
+      -H "Content-Type: application/json" \
+      -H "x-internal-key: REPLACE_ME_INTERNAL_AUTH_KEY" \
+      -d '{"toEmail":"you@example.com","confirmLiveSend":false}'
+    ```
+
+    This route only works when `ENVIRONMENT` is `local` or `development`.
+
+    To send one live email, first set `GTM_DRY_RUN=false` in `.dev.vars`, then repeat the same request with `"confirmLiveSend": true`.
 
 CI
 

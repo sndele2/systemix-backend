@@ -1,50 +1,86 @@
 ---
 name: Systemix Global Rules
-description: Repository‑wide guidelines for editing and building Systemix.
+description: Repository-wide guidelines for editing and building Systemix.
 color: "#006400"
 ---
 
-## Identity & Memory
+# Systemix — Global Agent Policy
 
-This agent file acts as the repository‑wide policy for editing Systemix using Codex.  It knows about the entire architecture described in this repository: Cloudflare Workers running in V8 isolates, a D1 database keyed by `business_number` for tenant isolation, an AI orchestration layer for semantic intent classification, distinct webhook entry points for Stripe, Twilio and internal onboarding, and asynchronous CRM synchronization.  It persists these guidelines across all tasks so that changes remain aligned with the core system design.
+This file is the root policy for all Codex-assisted work on Systemix. Read it fully before making any change. Then consult the relevant submodule `AGENTS.md` for local rules.
 
-## Core Mission
+**Also load at the start of every session:**
+- `ARCHITECTURE.md` — system topology, data flow, layer boundaries
+- `CONVENTIONS.md` — code style, naming, patterns
+- `SECURITY.md` — threat model, mandatory checks, forbidden patterns
 
-Ensure that any change across Systemix abides by the platform’s architectural invariants:
+---
 
-- Maintain sub‑10ms median response times for edge requests by avoiding blocking I/O.
-- Uphold multi‑tenant safety by always scoping data using `business_number` and preserving relational integrity in the D1 schema.
-- Preserve strict JSON‑only AI outputs for semantic intent classification.
-- Keep webhook handlers responsive (HTTP 200) by offloading long‑running tasks via `ctx.waitUntil` and other asynchronous workflows.
-- Ensure eventual consistency with external CRMs without impacting core flow reliability.
+## System at a Glance
 
-## Critical Rules
+Systemix is a multi-tenant SaaS platform running on Cloudflare Workers (V8 isolates) with:
+- **D1** as the primary database, tenant-isolated by `business_number`
+- **AI orchestration** layer for semantic intent classification (strict JSON output)
+- **Webhook handlers** for Stripe, Twilio, and internal onboarding
+- **Async CRM sync** to HubSpot and other external systems
+- **Workers** for background processing and queue consumption
 
-1. **Edge performance:** Never introduce synchronous network or database calls or heavy dependencies in Cloudflare Worker fetch handlers.  Always use asynchronous calls with `ctx.waitUntil` for work that can complete after the response is sent.
-2. **Data integrity:** Do not modify the D1 schema without preserving the unique `business_number` constraint and upsert semantics.  Avoid cross‑tenant data leakage by always including `business_number` in queries and primary keys.
-3. **AI outputs:** LLM responses must be machine‑parseable JSON; do not allow stray tokens or conversational text.  Strip unnecessary metadata from Twilio payloads before inference to reduce token usage.
-4. **Webhook safety:** Stripe and Twilio endpoints must always validate signatures or Authorization headers before processing; respond with HTTP 200 immediately; do not perform long tasks within the synchronous path.
-5. **Security:** Respect environment variables for secrets; never hard‑code keys; keep internal endpoints protected by proper Authorization headers.
-6. **Reliability:** External API failures (HubSpot, OpenAI) must not impact the acknowledgement of inbound webhooks or degrade user experience.  Use retry/backoff and eventual consistency.
-7. **Testing:** When editing code, run and update unit tests and integration tests.  Add tests for new features and edge cases.
+---
 
-## Technical Deliverables
+## Architectural Invariants — Never Violate These
 
-- Code or configuration files that adhere to these constraints.
-- Unit and integration tests verifying latency, integrity and security.
-- Migration scripts for database changes that are safe to run in production.
+These are non-negotiable. Any PR that breaks one must not be merged.
 
-## Workflow Process
+### 1. Edge Performance
+- No synchronous network or DB calls inside `fetch()` handlers
+- No heavy npm dependencies — V8 isolates have strict CPU/memory budgets
+- All post-response work goes through `ctx.waitUntil()`
+- Target: **< 10ms median** for edge request handlers
 
-1. Identify the relevant submodule (worker, database, AI, integrations) and consult its local `AGENTS.md` for more specific guidelines.
-2. Make changes in a local branch with clear commit messages (use conventional commits).
-3. Run tests and linters; fix issues before committing.
-4. When adding new features, update documentation and relevant skills or agent files.
-5. Create a pull request; request code review; incorporate feedback before merging.
+### 2. Multi-Tenant Data Isolation
+- Every DB query **must** include `business_number` in the WHERE clause or primary key
+- Never derive `business_number` from user input alone — always validate against the authenticated session
+- Schema changes must preserve the `business_number` unique constraint and upsert semantics
+- Cross-tenant queries are forbidden unless explicitly operating as a platform admin
 
-## Success Metrics
+### 3. AI Output Contract
+- All LLM responses must be **machine-parseable JSON only** — no prose, no markdown, no stray tokens
+- Strip Twilio/Stripe metadata before sending to inference to reduce token cost
+- Validate and type-check AI output before acting on it — never trust raw LLM output
 
-- No regression in median response time for critical endpoints (< 10 ms).
-- No production incidents triggered by schema or code changes.
-- 100 % passing tests with added coverage for new features.
-- Verified correct behaviour in staging through manual or automated tests.
+### 4. Webhook Safety
+- Validate **Stripe signatures** (`stripe-signature` header) before any processing
+- Validate **Twilio signatures** (Authorization header) before any processing
+- Return **HTTP 200 immediately** — offload everything else to `ctx.waitUntil()`
+- Never perform DB writes or external calls in the synchronous webhook path
+
+### 5. Secret Hygiene
+- All secrets via environment variables — never hardcoded, never logged
+- Internal endpoints require Authorization headers — no unauthenticated internal routes
+- See `SECURITY.md` for the full threat model
+
+### 6. External Reliability
+- HubSpot, OpenAI, and other external failures must **never** surface as errors to the webhook caller
+- Implement retry with exponential backoff and dead-letter handling
+- Design for eventual consistency — not strong consistency — with external CRMs
+
+---
+
+## Workflow — Follow This Every Time
+
+1. **Read first:** Load `ARCHITECTURE.md`, `CONVENTIONS.md`, and `SECURITY.md`
+2. **Locate:** Identify which submodule is affected (`ai/`, `db/`, `integrations/`, `workers/`) and read its local `AGENTS.md`
+3. **Branch:** Work in a feature branch with conventional commit messages (`feat:`, `fix:`, `chore:`, `security:`)
+4. **Test:** Run and update unit + integration tests; add tests for new behaviour and edge cases
+5. **Security check:** Run through the `SECURITY.md` checklist before committing
+6. **PR:** Open a pull request with a clear description; do not self-merge
+
+---
+
+## Success Criteria
+
+- Median edge response time remains < 10ms
+- Zero cross-tenant data leakage
+- Zero hardcoded secrets
+- All tests pass with new coverage added
+- No production incidents from schema or code changes
+- Security checklist cleared on every PR

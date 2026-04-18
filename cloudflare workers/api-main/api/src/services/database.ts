@@ -1,10 +1,12 @@
 import { sendTwilioSms } from '../core/sms.ts';
 import { createLogger } from '../core/logging.ts';
+import { ensureCustomerMissedCallSchema } from './missedCallRecovery.ts';
 
 type UpsertBusinessInput = {
   business_number: string;
   owner_phone_number: string;
   display_name: string;
+  intake_question?: string | null;
 };
 
 type DatabaseEnv = {
@@ -43,15 +45,18 @@ export async function sendBusinessWelcomeSms(
 }
 
 export async function upsertBusiness(
-  { business_number, owner_phone_number, display_name }: UpsertBusinessInput,
+  { business_number, owner_phone_number, display_name, intake_question }: UpsertBusinessInput,
   env: DatabaseEnv
 ): Promise<void> {
+  await ensureCustomerMissedCallSchema(env.SYSTEMIX);
+
   const sql = `
     INSERT INTO businesses (
       id,
       business_number,
       owner_phone_number,
       display_name,
+      intake_question,
       created_at,
       updated_at
     )
@@ -60,6 +65,7 @@ export async function upsertBusiness(
       ?1,
       ?2,
       ?3,
+      ?4,
       strftime('%Y-%m-%dT%H:%M:%fZ','now'),
       strftime('%Y-%m-%dT%H:%M:%fZ','now')
     )
@@ -67,10 +73,20 @@ export async function upsertBusiness(
     DO UPDATE SET
       owner_phone_number = excluded.owner_phone_number,
       display_name = excluded.display_name,
+      intake_question = CASE
+        WHEN excluded.intake_question IS NULL OR excluded.intake_question = ''
+        THEN businesses.intake_question
+        ELSE excluded.intake_question
+      END,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `;
 
-  await env.SYSTEMIX.prepare(sql).bind(business_number, owner_phone_number, display_name).run();
+  await env.SYSTEMIX.prepare(sql).bind(
+    business_number,
+    owner_phone_number,
+    display_name,
+    (intake_question || '').trim() || null
+  ).run();
   d1Log.log('Business upserted', {
     context: {
       handler: 'upsertBusiness',
@@ -79,6 +95,7 @@ export async function upsertBusiness(
     },
     data: {
       displayName: display_name,
+      intakeQuestion: (intake_question || '').trim() || null,
     },
   });
 

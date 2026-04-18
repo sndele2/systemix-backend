@@ -3,8 +3,10 @@ import { dirname, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import Stripe from 'stripe';
+import { createLogger } from '../src/core/logging.ts';
 
 const DEFAULT_WELCOME_URL = 'https://systemixai.co/';
+const stripeLog = createLogger('[STRIPE]', 'create-live-link');
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const envCandidates = [
@@ -117,21 +119,18 @@ async function main() {
     throw new Error(`Unexpected Stripe payment link URL: ${paymentLink.url}`);
   }
 
-  console.log(
-    JSON.stringify(
-      {
-        url: paymentLink.url,
-        id: paymentLink.id,
-        metadata: paymentLink.metadata,
-      },
-      null,
-      2
-    )
-  );
+  stripeLog.log('Live payment link created', {
+    data: {
+      url: paymentLink.url,
+      id: paymentLink.id,
+      metadata: paymentLink.metadata,
+    },
+  });
 }
 
 main().catch((error: unknown) => {
-  console.error('[STRIPE] Failed to create live payment link');
-  console.error(error);
+  stripeLog.error('Failed to create live payment link', {
+    error,
+  });
   process.exit(1);
 });

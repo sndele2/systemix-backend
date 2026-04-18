@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { buildTwilioValidationUrl } from '../src/core/twilioSignature.ts';
 import { appendSmsOptOutFooter, SMS_OPT_OUT_FOOTER } from '../src/core/sms.ts';
+import { createLogger } from '../src/core/logging.ts';
 import { classifyLeadIntent } from '../src/services/openai.ts';
 import { prepareCustomerFacingSmsBody } from '../src/services/smsCompliance.ts';
 import {
+  buildBusinessOwnerAlertMessage,
   buildEmergencyPriorityMessage,
+  formatDisplayPhoneNumber,
   buildOwnerAlertMessage,
   findBusinessByNumber,
   MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER,
@@ -14,6 +19,8 @@ import {
   shouldFireMissedCallVoiceHook,
 } from '../src/services/twilioLaunch.ts';
 import { twilioVoiceHandler } from '../src/webhooks/twilioVoice.ts';
+
+const verifyLog = createLogger('[ONBOARD]', 'verify-v1-final-polish');
 
 type FakeRow = Record<string, unknown> | null;
 
@@ -179,23 +186,59 @@ function verifyTwilioSmsSource() {
   assert.ok(smsSource.includes('const emergencySummary = await classifyLeadIntent(messageBody, apiKey);'));
   assert.ok(smsSource.includes('summary: emergencySummary.summary'));
   assert.ok(smsSource.includes('const emergencyCustomerMessage = buildEmergencyPriorityMessage(triage.summary, input.displayName);'));
+  assert.ok(smsSource.includes('const ownerAlertBody = buildBusinessOwnerAlertMessage({'));
   assert.ok(smsSource.includes('const ownerAlertBody = buildOwnerAlertMessage('));
-  assert.ok(smsSource.includes("console.log('[TWILIO] EMERGENCY SMS SENT'"));
+  assert.ok(smsSource.includes("source: 'post_classification_owner_alert'"));
+  assert.equal(smsSource.includes('buildImmediateOwnerAlertMessage('), false);
+  assert.ok(smsSource.includes("twilioLog.log('Emergency customer reply sent'"));
   assert.ok(smsSource.includes('displayName: businessContext.displayName'));
 
   assert.equal(
     buildEmergencyPriorityMessage('burst pipe in basement', 'Systemix Plumbing'),
-    "Emergency Priority: I've escalated your 'burst pipe in basement' to the Systemix Plumbing team. Expect a call in the next few minutes."
+    "🚨 Got it - we're on this. A local service provider has been notified and will call shortly. If not, reply here and we'll follow up."
   );
   assert.equal(
     buildEmergencyPriorityMessage('', ''),
-    "Emergency Priority: I've escalated your 'your request' to the team. Expect a call in the next few minutes."
+    "🚨 Got it - we're on this. A local service provider has been notified and will call shortly. If not, reply here and we'll follow up."
   );
   assert.equal(
     buildOwnerAlertMessage('emergency', 'Burst pipe is flooding the basement.', '+12175550123'),
     'AI thinks this is an [Emergency]. Summary: Burst pipe is flooding the basement. Click here to call them back immediately: tel:+12175550123'
   );
-  assertNoEmoji(buildEmergencyPriorityMessage('burst pipe in basement', 'Systemix Plumbing'));
+
+  assert.equal(formatDisplayPhoneNumber('+12175550123'), '(217) 555-0123');
+  assert.equal(formatDisplayPhoneNumber('2175550123'), '(217) 555-0123');
+  assert.equal(formatDisplayPhoneNumber('(217) 555-0123'), '(217) 555-0123');
+
+  assert.equal(
+    buildBusinessOwnerAlertMessage({
+      classification: 'emergency',
+      summary: 'Burst pipe is flooding the basement.',
+      customerNumber: '+12175550123',
+      customerMessage: 'The basement is flooding from a burst pipe.',
+    }),
+    '🚨 EMERGENCY LEAD\n\nIssue: Burst pipe is flooding the basement\nCustomer: (217) 555-0123\n\nMessage:\n"The basement is flooding from a burst pipe."\n\nCall now: (217) 555-0123'
+  );
+
+  assert.equal(
+    buildBusinessOwnerAlertMessage({
+      classification: null,
+      summary: null,
+      customerNumber: '2175550123',
+      customerMessage: 'Need a quote for a water heater next week.',
+    }),
+    '📩 NEW LEAD\n\nIssue: General Inquiry\nCustomer: (217) 555-0123\n\nMessage:\n"Need a quote for a water heater next week."\n\nReply or call: (217) 555-0123'
+  );
+
+  const longOwnerAlert = buildBusinessOwnerAlertMessage({
+    classification: 'emergency',
+    summary: 'Burst pipe is flooding the basement.',
+    customerNumber: '+12175550123',
+    customerMessage: 'A'.repeat(2000),
+  });
+  assert.ok(longOwnerAlert.includes('...'));
+  assert.ok(longOwnerAlert.endsWith('Call now: (217) 555-0123'));
+  assert.ok(longOwnerAlert.length <= 1500);
 }
 
 async function verifyOpenAiSchemaAndClassification() {
@@ -356,7 +399,10 @@ async function verifyVoiceHookSimulation() {
     } as never);
 
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { ok: true, queued: true, status: 'no-answer' });
+    assert.equal(response.headers.get('Content-Type'), 'application/xml');
+    const body = await response.text();
+    assert.ok(body.includes('<Response>'));
+    assert.ok(body.includes('recordingStatusCallback="https://example.com/v1/webhooks/twilio/recording?from=%2B12175550123&amp;to=%2B18443217137"'));
 
     await Promise.all(scheduledTasks);
 
@@ -372,17 +418,29 @@ async function verifyVoiceHookSimulation() {
   }
 }
 
+function verifyTwilioValidationUrlConstruction() {
+  assert.equal(
+    buildTwilioValidationUrl(
+      { WORKER_URL: 'http://systemix-backend.sean-ndele.workers.dev/internal' },
+      'http://workers.internal/v1/webhooks/twilio/voice?CallSid=CA123'
+    ),
+    'https://systemix-backend.sean-ndele.workers.dev/v1/webhooks/twilio/voice?CallSid=CA123'
+  );
+}
+
 async function main() {
   await verifyVoiceHookHelpers();
   await verifySmsFooterCompliance();
   verifyTwilioSmsSource();
   await verifyOpenAiSchemaAndClassification();
+  verifyTwilioValidationUrlConstruction();
   await verifyVoiceHookSimulation();
-  console.log('V1 final polish local verification passed.');
+  verifyLog.log('Local verification passed');
 }
 
 main().catch((error) => {
-  console.error('V1 final polish local verification failed.');
-  console.error(error);
+  verifyLog.error('Local verification failed', {
+    error,
+  });
   process.exit(1);
 });

@@ -7,6 +7,10 @@ import {
   prepareCustomerFacingSmsBody,
   SMS_OPT_OUT_FOOTER,
 } from '../services/smsCompliance.ts';
+import {
+  ensureCustomerMissedCallSchema,
+  isMissedCallNumberIgnored,
+} from '../services/missedCallRecovery.ts';
 
 export { appendSmsOptOutFooter, SMS_OPT_OUT_FOOTER };
 
@@ -51,6 +55,7 @@ async function dispatchTwilioSms(
   input: TwilioSendInput
 ): Promise<TwilioSendResult> {
   await ensureSmsComplianceSchema(env.SYSTEMIX);
+  await ensureCustomerMissedCallSchema(env.SYSTEMIX);
 
   const fromPhone = normalizePhone(input.fromPhone) || input.fromPhone.trim();
   const toPhone = normalizePhone(input.toPhone) || input.toPhone.trim();
@@ -76,6 +81,21 @@ async function dispatchTwilioSms(
       ok: true,
       suppressed: true,
       detail: 'suppressed_opted_out',
+    };
+  }
+
+  if (businessNumber && (await isMissedCallNumberIgnored(env.SYSTEMIX, businessNumber, toPhone))) {
+    twilioLog.log('Outbound SMS suppressed because recipient is ignored for missed-call follow-up', {
+      context: {
+        handler: 'dispatchTwilioSms',
+        fromNumber: businessNumber,
+        toNumber: toPhone,
+      },
+    });
+    return {
+      ok: true,
+      suppressed: true,
+      detail: 'suppressed_ignored',
     };
   }
 

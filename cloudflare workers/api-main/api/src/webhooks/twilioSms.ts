@@ -9,6 +9,10 @@ import {
   type AiLeadClassification,
 } from '../services/openai.ts';
 import {
+  ensureCustomerMissedCallSchema,
+  recordMissedCallReply,
+} from '../services/missedCallRecovery.ts';
+import {
   buildBusinessOwnerAlertMessage,
   buildEmergencyPriorityMessage,
   buildOwnerAlertMessage,
@@ -52,7 +56,7 @@ type TriageResult = {
   aiClassification: AiLeadClassification;
   summary: string;
   confidence: Exclude<Confidence, null>;
-  source: 'keyword_emergency' | 'keyword_standard' | 'gpt' | 'gpt_fallback';
+  source: 'keyword_emergency' | 'keyword_standard' | 'gpt' | 'gpt_fallback' | 'disabled';
   gptUsed: boolean;
   keywordMatcherMs: number;
   gptClassifierMs: number;
@@ -67,6 +71,7 @@ type BusinessContext = {
 };
 
 const PROVIDER = 'twilio';
+const ENABLE_CLASSIFICATION = false;
 const ALERT_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const ACTIVE_THREAD_WINDOW_MS = 5 * 60 * 1000;
 const MAX_SMS_BODY = 1500;
@@ -264,7 +269,24 @@ async function classifyAmbiguousWithGpt(messageBody: string, apiKey?: string): P
   };
 }
 
+function buildClassificationDisabledTriage(messageBody: string): TriageResult {
+  return {
+    classification: 'standard',
+    aiClassification: 'inquiry',
+    summary: buildLeadSummary('inquiry', messageBody),
+    confidence: 'low',
+    source: 'disabled',
+    gptUsed: false,
+    keywordMatcherMs: 0,
+    gptClassifierMs: 0,
+  };
+}
+
 async function classifyCustomerMessage(messageBody: string, apiKey?: string): Promise<TriageResult> {
+  if (!ENABLE_CLASSIFICATION) {
+    return buildClassificationDisabledTriage(messageBody);
+  }
+
   const keywordStartMs = nowMs();
   const normalized = messageBody.toLowerCase();
   const emergencyHit = EMERGENCY_KEYWORDS.some((keyword) => containsKeyword(normalized, keyword));
@@ -431,6 +453,42 @@ function scheduleSettledBackgroundTasks(
   }
 
   void backgroundWork;
+}
+
+function buildMissedCallReplyTrackingTask(input: {
+  env: Bindings;
+  businessNumber: string;
+  customerNumber: string;
+  body: string;
+  providerMessageId: string;
+}): Promise<unknown> {
+  return withLoggedBackgroundCatch(
+    '[D1]',
+    'Track missed-call reply',
+    recordMissedCallReply(input.env.SYSTEMIX, {
+      businessNumber: input.businessNumber,
+      phoneNumber: input.customerNumber,
+      replyText: input.body,
+    }).then(() => {
+      d1Log.log('Missed-call reply tracked', {
+        context: {
+          handler: 'buildMissedCallReplyTrackingTask',
+          messageSid: input.providerMessageId || null,
+          fromNumber: input.customerNumber,
+          toNumber: input.businessNumber,
+        },
+      });
+      return true;
+    }),
+    {
+      context: {
+        handler: 'buildMissedCallReplyTrackingTask',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.businessNumber,
+      },
+    }
+  );
 }
 
 async function hasExistingMessageSid(env: Bindings, providerMessageId: string): Promise<boolean> {
@@ -3557,6 +3615,7 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
     }
 
     await ensureSwitchboardSchema(c.env);
+    await ensureCustomerMissedCallSchema(c.env.SYSTEMIX);
 
     const params = formDataToParams(formData);
     const from = ((formData.get('From') as string) || '').trim();
@@ -3588,6 +3647,21 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
 
     const businessContext = await resolveBusinessContext(c.env, inboundTo);
     const resolvedBusinessNumber = businessContext?.businessNumber || inboundTo;
+    const ownerPhone = businessContext?.ownerPhone || '';
+    const isForcedTestLead = body.toUpperCase().includes('TEST LEAD');
+    const shouldTrackMissedCallReply =
+      !!businessContext && (!ownerPhone || !phonesEqual(inboundFrom, ownerPhone) || isForcedTestLead);
+    const replyTrackingTasks = shouldTrackMissedCallReply
+      ? [
+          buildMissedCallReplyTrackingTask({
+            env: c.env,
+            businessNumber: resolvedBusinessNumber,
+            customerNumber: inboundFrom,
+            body,
+            providerMessageId,
+          }),
+        ]
+      : [];
     const complianceAction = resolveInboundSmsComplianceAction(body);
 
     const rawJson = JSON.stringify({
@@ -3609,25 +3683,26 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
     if (complianceAction) {
       scheduleSettledBackgroundTasks(
         c.executionCtx,
-        buildComplianceCommandBackgroundTasks({
-          env: c.env,
-          twilioClient,
-          action: complianceAction,
-          businessNumber: resolvedBusinessNumber,
-          displayName: businessContext?.displayName || '',
-          inboundFrom,
-          inboundTo,
-          body,
-          providerMessageId,
-          rawJson,
-        })
+        [
+          ...buildComplianceCommandBackgroundTasks({
+            env: c.env,
+            twilioClient,
+            action: complianceAction,
+            businessNumber: resolvedBusinessNumber,
+            displayName: businessContext?.displayName || '',
+            inboundFrom,
+            inboundTo,
+            body,
+            providerMessageId,
+            rawJson,
+          }),
+          ...replyTrackingTasks,
+        ]
       );
 
       return respondWithEmptyTwiml(c);
     }
 
-    const ownerPhone = businessContext?.ownerPhone || '';
-    const isForcedTestLead = body.toUpperCase().includes('TEST LEAD');
     const route: 'owner_proxy' | 'customer_analysis' =
       ownerPhone && phonesEqual(inboundFrom, ownerPhone) && !isForcedTestLead
         ? 'owner_proxy'
@@ -3654,15 +3729,18 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
     if (!ownerPhone) {
       scheduleSettledBackgroundTasks(
         c.executionCtx,
-        buildMissingOwnerMappingBackgroundTasks({
-          env: c.env,
-          inboundFrom,
-          inboundTo,
-          body,
-          providerMessageId,
-          rawJson,
-          businessNumber: businessContext.businessNumber,
-        })
+        [
+          ...buildMissingOwnerMappingBackgroundTasks({
+            env: c.env,
+            inboundFrom,
+            inboundTo,
+            body,
+            providerMessageId,
+            rawJson,
+            businessNumber: businessContext.businessNumber,
+          }),
+          ...replyTrackingTasks,
+        ]
       );
       return respondWithEmptyTwiml(c);
     }
@@ -3672,15 +3750,18 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
     if (isForcedTestLead) {
       scheduleSettledBackgroundTasks(
         c.executionCtx,
-        buildForcedLeadBackgroundTasks({
-          env: c.env,
-          businessNumber: activeBusinessNumber,
-          customerNumber: inboundFrom,
-          body,
-          inboundTo,
-          providerMessageId,
-          rawJson,
-        })
+        [
+          ...buildForcedLeadBackgroundTasks({
+            env: c.env,
+            businessNumber: activeBusinessNumber,
+            customerNumber: inboundFrom,
+            body,
+            inboundTo,
+            providerMessageId,
+            rawJson,
+          }),
+          ...replyTrackingTasks,
+        ]
       );
 
       return respondWithEmptyTwiml(c);
@@ -3775,19 +3856,22 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
 
     scheduleSettledBackgroundTasks(
       c.executionCtx,
-        buildCustomerAnalysisBackgroundTasks({
+      [
+        ...buildCustomerAnalysisBackgroundTasks({
           env: c.env,
           twilioClient,
           businessNumber: activeBusinessNumber,
           ownerPhone,
           displayName: businessContext.displayName,
-        customerNumber: inboundFrom,
-        inboundTo,
-        body,
-        providerMessageId,
-        rawJson,
-        ownerAlertEligible,
-      })
+          customerNumber: inboundFrom,
+          inboundTo,
+          body,
+          providerMessageId,
+          rawJson,
+          ownerAlertEligible,
+        }),
+        ...replyTrackingTasks,
+      ]
     );
 
     twilioLog.log('Returning empty SMS TwiML', {

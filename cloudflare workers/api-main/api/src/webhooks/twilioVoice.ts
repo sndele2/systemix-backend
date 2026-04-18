@@ -391,6 +391,7 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
             db: getDb(env),
             twilioClient,
             smsFrom: (env.TWILIO_PHONE_NUMBER || '').trim(),
+            businessNumber: to,
             callerNumber: from,
             provider: CALL_PROVIDER,
             providerCallId,

@@ -1,0 +1,716 @@
+/**
+ * Orchestrates GTM lead state transitions without coupling this module to production webhook paths.
+ */
+import type {
+  AdvanceResult,
+  EmailSendResult,
+  GTMConfig,
+  GtmRepliesResponse,
+  InboxMessage,
+  InboxProvider,
+  Lead,
+  LeadRecord,
+  PreparedAction,
+  RecordReplyResult,
+  ReplyClassification,
+  Result,
+  Touchpoint,
+} from './types.ts';
+import type { LeadStore } from './lead-store.ts';
+
+import { EmailClient } from './email-client.ts';
+import { MicrosoftGraphInboxProvider } from './inbox-client.ts';
+import { DurableLeadStore } from './lead-store.ts';
+import { renderTemplate } from './prompts.ts';
+import { ReplyClassifier } from './reply-classifier.ts';
+import { SequenceEngine } from './sequence-engine.ts';
+
+const GTM_LOG_PREFIX = '[GTM]';
+const PENDING_STATUS = 'pending';
+const ACTIVE_STATUS = 'active';
+const REPLIED_STATUS = 'replied';
+const UNKNOWN_REPLY_CLASSIFICATION = 'unknown';
+const DEFAULT_SYNC_CURSOR = '1970-01-01T00:00:00.000Z';
+const MAX_SYNC_BATCH_SIZE = 50;
+
+export interface GtmServiceRuntimeEnv {
+  GTM_DB: D1Database;
+  GTM_FROM_EMAIL?: string;
+  GTM_FROM_NAME?: string;
+  GTM_MAX_TOUCHES?: string;
+  GRAPH_TENANT_ID?: string;
+  GRAPH_CLIENT_ID?: string;
+  GRAPH_CLIENT_SECRET?: string;
+  GRAPH_MAILBOX_UPN?: string;
+  SMTP_USER?: string;
+}
+
+interface GTMServiceDependencies {
+  store: LeadStore;
+  emailClient: EmailClient;
+  sequenceEngine: SequenceEngine;
+  replyClassifier: ReplyClassifier;
+  config: GTMConfig;
+  inboxProvider?: InboxProvider;
+}
+
+interface LoadedLeadContext {
+  lead: LeadRecord;
+  touchpoints: Touchpoint[];
+}
+
+interface ProcessedInboxMessageResult {
+  isNewReply: boolean;
+  ok: boolean;
+  receivedAt: string;
+  replyId: string;
+}
+
+function succeed<T>(value: T): Result<T> {
+  return { ok: true, value };
+}
+
+function fail<T>(error: string): Result<T> {
+  return { ok: false, error };
+}
+
+function logInfo(event: string, data: Record<string, unknown> = {}): void {
+  console.log(GTM_LOG_PREFIX + ' ' + event, {
+    ts: new Date().toISOString(),
+    ...data,
+  });
+}
+
+function logError(event: string, error: unknown, data: Record<string, unknown> = {}): void {
+  console.error(GTM_LOG_PREFIX + ' ' + event, {
+    ts: new Date().toISOString(),
+    ...data,
+    error: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function parseMaxTouches(value: string | undefined): 1 | 2 | 3 {
+  switch (value?.trim()) {
+    case '1':
+      return 1;
+    case '2':
+      return 2;
+    case '3':
+      return 3;
+    default:
+      return 3;
+  }
+}
+
+function buildRuntimeConfig(env: GtmServiceRuntimeEnv): GTMConfig {
+  return {
+    fromEmail: env.GTM_FROM_EMAIL?.trim() || env.SMTP_USER?.trim() || 'gtm-replies@example.invalid',
+    fromName: env.GTM_FROM_NAME?.trim() || 'Systemix',
+    maxTouches: parseMaxTouches(env.GTM_MAX_TOUCHES),
+    dryRun: true,
+  };
+}
+
+function subtractOneMillisecond(isoTimestamp: string): string {
+  const timestamp = Date.parse(isoTimestamp);
+  if (Number.isNaN(timestamp)) {
+    return isoTimestamp;
+  }
+
+  return new Date(Math.max(0, timestamp - 1)).toISOString();
+}
+
+export function createRuntimeGtmService(env: GtmServiceRuntimeEnv): GTMService {
+  const config = buildRuntimeConfig(env);
+
+  return new GTMService({
+    store: new DurableLeadStore(env.GTM_DB),
+    emailClient: new EmailClient(config),
+    sequenceEngine: new SequenceEngine({ maxTouches: config.maxTouches }),
+    replyClassifier: new ReplyClassifier(),
+    config,
+    inboxProvider: new MicrosoftGraphInboxProvider(env),
+  });
+}
+
+export class GTMService {
+  private readonly store: LeadStore;
+  private readonly emailClient: EmailClient;
+  private readonly sequenceEngine: SequenceEngine;
+  private readonly replyClassifier: ReplyClassifier;
+  private readonly config: GTMConfig;
+  private readonly inboxProvider: InboxProvider | null;
+
+  constructor(dependencies: GTMServiceDependencies) {
+    this.store = dependencies.store;
+    this.emailClient = dependencies.emailClient;
+    this.sequenceEngine = dependencies.sequenceEngine;
+    this.replyClassifier = dependencies.replyClassifier;
+    this.config = {
+      ...dependencies.config,
+      dryRun: dependencies.config.dryRun !== false,
+    };
+    this.inboxProvider = dependencies.inboxProvider ?? null;
+  }
+
+  async createLead(lead: Lead): Promise<Result<void>> {
+    const existingLeadResult = await this.store.getLeadById(lead.id);
+    if (!existingLeadResult.ok) {
+      return fail(existingLeadResult.error);
+    }
+
+    if (existingLeadResult.value !== null) {
+      if (existingLeadResult.value.status !== PENDING_STATUS) {
+        return fail('Lead already exists with status ' + existingLeadResult.value.status);
+      }
+
+      return fail('Lead already exists');
+    }
+
+    const createLeadResult = await this.store.createLead(lead);
+    if (!createLeadResult.ok) {
+      return fail(createLeadResult.error);
+    }
+
+    logInfo('gtm_lead_created', {
+      leadId: lead.id,
+      status: PENDING_STATUS,
+    });
+
+    return succeed(undefined);
+  }
+
+  async startSequence(leadId: string): Promise<Result<void>> {
+    const leadResult = await this.store.getLeadById(leadId);
+    if (!leadResult.ok) {
+      return fail(leadResult.error);
+    }
+
+    if (leadResult.value === null) {
+      return fail('Lead not found');
+    }
+
+    if (leadResult.value.status !== PENDING_STATUS) {
+      return fail('Lead must be pending to start the sequence');
+    }
+
+    const updateLeadResult = await this.store.updateLead(leadId, {
+      status: ACTIVE_STATUS,
+    });
+    if (!updateLeadResult.ok) {
+      return fail(updateLeadResult.error);
+    }
+
+    logInfo('gtm_sequence_started', {
+      leadId,
+      fromStatus: leadResult.value.status,
+      toStatus: ACTIVE_STATUS,
+    });
+
+    return succeed(undefined);
+  }
+
+  async prepareNextAction(leadId: string): Promise<Result<PreparedAction>> {
+    const leadContextResult = await this.loadLeadContext(leadId);
+    if (!leadContextResult.ok) {
+      return fail(leadContextResult.error);
+    }
+
+    const { lead, touchpoints } = leadContextResult.value;
+
+    if (touchpoints.length !== lead.touches_sent) {
+      logInfo('gtm_touchpoint_history_mismatch', {
+        leadId,
+        touchesSent: lead.touches_sent,
+        touchpointCount: touchpoints.length,
+      });
+    }
+
+    const decision = this.sequenceEngine.next(lead.touches_sent, lead.status);
+    if (decision.action === 'stop') {
+      return succeed({
+        action: 'stop',
+        reason: decision.reason,
+      });
+    }
+
+    try {
+      const rendered = renderTemplate(decision.stage.templateKey, lead);
+
+      return succeed({
+        action: 'send',
+        stage: decision.stage,
+        subject: rendered.subject,
+        body: rendered.body,
+      });
+    } catch (error) {
+      logError('gtm_prepare_next_action_render_failed', error, {
+        leadId,
+        templateKey: decision.stage.templateKey,
+      });
+      return fail('Failed to render GTM email template');
+    }
+  }
+
+  async advanceLeadSequence(leadId: string): Promise<Result<AdvanceResult>> {
+    const preparedActionResult = await this.prepareNextAction(leadId);
+    if (!preparedActionResult.ok) {
+      return fail(preparedActionResult.error);
+    }
+
+    const leadResult = await this.store.getLeadById(leadId);
+    if (!leadResult.ok) {
+      return fail(leadResult.error);
+    }
+
+    if (leadResult.value === null) {
+      return fail('Lead not found');
+    }
+
+    const lead = leadResult.value;
+    const preparedAction = preparedActionResult.value;
+
+    if (preparedAction.action === 'stop') {
+      const stoppedAt = new Date().toISOString();
+      const stopResult = await this.store.markStopped(leadId, preparedAction.reason, stoppedAt);
+      if (!stopResult.ok) {
+        return fail(stopResult.error);
+      }
+
+      logInfo('gtm_sequence_stopped', {
+        leadId,
+        fromStatus: lead.status,
+        toStatus: preparedAction.reason,
+        stoppedAt,
+      });
+
+      return succeed({
+        action: 'stopped',
+        leadId,
+        reason: preparedAction.reason,
+      });
+    }
+
+    if (lead.status !== ACTIVE_STATUS) {
+      return fail('Lead must be active before advancing the sequence');
+    }
+
+    if (!this.config.dryRun) {
+      return fail('Live GTM email sending is not implemented');
+    }
+
+    const sentAt = new Date().toISOString();
+    const touchpoint: Touchpoint = {
+      id: crypto.randomUUID(),
+      lead_id: leadId,
+      stage_index: preparedAction.stage.stageIndex,
+      sent_at: sentAt,
+      dry_run: this.config.dryRun,
+      result: 'skipped',
+      message_id: null,
+    };
+
+    const recordTouchpointResult = await this.store.recordTouchpoint(touchpoint);
+    if (!recordTouchpointResult.ok) {
+      return fail(recordTouchpointResult.error);
+    }
+
+    logInfo('gtm_touchpoint_persisted', {
+      leadId,
+      touchpointId: touchpoint.id,
+      stageIndex: touchpoint.stage_index,
+      dryRun: touchpoint.dry_run,
+      result: touchpoint.result,
+      sentAt: touchpoint.sent_at,
+    });
+
+    let sendResult: EmailSendResult;
+    try {
+      sendResult = await this.emailClient.send({
+        leadId,
+        toEmail: lead.email,
+        subject: preparedAction.subject,
+        body: preparedAction.body,
+      });
+    } catch (error) {
+      logError('gtm_email_send_failed', error, {
+        leadId,
+        stageIndex: preparedAction.stage.stageIndex,
+        dryRun: this.config.dryRun,
+      });
+      return fail('Failed to send GTM email');
+    }
+
+    if (!sendResult.success) {
+      const sendError = new Error('Email client returned success=false');
+      logError('gtm_email_send_unsuccessful', sendError, {
+        leadId,
+        stageIndex: preparedAction.stage.stageIndex,
+        dryRun: sendResult.dryRun,
+      });
+      return fail('Failed to send GTM email');
+    }
+
+    const updateLeadResult = await this.store.updateLead(leadId, {
+      touches_sent: lead.touches_sent + 1,
+      last_stage_index: preparedAction.stage.stageIndex,
+      last_sent_at: sentAt,
+    });
+    if (!updateLeadResult.ok) {
+      logError('gtm_lead_state_update_failed', new Error(updateLeadResult.error), {
+        leadId,
+        stageIndex: preparedAction.stage.stageIndex,
+        touchesSent: lead.touches_sent + 1,
+        lastSentAt: sentAt,
+      });
+      return fail(updateLeadResult.error);
+    }
+
+    const action = sendResult.dryRun ? 'skipped' : 'sent';
+
+    logInfo('gtm_lead_advanced', {
+      leadId,
+      action,
+      stageIndex: preparedAction.stage.stageIndex,
+      touchesSent: lead.touches_sent + 1,
+      lastSentAt: sentAt,
+      dryRun: sendResult.dryRun,
+      messageId: sendResult.messageId ?? null,
+    });
+
+    return succeed({
+      action,
+      leadId,
+      reason: sendResult.dryRun ? 'dry_run' : undefined,
+    });
+  }
+
+  async recordReply(leadId: string, rawReply: string): Promise<Result<RecordReplyResult>> {
+    let classification: ReplyClassification | null = null;
+
+    try {
+      classification = this.replyClassifier.classify(rawReply);
+      logInfo('gtm_reply_classified', {
+        leadId,
+        intent: classification.intent,
+        confidence: classification.confidence,
+        reason: classification.reason ?? null,
+      });
+    } catch (error) {
+      logError('gtm_reply_classification_failed', error, {
+        leadId,
+      });
+    }
+
+    const stoppedAt = new Date().toISOString();
+    const stopResult = await this.store.markStopped(leadId, REPLIED_STATUS, stoppedAt);
+    if (!stopResult.ok) {
+      return fail(stopResult.error);
+    }
+
+    logInfo('gtm_sequence_stopped_by_reply', {
+      leadId,
+      stoppedAt,
+      intent: classification?.intent ?? null,
+    });
+
+    return succeed({
+      classification: classification?.intent ?? UNKNOWN_REPLY_CLASSIFICATION,
+    });
+  }
+
+  async syncAndListReplies(limit: number, matchedOnly: boolean): Promise<Result<GtmRepliesResponse>> {
+    const syncResult = await this.syncRepliesFromInbox();
+    if (!syncResult.ok) {
+      return fail(syncResult.error);
+    }
+
+    const repliesResult = await this.store.listReplies(limit, matchedOnly);
+    if (!repliesResult.ok) {
+      return fail(repliesResult.error);
+    }
+
+    return succeed({
+      synced_at: syncResult.value.synced_at,
+      new_replies_found: syncResult.value.new_replies_found,
+      replies: repliesResult.value,
+    });
+  }
+
+  async listRepliesForLead(leadId: string): Promise<Result<GtmRepliesResponse>> {
+    const leadResult = await this.store.getLeadById(leadId);
+    if (!leadResult.ok) {
+      return fail(leadResult.error);
+    }
+
+    if (leadResult.value === null) {
+      return fail('Lead not found');
+    }
+
+    const syncedAtResult = await this.getLastSyncedAt();
+    if (!syncedAtResult.ok) {
+      return fail(syncedAtResult.error);
+    }
+
+    const repliesResult = await this.store.listRepliesByLeadId(leadId);
+    if (!repliesResult.ok) {
+      return fail(repliesResult.error);
+    }
+
+    return succeed({
+      synced_at: syncedAtResult.value,
+      new_replies_found: 0,
+      replies: repliesResult.value,
+    });
+  }
+
+  async getLeadsReadyForNextAction(): Promise<Result<LeadRecord[]>> {
+    return this.store.listLeadsReadyForNextAction(this.sequenceEngine.getSequence());
+  }
+
+  private async loadLeadContext(leadId: string): Promise<Result<LoadedLeadContext>> {
+    const leadResult = await this.store.getLeadById(leadId);
+    if (!leadResult.ok) {
+      return fail(leadResult.error);
+    }
+
+    if (leadResult.value === null) {
+      return fail('Lead not found');
+    }
+
+    const touchpointsResult = await this.store.listTouchpointsByLeadId(leadId);
+    if (!touchpointsResult.ok) {
+      return fail(touchpointsResult.error);
+    }
+
+    return succeed({
+      lead: leadResult.value,
+      touchpoints: touchpointsResult.value,
+    });
+  }
+
+  private async getLastSyncedAt(): Promise<Result<string>> {
+    const cursorResult = await this.store.getSyncCursor();
+    if (!cursorResult.ok) {
+      return fail(cursorResult.error);
+    }
+
+    return succeed(cursorResult.value?.last_synced_at ?? DEFAULT_SYNC_CURSOR);
+  }
+
+  private async matchReplyToLead(message: InboxMessage): Promise<Result<LeadRecord | null>> {
+    if (message.fromEmail.trim().length === 0) {
+      return fail('Reply is missing from_email');
+    }
+
+    const emailMatchResult = await this.store.findLeadByEmail(message.fromEmail);
+    if (!emailMatchResult.ok) {
+      return fail(emailMatchResult.error);
+    }
+
+    if (emailMatchResult.value !== null) {
+      return succeed(emailMatchResult.value);
+    }
+
+    // Conversation-id matching stays disabled until outbound GTM records persist it reliably.
+    return succeed(null);
+  }
+
+  private async processInboxMessage(message: InboxMessage): Promise<ProcessedInboxMessageResult> {
+    if (message.fromEmail.trim().length === 0) {
+      logError('gtm_reply_missing_from_email', new Error('Missing from email'), {
+        replyId: message.id,
+        conversationId: message.conversationId,
+      });
+
+      return {
+        isNewReply: false,
+        ok: false,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    const createdAt = new Date().toISOString();
+    const createReplyResult = await this.store.createReply({
+      id: message.id,
+      lead_id: null,
+      from_email: message.fromEmail,
+      subject: message.subject,
+      body_snippet: message.bodySnippet,
+      received_at: message.receivedAt,
+      conversation_id: message.conversationId,
+      classification: UNKNOWN_REPLY_CLASSIFICATION,
+      sequence_stopped: false,
+      raw_provider_id: message.rawProviderId,
+      created_at: createdAt,
+    });
+
+    if (!createReplyResult.ok) {
+      logError('gtm_reply_store_failed', new Error(createReplyResult.error), {
+        replyId: message.id,
+        fromEmail: message.fromEmail,
+      });
+
+      return {
+        isNewReply: false,
+        ok: false,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    const matchedLeadResult = await this.matchReplyToLead(message);
+    if (!matchedLeadResult.ok) {
+      logError('gtm_reply_match_failed', new Error(matchedLeadResult.error), {
+        replyId: message.id,
+        fromEmail: message.fromEmail,
+      });
+
+      return {
+        isNewReply: createReplyResult.value === 'created',
+        ok: false,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    if (matchedLeadResult.value === null) {
+      logInfo('gtm_reply_unmatched', {
+        replyId: message.id,
+        fromEmail: message.fromEmail,
+        conversationId: message.conversationId,
+      });
+
+      return {
+        isNewReply: createReplyResult.value === 'created',
+        ok: true,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    const updateMatchedReplyResult = await this.store.updateReply(message.id, {
+      lead_id: matchedLeadResult.value.id,
+    });
+    if (!updateMatchedReplyResult.ok) {
+      logError('gtm_reply_match_persist_failed', new Error(updateMatchedReplyResult.error), {
+        replyId: message.id,
+        leadId: matchedLeadResult.value.id,
+      });
+
+      return {
+        isNewReply: createReplyResult.value === 'created',
+        ok: false,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    const recordReplyResult = await this.recordReply(matchedLeadResult.value.id, message.bodySnippet);
+    if (!recordReplyResult.ok) {
+      logError('gtm_reply_stop_failed', new Error(recordReplyResult.error), {
+        replyId: message.id,
+        leadId: matchedLeadResult.value.id,
+      });
+
+      return {
+        isNewReply: createReplyResult.value === 'created',
+        ok: false,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    const updateStoppedReplyResult = await this.store.updateReply(message.id, {
+      classification: recordReplyResult.value.classification,
+      lead_id: matchedLeadResult.value.id,
+      sequence_stopped: true,
+    });
+    if (!updateStoppedReplyResult.ok) {
+      logError('gtm_reply_stop_persist_failed', new Error(updateStoppedReplyResult.error), {
+        replyId: message.id,
+        leadId: matchedLeadResult.value.id,
+      });
+
+      return {
+        isNewReply: createReplyResult.value === 'created',
+        ok: false,
+        receivedAt: message.receivedAt,
+        replyId: message.id,
+      };
+    }
+
+    logInfo('gtm_reply_matched', {
+      replyId: message.id,
+      leadId: matchedLeadResult.value.id,
+      classification: recordReplyResult.value.classification,
+    });
+
+    return {
+      isNewReply: createReplyResult.value === 'created',
+      ok: true,
+      receivedAt: message.receivedAt,
+      replyId: message.id,
+    };
+  }
+
+  private resolveNextSyncCursor(
+    messages: InboxMessage[],
+    processingResults: ReadonlyArray<ProcessedInboxMessageResult>
+  ): string {
+    if (messages.length === 0) {
+      return new Date().toISOString();
+    }
+
+    const firstFailedResult = processingResults.find((result) => !result.ok);
+    if (firstFailedResult !== undefined) {
+      return subtractOneMillisecond(firstFailedResult.receivedAt);
+    }
+
+    const lastReceivedAt = messages[messages.length - 1].receivedAt;
+    if (messages.length >= MAX_SYNC_BATCH_SIZE) {
+      return subtractOneMillisecond(lastReceivedAt);
+    }
+
+    return lastReceivedAt;
+  }
+
+  private async syncRepliesFromInbox(): Promise<
+    Result<{ synced_at: string; new_replies_found: number }>
+  > {
+    if (this.inboxProvider === null) {
+      return fail('Inbox provider is not configured');
+    }
+
+    const cursorResult = await this.store.getSyncCursor();
+    if (!cursorResult.ok) {
+      return fail(cursorResult.error);
+    }
+
+    const currentCursor = cursorResult.value?.last_synced_at ?? DEFAULT_SYNC_CURSOR;
+    const inboxMessagesResult = await this.inboxProvider.listMessages(currentCursor);
+    if (!inboxMessagesResult.ok) {
+      return fail(inboxMessagesResult.error);
+    }
+
+    const messages = [...inboxMessagesResult.value].sort((left, right) =>
+      left.receivedAt.localeCompare(right.receivedAt)
+    );
+    const processingResults = await Promise.all(
+      messages.map(async (message) => this.processInboxMessage(message))
+    );
+
+    const nextCursor = this.resolveNextSyncCursor(messages, processingResults);
+    const updatedAt = new Date().toISOString();
+    const setCursorResult = await this.store.setSyncCursor(nextCursor, updatedAt);
+    if (!setCursorResult.ok) {
+      return fail(setCursorResult.error);
+    }
+
+    return succeed({
+      synced_at: nextCursor,
+      new_replies_found: processingResults.filter((result) => result.isNewReply).length,
+    });
+  }
+}
