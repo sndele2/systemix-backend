@@ -36,6 +36,9 @@ preview_id = "d8bd5be6e38d4fa7ba794587c5cff08c"
 # - OWNER_PHONE_NUMBER
 # - TWILIO_ACCOUNT_SID
 # - TWILIO_AUTH_TOKEN
+# - INTERNAL_INBOX_PASSWORD   # one-time bootstrap password seed for the first internal owner user
+# - SESSION_SECRET            # HMAC secret for signed internal session cookies; min 32 chars
+# - ALLOWED_ORIGIN            # exact production frontend origin for credentialed internal-route CORS
 
 [vars]
 VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."

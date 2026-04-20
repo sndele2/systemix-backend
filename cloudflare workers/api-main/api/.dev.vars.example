@@ -10,6 +10,10 @@ CLIENT_PHONE=2179912895
 ## GTM local SMTP test settings
 ## Paste your real values into cloudflare workers/api-main/api/.dev.vars
 INTERNAL_AUTH_KEY=REPLACE_ME_INTERNAL_AUTH_KEY
+# Internal auth bootstrap seed for the first owner user.
+INTERNAL_INBOX_PASSWORD=REPLACE_ME_INTERNAL_OWNER_PASSWORD
+SESSION_SECRET=REPLACE_ME_SESSION_SECRET_AT_LEAST_32_CHARS
+ALLOWED_ORIGIN=https://your-app.lovable.app
 GTM_DRY_RUN=true
 GTM_FROM_EMAIL=REPLACE_ME_GTM_FROM_EMAIL
 GTM_FROM_NAME=Systemix
@@ -18,6 +22,7 @@ SMTP_HOST=smtp.office365.com
 SMTP_PORT=587
 SMTP_USER=REPLACE_ME_SMTP_USER
 SMTP_PASS=REPLACE_ME_SMTP_PASS
+GTM_ADMIN_KEY=REPLACE_ME_GTM_ADMIN_KEY
 ## GTM Outlook reply inbox settings
 ## Use real values only in cloudflare workers/api-main/api/.dev.vars or Wrangler secrets.
 GRAPH_TENANT_ID=REPLACE_ME_GRAPH_TENANT_ID

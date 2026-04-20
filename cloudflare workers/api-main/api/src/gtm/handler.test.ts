@@ -358,34 +358,13 @@ describe('createGtmHandler manual trigger routes', () => {
 });
 
 describe('createGtmInternalRepliesHandler', () => {
-  it('returns 500 when INTERNAL_AUTH_KEY is not configured', async () => {
-    const { service } = createReplyInboxServiceStub();
-    const app = createGtmInternalRepliesHandler(() => service);
-
-    const response = await app.request('http://example.com/v1/internal/gtm/replies');
-
-    assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), {
-      error: 'INTERNAL_AUTH_KEY is not configured',
-    });
-  });
-
-  it('syncs and returns replies only when X-GTM-Admin-Key is valid', async () => {
+  it('syncs and returns replies after middleware auth has already passed', async () => {
     const { service, calls } = createReplyInboxServiceStub();
     const app = createGtmInternalRepliesHandler(() => service);
 
-    const response = await app.request(
-      'http://example.com/v1/internal/gtm/replies?limit=250&matched_only=true',
-      {
-        headers: {
-          'X-GTM-Admin-Key': 'secret',
-        },
-      },
-      {
-        INTERNAL_AUTH_KEY: 'secret',
-        GTM_DB: {},
-      }
-    );
+    const response = await app.request('http://example.com/v1/internal/gtm/replies?limit=250&matched_only=true', {}, {
+      GTM_DB: {},
+    });
 
     assert.equal(response.status, 200);
     assert.deepEqual(calls.syncAndListReplies, [{ limit: 200, matchedOnly: true }]);
@@ -414,18 +393,9 @@ describe('createGtmInternalRepliesHandler', () => {
     const { service, calls } = createReplyInboxServiceStub();
     const app = createGtmInternalRepliesHandler(() => service);
 
-    const response = await app.request(
-      'http://example.com/v1/internal/gtm/replies/missing-lead',
-      {
-        headers: {
-          'X-GTM-Admin-Key': 'secret',
-        },
-      },
-      {
-        INTERNAL_AUTH_KEY: 'secret',
-        GTM_DB: {},
-      }
-    );
+    const response = await app.request('http://example.com/v1/internal/gtm/replies/missing-lead', {}, {
+      GTM_DB: {},
+    });
 
     assert.equal(response.status, 404);
     assert.deepEqual(calls.listRepliesForLead, ['missing-lead']);

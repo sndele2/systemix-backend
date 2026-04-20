@@ -7,18 +7,24 @@
  * - GRAPH_CLIENT_SECRET
  * - GRAPH_MAILBOX_UPN
  *
- * Required Microsoft Graph application permission:
+ * Required Microsoft Graph application permissions:
  * - Mail.Read
+ * - Mail.ReadWrite
  *
  * This client uses the client-credentials flow with fetch only and keeps the
  * access token in module memory until it expires.
  */
-import type { InboxMessage, InboxProvider, Result } from './types.ts';
+import type {
+  InboxMessage,
+  InboxProvider,
+  Result,
+} from './types.ts';
 
 const GRAPH_SCOPE = 'https://graph.microsoft.com/.default';
 const GRAPH_TOKEN_HOST = 'https://login.microsoftonline.com';
 const GRAPH_API_HOST = 'https://graph.microsoft.com';
 const GRAPH_MESSAGE_PAGE_SIZE = 50;
+const GRAPH_CONVERSATION_MESSAGE_LIMIT = 100;
 const GRAPH_TOKEN_EXPIRY_SKEW_MS = 60_000;
 
 interface GraphInboxEnv {
@@ -112,6 +118,10 @@ function trimBodySnippet(value: string): string {
   return value.slice(0, 500);
 }
 
+function escapeGraphString(value: string): string {
+  return value.replaceAll("'", "''");
+}
+
 function extractFromEmailAddress(message: GraphMessagePayload): string {
   const address = message.from?.emailAddress?.address;
   return typeof address === 'string' ? address.trim().toLowerCase() : '';
@@ -149,6 +159,21 @@ async function parseJsonResponse<T>(response: Response): Promise<Result<T>> {
   }
 }
 
+function normalizeMessages(entries: unknown[]): Result<InboxMessage[]> {
+  const messages: InboxMessage[] = [];
+
+  for (const entry of entries) {
+    const mappedMessageResult = mapGraphMessage((entry ?? {}) as GraphMessagePayload);
+    if (!mappedMessageResult.ok) {
+      return mappedMessageResult;
+    }
+
+    messages.push(mappedMessageResult.value);
+  }
+
+  return succeed(messages);
+}
+
 export class MicrosoftGraphInboxProvider implements InboxProvider {
   private readonly configResult: Result<GraphConfig>;
 
@@ -161,13 +186,8 @@ export class MicrosoftGraphInboxProvider implements InboxProvider {
       return this.configResult;
     }
 
-    const tokenResult = await this.getAccessToken(this.configResult.value);
-    if (!tokenResult.ok) {
-      return tokenResult;
-    }
-
     const url = new URL(
-      `${GRAPH_API_HOST}/v1.0/users/${encodeURIComponent(this.configResult.value.mailboxUpn)}/mailFolders/Inbox/messages`
+      `${GRAPH_API_HOST}/v1.0/users/${encodeURIComponent(this.getMailboxUpn())}/mailFolders/Inbox/messages`
     );
     url.searchParams.set('$filter', `receivedDateTime gt ${cursor}`);
     url.searchParams.set(
@@ -177,26 +197,165 @@ export class MicrosoftGraphInboxProvider implements InboxProvider {
     url.searchParams.set('$orderby', 'receivedDateTime asc');
     url.searchParams.set('$top', String(GRAPH_MESSAGE_PAGE_SIZE));
 
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: 'GET',
+    const messagesResult = await this.fetchMessages(url);
+    if (!messagesResult.ok) {
+      return messagesResult;
+    }
+
+    return succeed(messagesResult.value);
+  }
+
+  async listConversations(limit: number) {
+    if (!this.configResult.ok) {
+      return this.configResult;
+    }
+
+    const url = new URL(
+      `${GRAPH_API_HOST}/v1.0/users/${encodeURIComponent(this.getMailboxUpn())}/mailFolders/Inbox/messages`
+    );
+    url.searchParams.set('$select', 'id,subject,from,bodyPreview,receivedDateTime,conversationId');
+    url.searchParams.set('$orderby', 'receivedDateTime desc');
+    url.searchParams.set('$top', String(Math.min(Math.max(limit * 5, limit), GRAPH_CONVERSATION_MESSAGE_LIMIT)));
+
+    const messagesResult = await this.fetchMessages(url);
+    if (!messagesResult.ok) {
+      return messagesResult;
+    }
+
+    const conversations = new Map();
+
+    for (const message of messagesResult.value) {
+      const conversationId = message.conversationId?.trim();
+      if (!conversationId) {
+        continue;
+      }
+
+      const existingConversation = conversations.get(conversationId);
+      if (!existingConversation) {
+        conversations.set(conversationId, {
+          id: conversationId,
+          fromEmail: message.fromEmail,
+          subject: message.subject,
+          preview: message.bodySnippet,
+          lastMessageAt: message.receivedAt,
+          messageCount: 1,
+        });
+        continue;
+      }
+
+      existingConversation.messageCount += 1;
+    }
+
+    return succeed(Array.from(conversations.values()).slice(0, limit));
+  }
+
+  async getConversation(conversationId: string) {
+    if (!this.configResult.ok) {
+      return this.configResult;
+    }
+
+    const messagesResult = await this.listMessagesForConversation(conversationId, 'asc', GRAPH_CONVERSATION_MESSAGE_LIMIT);
+    if (!messagesResult.ok) {
+      return messagesResult;
+    }
+
+    if (messagesResult.value.length === 0) {
+      return succeed(null);
+    }
+
+    return succeed({
+      id: conversationId,
+      messages: messagesResult.value,
+    });
+  }
+
+  async replyToConversation(conversationId: string, body: string): Promise<Result<void>> {
+    if (!this.configResult.ok) {
+      return this.configResult;
+    }
+
+    const latestMessageResult = await this.listMessagesForConversation(conversationId, 'desc', 1);
+    if (!latestMessageResult.ok) {
+      return latestMessageResult;
+    }
+
+    const latestMessage = latestMessageResult.value[0];
+    if (!latestMessage) {
+      return fail('Conversation not found');
+    }
+
+    const responseResult = await this.fetchGraph(
+      `${GRAPH_API_HOST}/v1.0/users/${encodeURIComponent(this.getMailboxUpn())}/messages/${encodeURIComponent(latestMessage.id)}/reply`,
+      {
+        method: 'POST',
         headers: {
-          Authorization: `Bearer ${tokenResult.value}`,
+          'Content-Type': 'application/json',
         },
-      });
-    } catch (error) {
-      return fail(
-        'Microsoft Graph inbox request failed: ' +
-          (error instanceof Error ? error.message : String(error))
-      );
+        body: JSON.stringify({
+          comment: body,
+        }),
+      }
+    );
+
+    if (!responseResult.ok) {
+      return responseResult;
     }
 
-    if (!response.ok) {
-      return fail(`Microsoft Graph inbox request failed with status ${response.status}`);
+    if (!responseResult.value.ok) {
+      return fail(`Microsoft Graph inbox request failed with status ${responseResult.value.status}`);
     }
 
-    const bodyResult = await parseJsonResponse<GraphMessageResponse>(response);
+    return succeed(undefined);
+  }
+
+  private getMailboxUpn(): string {
+    if (!this.configResult.ok) {
+      throw new Error(this.configResult.error);
+    }
+
+    return this.configResult.value.mailboxUpn;
+  }
+
+  private async listMessagesForConversation(
+    conversationId: string,
+    sortDirection: 'asc' | 'desc',
+    limit: number
+  ): Promise<Result<InboxMessage[]>> {
+    if (!this.configResult.ok) {
+      return this.configResult;
+    }
+
+    if (conversationId.trim().length === 0) {
+      return fail('Conversation id is required');
+    }
+
+    const url = new URL(
+      `${GRAPH_API_HOST}/v1.0/users/${encodeURIComponent(this.getMailboxUpn())}/messages`
+    );
+    url.searchParams.set(
+      '$filter',
+      `conversationId eq '${escapeGraphString(conversationId.trim())}'`
+    );
+    url.searchParams.set('$select', 'id,subject,from,bodyPreview,receivedDateTime,conversationId');
+    url.searchParams.set('$orderby', `receivedDateTime ${sortDirection}`);
+    url.searchParams.set('$top', String(limit));
+
+    return this.fetchMessages(url);
+  }
+
+  private async fetchMessages(url: URL): Promise<Result<InboxMessage[]>> {
+    const responseResult = await this.fetchGraph(url.toString(), {
+      method: 'GET',
+    });
+    if (!responseResult.ok) {
+      return responseResult;
+    }
+
+    if (!responseResult.value.ok) {
+      return fail(`Microsoft Graph inbox request failed with status ${responseResult.value.status}`);
+    }
+
+    const bodyResult = await parseJsonResponse<GraphMessageResponse>(responseResult.value);
     if (!bodyResult.ok) {
       return bodyResult;
     }
@@ -205,18 +364,34 @@ export class MicrosoftGraphInboxProvider implements InboxProvider {
       return fail('Microsoft Graph inbox response did not include a value array');
     }
 
-    const messages: InboxMessage[] = [];
+    return normalizeMessages(bodyResult.value.value);
+  }
 
-    for (const entry of bodyResult.value.value) {
-      const mappedMessageResult = mapGraphMessage((entry ?? {}) as GraphMessagePayload);
-      if (!mappedMessageResult.ok) {
-        return mappedMessageResult;
-      }
-
-      messages.push(mappedMessageResult.value);
+  private async fetchGraph(input: string, init: RequestInit): Promise<Result<Response>> {
+    if (!this.configResult.ok) {
+      return this.configResult;
     }
 
-    return succeed(messages);
+    const tokenResult = await this.getAccessToken(this.configResult.value);
+    if (!tokenResult.ok) {
+      return tokenResult;
+    }
+
+    const headers = new Headers(init.headers);
+    headers.set('Authorization', `Bearer ${tokenResult.value}`);
+
+    try {
+      const response = await fetch(input, {
+        ...init,
+        headers,
+      });
+      return succeed(response);
+    } catch (error) {
+      return fail(
+        'Microsoft Graph inbox request failed: ' +
+          (error instanceof Error ? error.message : String(error))
+      );
+    }
   }
 
   private async getAccessToken(config: GraphConfig): Promise<Result<string>> {

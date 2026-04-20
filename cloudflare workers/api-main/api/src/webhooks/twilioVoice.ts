@@ -834,6 +834,76 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
           )
           .run();
 
+        const customerWelcomeLock = await getDb(env)
+          .prepare(
+            `
+            UPDATE calls
+            SET customer_welcome_sent_at = datetime('now')
+            WHERE provider = ?
+              AND provider_call_id = ?
+              AND customer_welcome_sent_at IS NULL
+          `
+          )
+          .bind(CALL_PROVIDER, providerCallId)
+          .run();
+
+        if (Number(customerWelcomeLock.meta?.changes || 0) > 0) {
+          try {
+            const twilioClient = createTwilioRestClient(env);
+            if (!twilioClient) {
+              await releaseCustomerWelcomeLock(env, providerCallId);
+              throw new Error('missing_twilio_credentials');
+            }
+
+            const callerFollowUp = await onboardNewLead({
+              db: getDb(env),
+              twilioClient,
+              smsFrom: (env.TWILIO_PHONE_NUMBER || '').trim(),
+              businessNumber: to,
+              callerNumber: from,
+              provider: CALL_PROVIDER,
+              providerCallId,
+              callStatus: 'completed',
+              rawStatus: 'voicemail_recording_completed',
+              callSid,
+            });
+
+            if (!callerFollowUp.ok) {
+              await releaseCustomerWelcomeLock(env, providerCallId);
+              throw new Error(callerFollowUp.detail);
+            }
+
+            voiceLog.log('Caller follow-up SMS sent from recording callback', {
+              context: {
+                handler: 'twilioRecordingHandler',
+                callSid,
+                messageSid: callerFollowUp.messageSid || null,
+                fromNumber: callerFollowUp.businessNumber,
+                toNumber: callerFollowUp.callerNumber,
+              },
+            });
+          } catch (customerWelcomeError) {
+            voiceLog.error('Caller follow-up SMS failed from recording callback', {
+              error: customerWelcomeError,
+              context: {
+                handler: 'twilioRecordingHandler',
+                callSid,
+                fromNumber: to,
+                toNumber: from,
+              },
+            });
+          }
+        } else {
+          voiceLog.log('Caller follow-up SMS deduped for recording callback', {
+            context: {
+              handler: 'twilioRecordingHandler',
+              callSid,
+              fromNumber: to,
+              toNumber: from,
+            },
+          });
+        }
+
         const lock = await getDb(env)
           .prepare(
             `

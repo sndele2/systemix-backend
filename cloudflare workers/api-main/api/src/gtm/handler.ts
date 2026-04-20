@@ -154,20 +154,6 @@ function requireInternalAuth(c: Context<{ Bindings: GTMHandlerBindings }>): Resp
   return jsonError(c, 'Unauthorized', 401);
 }
 
-function requireGtmAdminAuth(c: Context<{ Bindings: GTMHandlerBindings }>): Response | null {
-  const expectedAuthKey = c.env?.INTERNAL_AUTH_KEY?.trim();
-  if (!expectedAuthKey) {
-    return jsonError(c, 'INTERNAL_AUTH_KEY is not configured', 500);
-  }
-
-  const adminKey = c.req.header('x-gtm-admin-key');
-  if (adminKey === expectedAuthKey) {
-    return null;
-  }
-
-  return jsonError(c, 'Unauthorized', 401);
-}
-
 function normalizeReplyLimit(rawLimit: string | undefined): Result<number> {
   if (rawLimit === undefined) {
     return { ok: true, value: 50 };
@@ -481,11 +467,6 @@ export function createGtmInternalRepliesHandler(
   const app = new Hono<{ Bindings: GTMHandlerBindings }>();
 
   app.get('/v1/internal/gtm/replies', async (c) => {
-    const authError = requireGtmAdminAuth(c);
-    if (authError) {
-      return authError;
-    }
-
     const limitResult = normalizeReplyLimit(c.req.query('limit'));
     if (!limitResult.ok) {
       return jsonError(c, limitResult.error, 400);
@@ -516,11 +497,6 @@ export function createGtmInternalRepliesHandler(
   });
 
   app.get('/v1/internal/gtm/replies/:leadId', async (c) => {
-    const authError = requireGtmAdminAuth(c);
-    if (authError) {
-      return authError;
-    }
-
     if (!c.env?.GTM_DB) {
       return jsonError(c, 'GTM_DB is not configured', 500);
     }
