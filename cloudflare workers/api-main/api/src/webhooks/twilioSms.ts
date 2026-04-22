@@ -27,9 +27,11 @@ import {
   type InboundSmsComplianceAction,
   upsertSmsOptOut,
 } from '../services/smsCompliance.ts';
+import { DurableLeadStore } from '../gtm/lead-store.ts';
 
 type Bindings = {
   SYSTEMIX: D1Database;
+  GTM_DB?: D1Database;
   TWILIO_PHONE_NUMBER?: string;
   TWILIO_ACCOUNT_SID: string;
   TWILIO_AUTH_TOKEN: string;
@@ -1525,9 +1527,11 @@ type OwnerCommand =
   | { type: 'HISTORY' }
   | { type: 'SWITCH'; phoneNumber: string }
   | { type: 'PAUSE' }
-  | { type: 'STATUS' };
+  | { type: 'STATUS' }
+  | { type: 'GTM_APPROVE'; approvalCode: string }
+  | { type: 'GTM_REJECT'; approvalCode: string };
 
-function parseOwnerCommand(messageBody: string): OwnerCommand | null {
+export function parseOwnerCommand(messageBody: string): OwnerCommand | null {
   const trimmed = messageBody.trim();
   const upper = trimmed.toUpperCase();
 
@@ -1557,7 +1561,60 @@ function parseOwnerCommand(messageBody: string): OwnerCommand | null {
     return { type: 'STATUS' };
   }
 
+  const approveMatch = trimmed.match(/^YES\s+([A-Z0-9]{6,12})$/i);
+  if (approveMatch) {
+    return { type: 'GTM_APPROVE', approvalCode: approveMatch[1].toUpperCase() };
+  }
+
+  const rejectMatch = trimmed.match(/^NO\s+([A-Z0-9]{6,12})$/i);
+  if (rejectMatch) {
+    return { type: 'GTM_REJECT', approvalCode: rejectMatch[1].toUpperCase() };
+  }
+
   return null;
+}
+
+export async function resolveGtmApprovalOwnerCommand(input: {
+  env: Pick<Bindings, 'GTM_DB'>;
+  command: Extract<OwnerCommand, { type: 'GTM_APPROVE' | 'GTM_REJECT' }>;
+  ownerPhone: string;
+}): Promise<string> {
+  if (!input.env.GTM_DB) {
+    return 'GTM approval commands are unavailable because GTM_DB is not configured.';
+  }
+
+  const store = new DurableLeadStore(input.env.GTM_DB);
+  const decision = input.command.type === 'GTM_APPROVE' ? 'approved' : 'rejected';
+  const resolveResult = await store.resolveApprovalByCode(
+    input.command.approvalCode,
+    decision,
+    new Date().toISOString(),
+    input.ownerPhone
+  );
+
+  if (!resolveResult.ok) {
+    if (resolveResult.error === 'Approval not found') {
+      return `No pending GTM approval found for code ${input.command.approvalCode}.`;
+    }
+
+    if (resolveResult.error.startsWith('Approval is already ')) {
+      return `${resolveResult.error}.`;
+    }
+
+    throw new Error(resolveResult.error);
+  }
+
+  if (decision === 'approved') {
+    return (
+      `Approved GTM action ${resolveResult.value.approval_code}. ` +
+      `It will proceed on the next internal GTM run.`
+    );
+  }
+
+  return (
+    `Rejected GTM action ${resolveResult.value.approval_code}. ` +
+    `It will stay blocked unless a new proposal is created.`
+  );
 }
 
 function parsePrefixedRecipient(messageBody: string): { recipient: string; body: string } | null {
@@ -1726,6 +1783,14 @@ async function handleOwnerCommand(input: {
     } else {
       responseBody = 'Line is ACTIVE. All alerts are flowing normally.';
     }
+  }
+
+  if (input.command.type === 'GTM_APPROVE' || input.command.type === 'GTM_REJECT') {
+    responseBody = await resolveGtmApprovalOwnerCommand({
+      env: input.env,
+      command: input.command,
+      ownerPhone: input.ownerPhone,
+    });
   }
 
   const sendResult = await input.twilioClient.sendSms({

@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   hasRecentInboundMessageDuplicate,
   normalizeInboundMessageBodyForDedup,
+  parseOwnerCommand,
   shouldSendOwnerLeadNotification,
 } from './twilioSms.ts';
 
@@ -112,4 +113,15 @@ test('shouldSendOwnerLeadNotification only fires for the first saved inbound cus
     await shouldSendOwnerLeadNotification(existingLeadEnv, '+18443217137', '+12175550123'),
     false
   );
+});
+
+test('parseOwnerCommand recognizes GTM approval replies', () => {
+  assert.deepEqual(parseOwnerCommand('YES ab12cd34'), {
+    type: 'GTM_APPROVE',
+    approvalCode: 'AB12CD34',
+  });
+  assert.deepEqual(parseOwnerCommand('NO ZXCV1234'), {
+    type: 'GTM_REJECT',
+    approvalCode: 'ZXCV1234',
+  });
 });

@@ -6,6 +6,7 @@ import type {
   EmailSendResult,
   EmailStage,
   GTMConfig,
+  GtmApprovalRecord,
   GtmRepliesResponse,
   InboxMessage,
   InboxProvider,
@@ -60,6 +61,7 @@ interface GTMServiceDependencies {
   config: GTMConfig;
   inboxProvider?: InboxProvider;
   agentHooks?: GTMServiceAgentHooks;
+  approvalHooks?: GTMServiceApprovalHooks;
 }
 
 interface LoadedLeadContext {
@@ -86,6 +88,17 @@ export interface GTMServiceAgentHooks {
 
 interface GTMServiceRuntimeOptions {
   agentHooks?: GTMServiceAgentHooks;
+  approvalHooks?: GTMServiceApprovalHooks;
+}
+
+export interface ApprovalNotificationRequest {
+  approval: GtmApprovalRecord;
+  lead: LeadRecord;
+  preparedAction: Extract<PreparedAction, { action: 'send' }>;
+}
+
+export interface GTMServiceApprovalHooks {
+  requestApproval?: (input: ApprovalNotificationRequest) => Promise<void>;
 }
 
 function succeed<T>(value: T): Result<T> {
@@ -167,6 +180,27 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+function buildApprovalProposalHash(
+  leadId: string,
+  stageIndex: EmailStage['stageIndex'],
+  subject: string,
+  body: string
+): string {
+  const raw = `${leadId}|${stageIndex}|${subject.trim()}|${body.trim()}`;
+  let hash = 2166136261;
+
+  for (let index = 0; index < raw.length; index += 1) {
+    hash ^= raw.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return `gtm-${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function generateApprovalCode(): string {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+}
+
 export function createRuntimeGtmService(
   env: GtmServiceRuntimeEnv,
   options: GTMServiceRuntimeOptions = {}
@@ -181,6 +215,7 @@ export function createRuntimeGtmService(
     config,
     inboxProvider: new MicrosoftGraphInboxProvider(env),
     agentHooks: options.agentHooks,
+    approvalHooks: options.approvalHooks,
   });
 }
 
@@ -192,6 +227,7 @@ export class GTMService {
   private readonly config: GTMConfig;
   private readonly inboxProvider: InboxProvider | null;
   private readonly agentHooks: GTMServiceAgentHooks | null;
+  private readonly approvalHooks: GTMServiceApprovalHooks | null;
 
   constructor(dependencies: GTMServiceDependencies) {
     this.store = dependencies.store;
@@ -204,6 +240,7 @@ export class GTMService {
     };
     this.inboxProvider = dependencies.inboxProvider ?? null;
     this.agentHooks = dependencies.agentHooks ?? null;
+    this.approvalHooks = dependencies.approvalHooks ?? null;
   }
 
   async createLead(lead: Lead): Promise<Result<void>> {
@@ -408,6 +445,19 @@ export class GTMService {
       return fail('Live GTM email sending is not implemented');
     }
 
+    const approvalResult = await this.requireOutboundApproval(lead, preparedAction);
+    if (!approvalResult.ok) {
+      return fail(approvalResult.error);
+    }
+
+    if (approvalResult.value.approved !== true) {
+      return succeed({
+        action: 'skipped',
+        leadId,
+        reason: approvalResult.value.reason,
+      });
+    }
+
     const sentAt = new Date().toISOString();
     const touchpoint: Touchpoint = {
       id: crypto.randomUUID(),
@@ -458,6 +508,18 @@ export class GTMService {
         dryRun: sendResult.dryRun,
       });
       return fail('Failed to send GTM email');
+    }
+
+    const approvedProposal = approvalResult.value.approval;
+    if (approvedProposal !== null) {
+      const markExecutedResult = await this.store.markApprovalExecuted(approvedProposal.id, sentAt);
+      if (!markExecutedResult.ok) {
+        logError('gtm_approval_mark_executed_failed', new Error(markExecutedResult.error), {
+          leadId,
+          approvalId: approvedProposal.id,
+          approvalCode: approvedProposal.approval_code,
+        });
+      }
     }
 
     const updateLeadResult = await this.store.updateLead(leadId, {
@@ -605,6 +667,164 @@ export class GTMService {
 
   async getLeadsReadyForNextAction(): Promise<Result<LeadRecord[]>> {
     return this.store.listLeadsReadyForNextAction(this.sequenceEngine.getSequence());
+  }
+
+  private async requireOutboundApproval(
+    lead: LeadRecord,
+    preparedAction: Extract<PreparedAction, { action: 'send' }>
+  ): Promise<Result<{ approved: true; approval: GtmApprovalRecord | null } | { approved: false; approval: null; reason: string }>> {
+    const proposalHash = buildApprovalProposalHash(
+      lead.id,
+      preparedAction.stage.stageIndex,
+      preparedAction.subject,
+      preparedAction.body
+    );
+
+    const existingApprovalResult = await this.store.getLatestApprovalByProposal(
+      lead.id,
+      preparedAction.stage.stageIndex,
+      proposalHash
+    );
+    if (!existingApprovalResult.ok) {
+      return fail(existingApprovalResult.error);
+    }
+
+    const existingApproval = existingApprovalResult.value;
+    if (existingApproval?.status === 'approved') {
+      return succeed({
+        approved: true,
+        approval: existingApproval,
+      });
+    }
+
+    if (existingApproval?.status === 'executed') {
+      logInfo('gtm_approval_already_executed', {
+        leadId: lead.id,
+        approvalId: existingApproval.id,
+        approvalCode: existingApproval.approval_code,
+        stageIndex: existingApproval.stage_index,
+      });
+
+      return fail('Approval already executed for this proposal; GTM lead state requires manual repair');
+    }
+
+    if (existingApproval?.status === 'rejected') {
+      logInfo('gtm_approval_rejected', {
+        leadId: lead.id,
+        approvalId: existingApproval.id,
+        approvalCode: existingApproval.approval_code,
+        stageIndex: existingApproval.stage_index,
+      });
+
+      return succeed({
+        approved: false,
+        approval: null,
+        reason: 'approval_rejected',
+      });
+    }
+
+    let approval = existingApproval;
+    if (approval === null) {
+      const requestedAt = new Date().toISOString();
+      approval = {
+        id: crypto.randomUUID(),
+        approval_code: generateApprovalCode(),
+        lead_id: lead.id,
+        stage_index: preparedAction.stage.stageIndex,
+        proposal_hash: proposalHash,
+        subject: preparedAction.subject,
+        body: preparedAction.body,
+        status: 'pending',
+        requested_at: requestedAt,
+      };
+
+      const createApprovalResult = await this.store.createApproval(approval);
+      if (!createApprovalResult.ok) {
+        if (createApprovalResult.error === 'Approval already exists') {
+          const latestApprovalResult = await this.store.getLatestApprovalByProposal(
+            lead.id,
+            preparedAction.stage.stageIndex,
+            proposalHash
+          );
+          if (!latestApprovalResult.ok) {
+            return fail(latestApprovalResult.error);
+          }
+
+          approval = latestApprovalResult.value;
+          if (approval === null) {
+            return fail('Failed to load GTM approval after duplicate approval detection');
+          }
+        } else {
+          return fail(createApprovalResult.error);
+        }
+      } else {
+        logInfo('gtm_approval_requested', {
+          leadId: lead.id,
+          approvalId: approval.id,
+          approvalCode: approval.approval_code,
+          stageIndex: approval.stage_index,
+        });
+      }
+    }
+
+    await this.notifyApprovalRequested(lead, preparedAction, approval);
+
+    return succeed({
+      approved: false,
+      approval: null,
+      reason: 'awaiting_approval',
+    });
+  }
+
+  private async notifyApprovalRequested(
+    lead: LeadRecord,
+    preparedAction: Extract<PreparedAction, { action: 'send' }>,
+    approval: GtmApprovalRecord
+  ): Promise<void> {
+    if (approval.notified_at) {
+      return;
+    }
+
+    if (!this.approvalHooks?.requestApproval) {
+      logInfo('gtm_approval_notification_not_configured', {
+        leadId: lead.id,
+        approvalId: approval.id,
+        approvalCode: approval.approval_code,
+      });
+      return;
+    }
+
+    try {
+      await withTimeout(
+        this.approvalHooks.requestApproval({
+          approval,
+          lead,
+          preparedAction,
+        }),
+        AGENT_TIMEOUT_MS,
+        'approval notification hook'
+      );
+
+      const notifiedAt = new Date().toISOString();
+      const markNotifiedResult = await this.store.markApprovalNotified(approval.id, notifiedAt);
+      if (!markNotifiedResult.ok) {
+        logError('gtm_approval_mark_notified_failed', new Error(markNotifiedResult.error), {
+          leadId: lead.id,
+          approvalId: approval.id,
+          approvalCode: approval.approval_code,
+        });
+        return;
+      }
+
+      approval.notified_at = notifiedAt;
+    } catch (error) {
+      logError('gtm_approval_notification_failed', error, {
+        leadId: lead.id,
+        approvalId: approval.id,
+        approvalCode: approval.approval_code,
+        fallback: 'pending_approval_without_sms_notification',
+      });
+    }
   }
 
   private async loadLeadContext(leadId: string): Promise<Result<LoadedLeadContext>> {

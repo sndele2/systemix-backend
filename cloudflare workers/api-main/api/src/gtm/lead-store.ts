@@ -2,8 +2,10 @@
  * Implements durable GTM lead-state persistence against the GTM D1 schema.
  */
 import type {
+  CreateGtmApprovalRecord,
   CreateGtmReply,
   EmailStage,
+  GtmApprovalRecord,
   GtmReply,
   Lead,
   LeadRecord,
@@ -71,11 +73,41 @@ interface SyncCursorRow {
   updated_at: string;
 }
 
+interface GtmApprovalRow {
+  id: string;
+  approval_code: string;
+  lead_id: string;
+  stage_index: number;
+  proposal_hash: string;
+  subject: string;
+  body: string;
+  status: string;
+  requested_at: string;
+  notified_at: string | null;
+  decision_at: string | null;
+  decided_by_phone: string | null;
+  executed_at: string | null;
+}
+
 export interface LeadStore {
   createLead(lead: Lead): Promise<Result<void>>;
+  createApproval(approval: CreateGtmApprovalRecord): Promise<Result<void>>;
   createReply(reply: CreateGtmReply): Promise<Result<'created' | 'exists'>>;
   findLeadByEmail(email: string): Promise<Result<LeadRecord | null>>;
+  getLatestApprovalByProposal(
+    leadId: string,
+    stageIndex: EmailStage['stageIndex'],
+    proposalHash: string
+  ): Promise<Result<GtmApprovalRecord | null>>;
   getSyncCursor(): Promise<Result<SyncCursor | null>>;
+  markApprovalExecuted(approvalId: string, executedAt: string): Promise<Result<void>>;
+  markApprovalNotified(approvalId: string, notifiedAt: string): Promise<Result<void>>;
+  resolveApprovalByCode(
+    approvalCode: string,
+    status: 'approved' | 'rejected',
+    decisionAt: string,
+    decidedByPhone: string
+  ): Promise<Result<GtmApprovalRecord>>;
   updateLead(leadId: string, patch: Partial<LeadRecord>): Promise<Result<void>>;
   updateReply(replyId: string, patch: UpdateGtmReply): Promise<Result<void>>;
   getLeadById(leadId: string): Promise<Result<LeadRecord | null>>;
@@ -158,6 +190,18 @@ function isStageIndex(value: number): value is EmailStage['stageIndex'] {
   return value === 0 || value === 1 || value === 2;
 }
 
+function isApprovalStatus(value: string): value is GtmApprovalRecord['status'] {
+  switch (value) {
+    case 'pending':
+    case 'approved':
+    case 'rejected':
+    case 'executed':
+      return true;
+    default:
+      return false;
+  }
+}
+
 function isUniqueConstraintError(
   error: unknown,
   table: 'gtm_leads' | 'gtm_touchpoints' | 'gtm_replies'
@@ -167,6 +211,16 @@ function isUniqueConstraintError(
   }
 
   return error.message.includes('UNIQUE constraint failed: ' + table + '.id');
+}
+
+function isPendingApprovalProposalConstraintError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.message.includes(
+    'UNIQUE constraint failed: gtm_approvals.lead_id, gtm_approvals.stage_index, gtm_approvals.proposal_hash'
+  );
 }
 
 function validateTouchesSent(value: number): Result<number> {
@@ -304,6 +358,46 @@ function mapReplyRow(row: GtmReplyRow): Result<GtmReply> {
   });
 }
 
+function mapApprovalRow(row: GtmApprovalRow): Result<GtmApprovalRecord> {
+  if (!isStageIndex(row.stage_index)) {
+    return fail('Invalid approval stage_index in durable store');
+  }
+
+  if (!isApprovalStatus(row.status)) {
+    return fail('Invalid approval status in durable store');
+  }
+
+  const approval: GtmApprovalRecord = {
+    id: row.id,
+    approval_code: row.approval_code,
+    lead_id: row.lead_id,
+    stage_index: row.stage_index,
+    proposal_hash: row.proposal_hash,
+    subject: row.subject,
+    body: row.body,
+    status: row.status,
+    requested_at: row.requested_at,
+  };
+
+  if (row.notified_at !== null) {
+    approval.notified_at = row.notified_at;
+  }
+
+  if (row.decision_at !== null) {
+    approval.decision_at = row.decision_at;
+  }
+
+  if (row.decided_by_phone !== null) {
+    approval.decided_by_phone = row.decided_by_phone;
+  }
+
+  if (row.executed_at !== null) {
+    approval.executed_at = row.executed_at;
+  }
+
+  return succeed(approval);
+}
+
 export class DurableLeadStore implements LeadStore {
   readonly database: D1Database;
 
@@ -356,6 +450,46 @@ export class DurableLeadStore implements LeadStore {
 
       logStoreError('createLead', error, { leadId: lead.id });
       return fail('Failed to create GTM lead');
+    }
+  }
+
+  async createApproval(approval: CreateGtmApprovalRecord): Promise<Result<void>> {
+    try {
+      await this.database
+        .prepare(
+          'INSERT INTO gtm_approvals ' +
+            '(id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at) ' +
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .bind(
+          approval.id,
+          approval.approval_code,
+          approval.lead_id,
+          approval.stage_index,
+          approval.proposal_hash,
+          approval.subject,
+          approval.body,
+          approval.status,
+          approval.requested_at,
+          approval.notified_at ?? null,
+          approval.decision_at ?? null,
+          approval.decided_by_phone ?? null,
+          approval.executed_at ?? null
+        )
+        .run();
+
+      return succeed(undefined);
+    } catch (error) {
+      if (isPendingApprovalProposalConstraintError(error)) {
+        return fail('Approval already exists');
+      }
+
+      logStoreError('createApproval', error, {
+        approvalId: approval.id,
+        leadId: approval.lead_id,
+        approvalCode: approval.approval_code,
+      });
+      return fail('Failed to create GTM approval');
     }
   }
 
@@ -435,6 +569,35 @@ export class DurableLeadStore implements LeadStore {
     } catch (error) {
       logStoreError('getSyncCursor', error);
       return fail('Failed to load GTM sync cursor');
+    }
+  }
+
+  async getLatestApprovalByProposal(
+    leadId: string,
+    stageIndex: EmailStage['stageIndex'],
+    proposalHash: string
+  ): Promise<Result<GtmApprovalRecord | null>> {
+    try {
+      const row = await this.database
+        .prepare(
+          'SELECT id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at ' +
+            'FROM gtm_approvals WHERE lead_id = ? AND stage_index = ? AND proposal_hash = ? ' +
+            'ORDER BY requested_at DESC LIMIT 1'
+        )
+        .bind(leadId, stageIndex, proposalHash)
+        .first<GtmApprovalRow>();
+
+      if (row === null) {
+        return succeed(null);
+      }
+
+      return mapApprovalRow(row);
+    } catch (error) {
+      logStoreError('getLatestApprovalByProposal', error, {
+        leadId,
+        stageIndex,
+      });
+      return fail('Failed to load GTM approval');
     }
   }
 
@@ -565,6 +728,132 @@ export class DurableLeadStore implements LeadStore {
     } catch (error) {
       logStoreError('updateLead', error, { leadId });
       return fail('Failed to update GTM lead');
+    }
+  }
+
+  async markApprovalExecuted(approvalId: string, executedAt: string): Promise<Result<void>> {
+    try {
+      const row = await this.database
+        .prepare(
+          'SELECT id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at ' +
+            'FROM gtm_approvals WHERE id = ? LIMIT 1'
+        )
+        .bind(approvalId)
+        .first<GtmApprovalRow>();
+
+      if (row === null) {
+        return fail('Approval not found');
+      }
+
+      if (row.status !== 'approved') {
+        return fail('Approval must be approved before execution');
+      }
+
+      const result = await this.database
+        .prepare('UPDATE gtm_approvals SET status = ?, executed_at = ? WHERE id = ? AND status = ?')
+        .bind('executed', executedAt, approvalId, 'approved')
+        .run();
+
+      if (Number(result.meta.changes || 0) === 0) {
+        return fail('Approval must be approved before execution');
+      }
+
+      return succeed(undefined);
+    } catch (error) {
+      logStoreError('markApprovalExecuted', error, { approvalId });
+      return fail('Failed to mark GTM approval executed');
+    }
+  }
+
+  async markApprovalNotified(approvalId: string, notifiedAt: string): Promise<Result<void>> {
+    try {
+      const result = await this.database
+        .prepare('UPDATE gtm_approvals SET notified_at = ? WHERE id = ?')
+        .bind(notifiedAt, approvalId)
+        .run();
+
+      if (result.meta.changes === 0) {
+        return fail('Approval not found');
+      }
+
+      return succeed(undefined);
+    } catch (error) {
+      logStoreError('markApprovalNotified', error, { approvalId });
+      return fail('Failed to mark GTM approval notified');
+    }
+  }
+
+  async resolveApprovalByCode(
+    approvalCode: string,
+    status: 'approved' | 'rejected',
+    decisionAt: string,
+    decidedByPhone: string
+  ): Promise<Result<GtmApprovalRecord>> {
+    try {
+      const row = await this.database
+        .prepare(
+          'SELECT id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at ' +
+            'FROM gtm_approvals WHERE upper(approval_code) = upper(?) LIMIT 1'
+        )
+        .bind(approvalCode)
+        .first<GtmApprovalRow>();
+
+      if (row === null) {
+        return fail('Approval not found');
+      }
+
+      if (row.status !== 'pending') {
+        return fail('Approval is already ' + row.status);
+      }
+
+      const updateResult = await this.database
+        .prepare(
+          'UPDATE gtm_approvals SET status = ?, decision_at = ?, decided_by_phone = ? WHERE id = ? AND status = ?'
+        )
+        .bind(status, decisionAt, decidedByPhone, row.id, 'pending')
+        .run();
+
+      if (Number(updateResult.meta.changes || 0) === 0) {
+        const currentRow = await this.database
+          .prepare(
+            'SELECT id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at ' +
+              'FROM gtm_approvals WHERE id = ? LIMIT 1'
+          )
+          .bind(row.id)
+          .first<GtmApprovalRow>();
+
+        if (currentRow === null) {
+          return fail('Approval not found');
+        }
+
+        return fail('Approval is already ' + currentRow.status);
+      }
+
+      if (!isStageIndex(row.stage_index)) {
+        return fail('Invalid approval stage_index in durable store');
+      }
+
+      return succeed({
+        id: row.id,
+        approval_code: row.approval_code,
+        lead_id: row.lead_id,
+        stage_index: row.stage_index,
+        proposal_hash: row.proposal_hash,
+        subject: row.subject,
+        body: row.body,
+        status,
+        requested_at: row.requested_at,
+        notified_at: row.notified_at ?? undefined,
+        decision_at: decisionAt,
+        decided_by_phone: decidedByPhone,
+        executed_at: row.executed_at ?? undefined,
+      });
+    } catch (error) {
+      logStoreError('resolveApprovalByCode', error, {
+        approvalCode,
+        status,
+      });
+      return fail('Failed to resolve GTM approval');
     }
   }
 

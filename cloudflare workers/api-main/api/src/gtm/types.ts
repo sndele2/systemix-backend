@@ -63,6 +63,26 @@ export interface RecordReplyResult {
   classification: string;
 }
 
+export type GtmApprovalStatus = 'pending' | 'approved' | 'rejected' | 'executed';
+
+export interface GtmApprovalRecord {
+  id: string;
+  approval_code: string;
+  lead_id: string;
+  stage_index: EmailStage['stageIndex'];
+  proposal_hash: string;
+  subject: string;
+  body: string;
+  status: GtmApprovalStatus;
+  requested_at: string;
+  notified_at?: string;
+  decision_at?: string;
+  decided_by_phone?: string;
+  executed_at?: string;
+}
+
+export interface CreateGtmApprovalRecord extends GtmApprovalRecord {}
+
 export interface InboxMessage {
   id: string;
   fromEmail: string;

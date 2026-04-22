@@ -23,17 +23,23 @@ class FakeLeadStore {
     this.eventLog = eventLog;
     this.leads = new Map();
     this.replies = new Map();
+    this.approvals = new Map();
     this.syncCursor = null;
     this.touchpoints = [];
     this.readyLeads = [];
     this.calls = [];
     this.failures = {
       createLead: null,
+      createApproval: null,
       createReply: null,
       findLeadByEmail: null,
+      getLatestApprovalByProposal: null,
       getSyncCursor: null,
+      markApprovalExecuted: null,
+      markApprovalNotified: null,
       updateLead: null,
       updateReply: null,
+      resolveApprovalByCode: null,
       getLeadById: null,
       listReplies: null,
       listRepliesByLeadId: null,
@@ -68,6 +74,18 @@ class FakeLeadStore {
       touches_sent: 0,
     });
 
+    return { ok: true, value: undefined };
+  }
+
+  async createApproval(approval) {
+    this.eventLog.push('createApproval');
+    this.calls.push({ method: 'createApproval', approvalId: approval.id, approval });
+
+    if (this.failures.createApproval) {
+      return { ok: false, error: this.failures.createApproval };
+    }
+
+    this.approvals.set(approval.id, { ...approval });
     return { ok: true, value: undefined };
   }
 
@@ -113,6 +131,72 @@ class FakeLeadStore {
     }
 
     return { ok: true, value: this.syncCursor };
+  }
+
+  async getLatestApprovalByProposal(leadId, stageIndex, proposalHash) {
+    this.eventLog.push('getLatestApprovalByProposal');
+    this.calls.push({ method: 'getLatestApprovalByProposal', leadId, stageIndex, proposalHash });
+
+    if (this.failures.getLatestApprovalByProposal) {
+      return { ok: false, error: this.failures.getLatestApprovalByProposal };
+    }
+
+    const approval =
+      Array.from(this.approvals.values())
+        .filter(
+          (candidate) =>
+            candidate.lead_id === leadId &&
+            candidate.stage_index === stageIndex &&
+            candidate.proposal_hash === proposalHash
+        )
+        .sort((left, right) => right.requested_at.localeCompare(left.requested_at))[0] ?? null;
+
+    return { ok: true, value: approval ? { ...approval } : null };
+  }
+
+  async markApprovalExecuted(approvalId, executedAt) {
+    this.eventLog.push('markApprovalExecuted');
+    this.calls.push({ method: 'markApprovalExecuted', approvalId, executedAt });
+
+    if (this.failures.markApprovalExecuted) {
+      return { ok: false, error: this.failures.markApprovalExecuted };
+    }
+
+    const approval = this.approvals.get(approvalId);
+    if (!approval) {
+      return { ok: false, error: 'Approval not found' };
+    }
+
+    if (approval.status !== 'approved') {
+      return { ok: false, error: 'Approval must be approved before execution' };
+    }
+
+    this.approvals.set(approvalId, {
+      ...approval,
+      status: 'executed',
+      executed_at: executedAt,
+    });
+    return { ok: true, value: undefined };
+  }
+
+  async markApprovalNotified(approvalId, notifiedAt) {
+    this.eventLog.push('markApprovalNotified');
+    this.calls.push({ method: 'markApprovalNotified', approvalId, notifiedAt });
+
+    if (this.failures.markApprovalNotified) {
+      return { ok: false, error: this.failures.markApprovalNotified };
+    }
+
+    const approval = this.approvals.get(approvalId);
+    if (!approval) {
+      return { ok: false, error: 'Approval not found' };
+    }
+
+    this.approvals.set(approvalId, {
+      ...approval,
+      notified_at: notifiedAt,
+    });
+    return { ok: true, value: undefined };
   }
 
   async updateLead(leadId, patch) {
@@ -277,6 +361,37 @@ class FakeLeadStore {
 
     return { ok: true, value: undefined };
   }
+
+  async resolveApprovalByCode(approvalCode, status, decisionAt, decidedByPhone) {
+    this.eventLog.push('resolveApprovalByCode');
+    this.calls.push({ method: 'resolveApprovalByCode', approvalCode, status, decisionAt, decidedByPhone });
+
+    if (this.failures.resolveApprovalByCode) {
+      return { ok: false, error: this.failures.resolveApprovalByCode };
+    }
+
+    const approval =
+      Array.from(this.approvals.values()).find(
+        (candidate) => candidate.approval_code.toUpperCase() === approvalCode.toUpperCase()
+      ) ?? null;
+
+    if (!approval) {
+      return { ok: false, error: 'Approval not found' };
+    }
+
+    if (approval.status !== 'pending') {
+      return { ok: false, error: `Approval is already ${approval.status}` };
+    }
+
+    const updated = {
+      ...approval,
+      status,
+      decision_at: decisionAt,
+      decided_by_phone: decidedByPhone,
+    };
+    this.approvals.set(approval.id, updated);
+    return { ok: true, value: updated };
+  }
 }
 
 class TestEmailClient extends EmailClient {
@@ -375,6 +490,7 @@ function createService(options = {}) {
       config,
       inboxProvider,
       agentHooks: options.agentHooks,
+      approvalHooks: options.approvalHooks,
     }),
   };
 }
@@ -493,8 +609,34 @@ test('prepareNextAction falls back to renderTemplate when the outreach writer fa
 });
 
 test('advanceLeadSequence persists the touchpoint before the email call and then updates the lead', async () => {
-  const { service, store, emailClient, eventLog } = createService();
+  const approvalNotifications = [];
+  const { service, store, emailClient, eventLog } = createService({
+    approvalHooks: {
+      async requestApproval(input) {
+        approvalNotifications.push(input);
+      },
+    },
+  });
   store.seedLead(buildLead({ status: 'active' }));
+
+  const firstAttempt = await service.advanceLeadSequence('lead-123');
+  assert.deepEqual(firstAttempt, {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+  assert.equal(store.touchpoints.length, 0);
+  assert.equal(emailClient.calls.length, 0);
+  assert.equal(approvalNotifications.length, 1);
+
+  const pendingApproval = Array.from(store.approvals.values())[0];
+  store.approvals.set(pendingApproval.id, {
+    ...pendingApproval,
+    status: 'approved',
+  });
 
   const result = await service.advanceLeadSequence('lead-123');
   assert.deepEqual(result, {
@@ -510,8 +652,16 @@ test('advanceLeadSequence persists the touchpoint before the email call and then
     'getLeadById',
     'listTouchpointsByLeadId',
     'getLeadById',
+    'getLatestApprovalByProposal',
+    'createApproval',
+    'markApprovalNotified',
+    'getLeadById',
+    'listTouchpointsByLeadId',
+    'getLeadById',
+    'getLatestApprovalByProposal',
     'recordTouchpoint',
     'emailSend',
+    'markApprovalExecuted',
     'updateLead',
   ]);
   assert.equal(emailClient.calls.length, 1);
@@ -521,17 +671,112 @@ test('advanceLeadSequence persists the touchpoint before the email call and then
   assert.equal(store.leads.get('lead-123').touches_sent, 1);
   assert.equal(store.leads.get('lead-123').last_stage_index, 0);
   assert.equal(typeof store.leads.get('lead-123').last_sent_at, 'string');
+  assert.equal(store.approvals.get(pendingApproval.id).status, 'executed');
 });
 
 test('advanceLeadSequence returns an error and never sends when touchpoint persistence fails', async () => {
   const { service, store, emailClient } = createService();
   store.seedLead(buildLead({ status: 'active' }));
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+  const pendingApproval = Array.from(store.approvals.values())[0];
+  store.approvals.set(pendingApproval.id, {
+    ...pendingApproval,
+    status: 'approved',
+  });
   store.failures.recordTouchpoint = 'touchpoint persistence failed';
 
   assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
     ok: false,
     error: 'touchpoint persistence failed',
   });
+  assert.equal(emailClient.calls.length, 0);
+});
+
+test('advanceLeadSequence stores a pending approval and skips sending until approved', async () => {
+  const approvalNotifications = [];
+  const { service, store, emailClient } = createService({
+    approvalHooks: {
+      async requestApproval(input) {
+        approvalNotifications.push(input);
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+
+  assert.equal(emailClient.calls.length, 0);
+  assert.equal(store.touchpoints.length, 0);
+  assert.equal(store.approvals.size, 1);
+  assert.equal(approvalNotifications.length, 1);
+});
+
+test('advanceLeadSequence skips rejected approvals without sending', async () => {
+  const { service, store, emailClient } = createService();
+  store.seedLead(buildLead({ status: 'active' }));
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+  const pendingApproval = Array.from(store.approvals.values())[0];
+  store.approvals.set(pendingApproval.id, {
+    ...pendingApproval,
+    status: 'rejected',
+  });
+
+  const result = await service.advanceLeadSequence('lead-123');
+  assert.deepEqual(result, {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'approval_rejected',
+    },
+  });
+  assert.equal(emailClient.calls.length, 0);
+  assert.equal(store.touchpoints.length, 0);
+});
+
+test('advanceLeadSequence keeps pending approval when notification hook fails', async () => {
+  const { service, store, emailClient } = createService({
+    approvalHooks: {
+      async requestApproval() {
+        throw new Error('sms unavailable');
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+
+  const approval = Array.from(store.approvals.values())[0];
+  assert.equal(approval.status, 'pending');
+  assert.equal(approval.notified_at, undefined);
   assert.equal(emailClient.calls.length, 0);
 });
 
@@ -570,11 +815,31 @@ test('advanceLeadSequence marks exhausted leads as stopped', async () => {
 test('advanceLeadSequence does not retry the email send when the final state update fails', async () => {
   const { service, store, emailClient } = createService();
   store.seedLead(buildLead({ status: 'active' }));
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+  const pendingApproval = Array.from(store.approvals.values())[0];
+  store.approvals.set(pendingApproval.id, {
+    ...pendingApproval,
+    status: 'approved',
+  });
   store.failures.updateLead = 'failed to update lead state';
 
   assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
     ok: false,
     error: 'failed to update lead state',
+  });
+  assert.equal(emailClient.calls.length, 1);
+  assert.equal(store.approvals.get(pendingApproval.id).status, 'executed');
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: false,
+    error: 'Approval already executed for this proposal; GTM lead state requires manual repair',
   });
   assert.equal(emailClient.calls.length, 1);
 });
