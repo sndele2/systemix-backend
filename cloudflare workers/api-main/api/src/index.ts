@@ -59,6 +59,7 @@ type Bindings = {
   SYSTEMIX: D1Database;
   DB?: D1Database;
   GTM_DB?: D1Database;
+  GTM_LIVE_TEST_KEY?: string;
   OPENAI_API_KEY: string;
   CLIENT_PHONE: string;
   OWNER_PHONE_NUMBER?: string;
@@ -520,6 +521,42 @@ export function createRuntimeGtmApprovalHooks(
       });
     },
   };
+}
+
+type GtmApprovalProofRow = {
+  approval_code: string;
+  status: string;
+  requested_at: string;
+  notified_at: string | null;
+};
+
+function isGtmLiveProofAuthorized(c: Context<AppEnv>): boolean {
+  const expectedKey = c.env.GTM_LIVE_TEST_KEY?.trim();
+  if (!expectedKey) {
+    return false;
+  }
+
+  return c.req.header('x-gtm-live-test-key') === expectedKey;
+}
+
+async function getLatestGtmApprovalForLead(
+  database: D1Database,
+  leadId: string
+): Promise<GtmApprovalProofRow | null> {
+  const row = await database
+    .prepare(
+      `
+      SELECT approval_code, status, requested_at, notified_at
+      FROM gtm_approvals
+      WHERE lead_id = ?
+      ORDER BY requested_at DESC
+      LIMIT 1
+    `
+    )
+    .bind(leadId)
+    .first<GtmApprovalProofRow>();
+
+  return row ?? null;
 }
 
 function applyInternalCorsHeaders(c: Context<AppEnv>): AuthResult<void> {
@@ -1197,6 +1234,88 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
       {
         success: true,
         ...sendResult.value,
+      },
+      200
+    );
+  });
+
+  app.post('/v1/gtm/live-proof', async (c) => {
+    if (!isGtmLiveProofAuthorized(c)) {
+      return c.json({ ok: false, error: 'Unauthorized' }, 401);
+    }
+
+    if (!c.env.GTM_DB) {
+      return c.json({ ok: false, error: 'GTM_DB is not configured' }, 500);
+    }
+
+    const service = gtmServiceFactory(c.env as Parameters<typeof createRuntimeGtmService>[0]);
+    const timestamp = new Date().toISOString();
+    const compactTimestamp = timestamp.replace(/\D/g, '').slice(0, 14);
+    const leadId = `gtm-live-proof-${compactTimestamp}`;
+
+    routerLog.log('GTM live proof route invoked', {
+      context: {
+        handler: 'gtmLiveProofRoute',
+      },
+      data: {
+        system: 'gtm',
+        environment: c.env.ENVIRONMENT ?? 'unset',
+        leadId,
+      },
+    });
+
+    const lead = {
+      id: leadId,
+      name: 'Jordan GTM Proof',
+      email: `${leadId}@example.com`,
+      phone: '+13125550199',
+      createdAt: timestamp,
+      metadata: {
+        source: 'gtm_live_proof_route',
+      },
+    };
+
+    const createLeadResult = await service.createLead(lead);
+    if (!createLeadResult.ok) {
+      return c.json({ ok: false, error: createLeadResult.error, leadId }, 400);
+    }
+
+    const startSequenceResult = await service.startSequence(leadId);
+    if (!startSequenceResult.ok) {
+      return c.json({ ok: false, error: startSequenceResult.error, leadId }, 400);
+    }
+
+    const advanceResult = await service.advanceLeadSequence(leadId);
+    if (!advanceResult.ok) {
+      return c.json({ ok: false, error: advanceResult.error, leadId }, 400);
+    }
+
+    const resultLeadId = advanceResult.value.leadId || leadId;
+    const approval = await getLatestGtmApprovalForLead(c.env.GTM_DB, resultLeadId);
+
+    routerLog.log('GTM live proof route completed', {
+      context: {
+        handler: 'gtmLiveProofRoute',
+      },
+      data: {
+        system: 'gtm',
+        environment: c.env.ENVIRONMENT ?? 'unset',
+        leadId: resultLeadId,
+        action: advanceResult.value.action,
+        reason: advanceResult.value.reason ?? null,
+        approvalCode: approval?.approval_code ?? null,
+        approvalStatus: approval?.status ?? null,
+        notifiedAt: approval?.notified_at ?? null,
+      },
+    });
+
+    return c.json(
+      {
+        ok: true,
+        leadId: resultLeadId,
+        action: advanceResult.value.action,
+        reason: advanceResult.value.reason ?? null,
+        approvalCode: approval?.approval_code ?? null,
       },
       200
     );

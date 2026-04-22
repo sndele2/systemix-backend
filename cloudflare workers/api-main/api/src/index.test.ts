@@ -197,8 +197,9 @@ class MockApprovalPreparedStatement {
 }
 
 class MockApprovalDatabase {
-  constructor({ businesses = [] } = {}) {
+  constructor({ businesses = [], approvals = [] } = {}) {
     this.businesses = businesses;
+    this.approvals = approvals;
   }
 
   prepare(sql) {
@@ -226,6 +227,11 @@ class MockApprovalDatabase {
       return null;
     }
 
+    if (normalized.includes('from gtm_approvals') && normalized.includes('where lead_id = ?')) {
+      const leadId = args[0];
+      return this.approvals.find((row) => row.lead_id === leadId) ?? null;
+    }
+
     return null;
   }
 
@@ -250,8 +256,30 @@ class MockApprovalDatabase {
   }
 }
 
-function createGtmServiceStub() {
+function createGtmServiceStub(overrides = {}) {
   return {
+    async createLead() {
+      return {
+        ok: true,
+        value: undefined,
+      };
+    },
+    async startSequence() {
+      return {
+        ok: true,
+        value: undefined,
+      };
+    },
+    async advanceLeadSequence() {
+      return {
+        ok: true,
+        value: {
+          action: 'skipped',
+          leadId: 'lead-internal-1',
+          reason: 'awaiting_approval',
+        },
+      };
+    },
     async syncAndListReplies() {
       return {
         ok: true,
@@ -286,6 +314,7 @@ function createGtmServiceStub() {
         },
       };
     },
+    ...overrides,
   };
 }
 
@@ -304,9 +333,9 @@ function createEnv(overrides = {}) {
   };
 }
 
-function createTestWorker(sessionStore, userStore) {
+function createTestWorker(sessionStore, userStore, overrides = {}) {
   return createWorker({
-    gtmServiceFactory: () => createGtmServiceStub(),
+    gtmServiceFactory: () => createGtmServiceStub(overrides.gtmServiceOverrides),
     sessionStoreFactory: () => sessionStore,
     userStoreFactory: () => userStore,
   });
@@ -844,6 +873,77 @@ test('internal GTM test route still requires header auth outside the cookie midd
   const json = await authorizedResponse.json();
   assert.equal(json.success, true);
   assert.equal(json.dryRun, true);
+});
+
+test('GTM live proof route requires the dedicated live test key and returns approval details', async () => {
+  const sessionStore = new MockSessionStore();
+  const userStore = new MockUserStore();
+  const leadId = 'gtm-live-proof-20260422230000';
+  const worker = createTestWorker(sessionStore, userStore, {
+    gtmServiceOverrides: {
+      async advanceLeadSequence() {
+        return {
+          ok: true,
+          value: {
+            action: 'skipped',
+            leadId,
+            reason: 'awaiting_approval',
+          },
+        };
+      },
+    },
+  });
+  const env = createEnv({
+    GTM_LIVE_TEST_KEY: 'proof-key',
+    FALLBACK_AGENT_NUMBER: '+12175550111',
+    FALLBACK_NUMBER: '+12175550112',
+    HUBSPOT_ACCESS_TOKEN: 'hubspot-token',
+    DB: {},
+    GTM_DB: new MockApprovalDatabase({
+      approvals: [
+        {
+          approval_code: 'ABC12345',
+          lead_id: leadId,
+          status: 'pending',
+          requested_at: '2026-04-22T23:00:00.000Z',
+          notified_at: '2026-04-22T23:00:01.000Z',
+        },
+      ],
+    }),
+  });
+
+  const unauthorizedResponse = await worker.fetch(
+    new Request('http://example.com/v1/gtm/live-proof', {
+      method: 'POST',
+    }),
+    env,
+    executionCtx
+  );
+
+  assert.equal(unauthorizedResponse.status, 401);
+  assert.deepEqual(await unauthorizedResponse.json(), {
+    ok: false,
+    error: 'Unauthorized',
+  });
+
+  const authorizedResponse = await worker.fetch(
+    new Request('http://example.com/v1/gtm/live-proof', {
+      method: 'POST',
+      headers: {
+        'x-gtm-live-test-key': 'proof-key',
+      },
+    }),
+    env,
+    executionCtx
+  );
+
+  assert.equal(authorizedResponse.status, 200);
+  const json = await authorizedResponse.json();
+  assert.equal(json.ok, true);
+  assert.equal(json.action, 'skipped');
+  assert.equal(json.reason, 'awaiting_approval');
+  assert.equal(json.approvalCode, 'ABC12345');
+  assert.match(json.leadId, /^gtm-live-proof-/);
 });
 
 test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
