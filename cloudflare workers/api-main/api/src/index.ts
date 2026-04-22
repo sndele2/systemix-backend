@@ -37,7 +37,9 @@ import { scheduleTwilioBackgroundTask } from './services/twilioLaunch.ts';
 import { upsertBusiness } from './services/database.ts';
 import {
   ensureCustomerMissedCallSchema,
+  getMissedCallRecoveryStats,
   ignoreMissedCallNumber,
+  RECOVERED_OPPORTUNITY_DEFINITION,
 } from './services/missedCallRecovery.ts';
 import { simulateCallbackHandler } from './testing/simulator.ts';
 import { stripeWebhookHandler } from './webhooks/stripe.ts';
@@ -845,6 +847,28 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
         business_number: businessNumber,
         phone_number: normalizePhone(phoneNumber) || phoneNumber,
         ignored: true,
+      },
+      200
+    );
+  });
+
+  app.get('/v1/internal/missed-call/stats', async (c) => {
+    if (!isInternalRequestAuthorized(c)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    await ensureCustomerMissedCallSchema(c.env.SYSTEMIX);
+    const stats = await getMissedCallRecoveryStats(c.env.SYSTEMIX);
+
+    return c.json(
+      {
+        success: true,
+        recovered_opportunity_definition: RECOVERED_OPPORTUNITY_DEFINITION,
+        totals: {
+          missed_calls: stats.totalMissedCalls,
+          customer_replies: stats.totalCustomerReplies,
+          recovered_opportunities: stats.totalRecoveredOpportunities,
+        },
       },
       200
     );

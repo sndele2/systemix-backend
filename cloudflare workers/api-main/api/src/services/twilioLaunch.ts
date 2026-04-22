@@ -124,12 +124,11 @@ function truncateOwnerAlertMessage(message: string, maxLength: number): string {
 
 export function buildBusinessOwnerAlertMessage(input: BusinessOwnerAlertInput): string {
   const isEmergency = input.classification === 'emergency';
-  const heading = isEmergency ? '🚨 EMERGENCY LEAD' : '📩 NEW LEAD';
-  const issueLabel = cleanBusinessOwnerIssueLabel(input.summary);
+  const heading = isEmergency ? '🚨 NEW LEAD' : '📩 NEW LEAD';
   const customerPhone = formatDisplayPhoneNumber(input.customerNumber);
-  const actionLine = isEmergency ? 'Call now' : 'Reply or call';
-  const prefix = `${heading}\n\nIssue: ${issueLabel}\nCustomer: ${customerPhone}\n\nMessage:\n"`;
-  const suffix = `"\n\n${actionLine}: ${customerPhone}`;
+  const latestMessageLabel = isEmergency ? 'Latest emergency message' : 'Latest message';
+  const prefix = `${heading}\nCustomer: ${customerPhone}\n${latestMessageLabel}: "`;
+  const suffix = `"\nLog in to reply: https://systemixai.co/internal/inbox`;
   const truncatedMessage = truncateOwnerAlertMessage(
     input.customerMessage,
     Math.max(0, OWNER_ALERT_MAX_SMS_BODY - prefix.length - suffix.length)
@@ -324,6 +323,7 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
       businessNumber: business.business_number,
       phoneNumber: callerNumber,
       smsContent: preparedBody,
+      firstAutoTextAt: new Date().toISOString(),
     });
   }
 

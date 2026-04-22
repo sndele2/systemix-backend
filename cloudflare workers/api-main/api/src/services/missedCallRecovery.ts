@@ -10,6 +10,15 @@ export type MissedCallBusinessConfig = {
   intakeQuestion: string | null;
 };
 
+export type MissedCallRecoveryStats = {
+  totalMissedCalls: number;
+  totalCustomerReplies: number;
+  totalRecoveredOpportunities: number;
+};
+
+export const RECOVERED_OPPORTUNITY_DEFINITION =
+  'missed call + customer replied after the first auto-text';
+
 function isDuplicateColumnError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.toLowerCase().includes('duplicate column name');
@@ -47,9 +56,12 @@ export async function ensureCustomerMissedCallSchema(db: D1Database): Promise<vo
         missed_call_timestamp TEXT NOT NULL,
         sms_sent INTEGER NOT NULL DEFAULT 0,
         sms_content TEXT,
+        first_auto_text_at TEXT,
         reply_received INTEGER NOT NULL DEFAULT 0,
         reply_text TEXT,
         reply_timestamp TEXT,
+        first_customer_reply_at TEXT,
+        recovered_opportunity_at TEXT,
         time_to_reply_seconds INTEGER,
         is_ignored INTEGER NOT NULL DEFAULT 0,
         notes TEXT
@@ -74,6 +86,9 @@ export async function ensureCustomerMissedCallSchema(db: D1Database): Promise<vo
         await db.prepare(statement).run();
       }
       await maybeAddColumn(db, 'ALTER TABLE businesses ADD COLUMN intake_question TEXT');
+      await maybeAddColumn(db, 'ALTER TABLE missed_call_conversations ADD COLUMN first_auto_text_at TEXT');
+      await maybeAddColumn(db, 'ALTER TABLE missed_call_conversations ADD COLUMN first_customer_reply_at TEXT');
+      await maybeAddColumn(db, 'ALTER TABLE missed_call_conversations ADD COLUMN recovered_opportunity_at TEXT');
     })()
       .then(() => undefined)
       .catch((error) => {
@@ -206,6 +221,7 @@ export async function markMissedCallSmsSent(
     businessNumber: string;
     phoneNumber: string;
     smsContent: string;
+    firstAutoTextAt?: string;
   }
 ): Promise<void> {
   await ensureCustomerMissedCallSchema(db);
@@ -213,6 +229,7 @@ export async function markMissedCallSmsSent(
   const businessNumber = normalizePhone(input.businessNumber);
   const phoneNumber = normalizePhone(input.phoneNumber);
   const smsContent = (input.smsContent || '').trim();
+  const firstAutoTextAt = (input.firstAutoTextAt || '').trim() || new Date().toISOString();
   if (!businessNumber || !phoneNumber || !smsContent) {
     return;
   }
@@ -222,7 +239,8 @@ export async function markMissedCallSmsSent(
       `
       UPDATE missed_call_conversations
       SET sms_sent = 1,
-          sms_content = ?
+          sms_content = ?,
+          first_auto_text_at = COALESCE(first_auto_text_at, ?)
       WHERE id = (
         SELECT id
         FROM missed_call_conversations
@@ -234,7 +252,7 @@ export async function markMissedCallSmsSent(
       )
     `
     )
-    .bind(smsContent, businessNumber, phoneNumber)
+    .bind(smsContent, firstAutoTextAt, businessNumber, phoneNumber)
     .run();
 }
 
@@ -264,6 +282,13 @@ export async function recordMissedCallReply(
       SET reply_received = 1,
           reply_text = ?,
           reply_timestamp = ?,
+          first_customer_reply_at = COALESCE(first_customer_reply_at, ?),
+          recovered_opportunity_at = CASE
+            WHEN recovered_opportunity_at IS NOT NULL THEN recovered_opportunity_at
+            WHEN first_auto_text_at IS NULL THEN NULL
+            WHEN CAST(strftime('%s', ?) AS INTEGER) < CAST(strftime('%s', first_auto_text_at) AS INTEGER) THEN NULL
+            ELSE COALESCE(first_customer_reply_at, ?)
+          END,
           time_to_reply_seconds = CASE
             WHEN missed_call_timestamp IS NULL THEN NULL
             ELSE MAX(0, CAST(strftime('%s', ?) AS INTEGER) - CAST(strftime('%s', missed_call_timestamp) AS INTEGER))
@@ -279,8 +304,49 @@ export async function recordMissedCallReply(
       )
     `
     )
-    .bind(replyText, replyTimestamp, replyTimestamp, businessNumber, phoneNumber)
+    .bind(
+      replyText,
+      replyTimestamp,
+      replyTimestamp,
+      replyTimestamp,
+      replyTimestamp,
+      replyTimestamp,
+      businessNumber,
+      phoneNumber
+    )
     .run();
+}
+
+export async function getMissedCallRecoveryStats(
+  db: D1Database,
+  businessNumber?: string
+): Promise<MissedCallRecoveryStats> {
+  await ensureCustomerMissedCallSchema(db);
+
+  const scopedBusinessNumber = normalizePhone(businessNumber || '') || null;
+  const row = await db
+    .prepare(
+      `
+      SELECT
+        COUNT(*) AS total_missed_calls,
+        SUM(CASE WHEN first_customer_reply_at IS NOT NULL THEN 1 ELSE 0 END) AS total_customer_replies,
+        SUM(CASE WHEN recovered_opportunity_at IS NOT NULL THEN 1 ELSE 0 END) AS total_recovered_opportunities
+      FROM missed_call_conversations
+      WHERE (? IS NULL OR business_number = ?)
+    `
+    )
+    .bind(scopedBusinessNumber, scopedBusinessNumber)
+    .first<{
+      total_missed_calls?: number | string | null;
+      total_customer_replies?: number | string | null;
+      total_recovered_opportunities?: number | string | null;
+    }>();
+
+  return {
+    totalMissedCalls: Number(row?.total_missed_calls || 0),
+    totalCustomerReplies: Number(row?.total_customer_replies || 0),
+    totalRecoveredOpportunities: Number(row?.total_recovered_opportunities || 0),
+  };
 }
 
 export async function ignoreMissedCallNumber(

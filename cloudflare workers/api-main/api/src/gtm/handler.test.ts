@@ -355,6 +355,90 @@ describe('createGtmHandler manual trigger routes', () => {
     assert.equal(calls.getLeadsReadyForNextAction, 1);
     assert.deepEqual(calls.advanceLeadSequence, ['lead-ready-1', 'lead-ready-2']);
   });
+
+  it('returns discovery candidates with agent_status ok when the discovery agent succeeds', async () => {
+    const { service } = createHandlerServiceStub();
+    const app = createGtmHandler(service, {
+      async runLeadDiscovery() {
+        return {
+          candidates: [
+            {
+              businessName: 'Jordan Home Services',
+              email: 'jordan@example.com',
+              source: 'test-fixture',
+            },
+          ],
+          limitations: [],
+        };
+      },
+    });
+
+    const response = await app.request(
+      'http://example.com/gtm/internal/discovery',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer secret',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          objective: 'Find missed-call recovery candidates',
+          searchHints: ['plumber'],
+          maxCandidates: 5,
+        }),
+      },
+      {
+        INTERNAL_AUTH_KEY: 'secret',
+      }
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      agent_status: 'ok',
+      candidates: [
+        {
+          businessName: 'Jordan Home Services',
+          email: 'jordan@example.com',
+          source: 'test-fixture',
+        },
+      ],
+      limitations: [],
+    });
+  });
+
+  it('returns agent_status fallback when the discovery agent fails', async () => {
+    const { service } = createHandlerServiceStub();
+    const app = createGtmHandler(service, {
+      async runLeadDiscovery() {
+        throw new Error('discovery unavailable');
+      },
+    });
+
+    const response = await app.request(
+      'http://example.com/gtm/internal/discovery',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer secret',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          objective: 'Find missed-call recovery candidates',
+          maxCandidates: 5,
+        }),
+      },
+      {
+        INTERNAL_AUTH_KEY: 'secret',
+      }
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      agent_status: 'fallback',
+      candidates: [],
+      limitations: ['Lead discovery agent failed; returned empty fallback result'],
+    });
+  });
 });
 
 describe('createGtmInternalRepliesHandler', () => {

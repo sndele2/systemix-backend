@@ -74,6 +74,7 @@ const PROVIDER = 'twilio';
 const ENABLE_CLASSIFICATION = false;
 const ALERT_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const ACTIVE_THREAD_WINDOW_MS = 5 * 60 * 1000;
+const INBOUND_SMS_DEDUP_WINDOW_SECONDS = 10;
 const MAX_SMS_BODY = 1500;
 const OWNER_THREAD_PREFIX = 'owner:';
 const LINE_STATE_SENTINEL = '__line_state__';
@@ -339,7 +340,23 @@ async function saveInboundSms(
   body: string,
   providerMessageId: string,
   rawJson: string
-): Promise<{ saved: boolean }> {
+): Promise<{ saved: boolean; deduplicated: boolean; reason: string | null }> {
+  if (
+    await hasRecentInboundMessageDuplicate(
+      env,
+      fromPhone,
+      toPhone,
+      body,
+      INBOUND_SMS_DEDUP_WINDOW_SECONDS
+    )
+  ) {
+    return {
+      saved: false,
+      deduplicated: true,
+      reason: 'phone_body_time_window',
+    };
+  }
+
   if (!providerMessageId) {
     await env.SYSTEMIX.prepare(
       `
@@ -358,7 +375,11 @@ async function saveInboundSms(
       .bind(crypto.randomUUID(), PROVIDER, fromPhone, toPhone, body, rawJson)
       .run();
 
-    return { saved: true };
+    return {
+      saved: true,
+      deduplicated: false,
+      reason: null,
+    };
   }
 
   const insert = await env.SYSTEMIX.prepare(
@@ -379,7 +400,12 @@ async function saveInboundSms(
     .bind(crypto.randomUUID(), PROVIDER, providerMessageId, fromPhone, toPhone, body, rawJson)
     .run();
 
-  return { saved: Number(insert.meta?.changes || 0) > 0 };
+  const saved = Number(insert.meta?.changes || 0) > 0;
+  return {
+    saved,
+    deduplicated: !saved,
+    reason: saved ? null : 'provider_message_id',
+  };
 }
 
 async function saveOutboundSms(
@@ -417,6 +443,75 @@ function emptyTwimlResponseBody(): string {
 
 function respondWithEmptyTwiml(c: Context<{ Bindings: Bindings }>) {
   return c.body(emptyTwimlResponseBody(), 200, { 'Content-Type': 'text/xml' });
+}
+
+export function normalizeInboundMessageBodyForDedup(body: string): string {
+  return body.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+export async function hasRecentInboundMessageDuplicate(
+  env: Pick<Bindings, 'SYSTEMIX'>,
+  fromPhone: string,
+  toPhone: string,
+  body: string,
+  windowSeconds = INBOUND_SMS_DEDUP_WINDOW_SECONDS
+): Promise<boolean> {
+  const normalizedFrom = normalizePhone(fromPhone) || fromPhone.trim();
+  const normalizedTo = normalizePhone(toPhone) || toPhone.trim();
+  const normalizedBody = normalizeInboundMessageBodyForDedup(body);
+
+  if (!normalizedFrom || !normalizedTo || !normalizedBody || windowSeconds <= 0) {
+    return false;
+  }
+
+  const recentMessages = await env.SYSTEMIX.prepare(
+    `
+    SELECT body
+    FROM messages
+    WHERE direction = 'inbound'
+      AND provider = ?
+      AND from_phone = ?
+      AND to_phone = ?
+      AND unixepoch(created_at) >= unixepoch('now') - ?
+    ORDER BY created_at DESC
+    LIMIT 25
+  `
+  )
+    .bind(PROVIDER, normalizedFrom, normalizedTo, windowSeconds)
+    .all<{ body?: string | null }>();
+
+  return (recentMessages.results || []).some(
+    (row) => normalizeInboundMessageBodyForDedup(row.body || '') === normalizedBody
+  );
+}
+
+async function countInboundCustomerMessages(
+  env: Pick<Bindings, 'SYSTEMIX'>,
+  businessNumber: string,
+  customerNumber: string
+): Promise<number> {
+  const row = await env.SYSTEMIX.prepare(
+    `
+    SELECT COUNT(*) AS inbound_count
+    FROM messages
+    WHERE direction = 'inbound'
+      AND provider = ?
+      AND from_phone = ?
+      AND to_phone = ?
+  `
+  )
+    .bind(PROVIDER, customerNumber, businessNumber)
+    .first<{ inbound_count?: number | string | null }>();
+
+  return Number(row?.inbound_count || 0);
+}
+
+export async function shouldSendOwnerLeadNotification(
+  env: Pick<Bindings, 'SYSTEMIX'>,
+  businessNumber: string,
+  customerNumber: string
+): Promise<boolean> {
+  return (await countInboundCustomerMessages(env, businessNumber, customerNumber)) === 1;
 }
 
 function withLoggedBackgroundCatch<T>(
@@ -2348,7 +2443,7 @@ function buildCustomerAnalysisBackgroundTasks(input: {
 }): Promise<unknown>[] {
   const saveInboundTask = withLoggedBackgroundCatch(
     '[D1]',
-    'Persist inbound MessageSid',
+    'Persist inbound message',
     saveInboundSms(
       input.env,
       input.customerNumber,
@@ -2366,6 +2461,8 @@ function buildCustomerAnalysisBackgroundTasks(input: {
         },
         data: {
           saved: saved.saved,
+          deduplicated: saved.deduplicated,
+          reason: saved.reason,
         },
       });
       return saved;
@@ -2376,6 +2473,40 @@ function buildCustomerAnalysisBackgroundTasks(input: {
         messageSid: input.providerMessageId || null,
         fromNumber: input.customerNumber,
         toNumber: input.inboundTo,
+      },
+    }
+  );
+
+  const notificationEligibilityTask = withLoggedBackgroundCatch(
+    '[D1]',
+    'Evaluate owner notification eligibility',
+    saveInboundTask.then(async (savedInbound) => {
+      if (!savedInbound?.saved) {
+        return {
+          send: false,
+          reason: savedInbound?.reason || 'not_saved',
+          inboundCount: 0,
+        };
+      }
+
+      const inboundCount = await countInboundCustomerMessages(
+        input.env,
+        input.businessNumber,
+        input.customerNumber
+      );
+
+      return {
+        send: inboundCount === 1,
+        reason: inboundCount === 1 ? 'new_lead' : 'existing_thread',
+        inboundCount,
+      };
+    }),
+    {
+      context: {
+        handler: 'buildCustomerAnalysisBackgroundTasks',
+        messageSid: input.providerMessageId || null,
+        fromNumber: input.customerNumber,
+        toNumber: input.ownerPhone || input.businessNumber,
       },
     }
   );
@@ -2561,10 +2692,10 @@ function buildCustomerAnalysisBackgroundTasks(input: {
   const ownerAlertTask = input.ownerAlertEligible
     ? withLoggedBackgroundCatch(
         '[TWILIO]',
-        'Send owner alert',
-        Promise.all([saveInboundTask, classifyTask, inboundClassificationTask]).then(
-          async ([savedInbound, triage, inboundClassification]) => {
-            if (!savedInbound?.saved) return null;
+        'Send owner lead notification',
+        Promise.all([saveInboundTask, classifyTask, inboundClassificationTask, notificationEligibilityTask]).then(
+          async ([savedInbound, triage, inboundClassification, notificationEligibility]) => {
+            if (!savedInbound?.saved || !notificationEligibility?.send) return null;
 
             const ownerAlertBody = buildBusinessOwnerAlertMessage({
               classification: triage?.aiClassification ?? null,
@@ -2617,6 +2748,7 @@ function buildCustomerAnalysisBackgroundTasks(input: {
               suppressed: isSmsSuppressed(ownerSms),
               body: ownerAlertBody,
               classification: ownerAlertClassification,
+              trigger: notificationEligibility.reason,
               confidence: triage?.confidence ?? 'low',
               aiClassification: triage?.aiClassification ?? null,
               summary: triage?.summary ?? null,
@@ -2640,7 +2772,7 @@ function buildCustomerAnalysisBackgroundTasks(input: {
   const persistOwnerAlertTask = ownerAlertTask
     ? withLoggedBackgroundCatch(
         '[D1]',
-        'Persist owner alert',
+        'Persist owner lead notification',
         Promise.all([ownerAlertTask, threadIdTask]).then(async ([ownerAlert, threadId]) => {
           if (!ownerAlert || !threadId || ownerAlert.suppressed) return null;
 
@@ -2651,7 +2783,8 @@ function buildCustomerAnalysisBackgroundTasks(input: {
             input.ownerPhone,
             ownerAlert.body,
             JSON.stringify({
-              source: 'post_classification_owner_alert',
+              source: 'owner_new_lead_notification',
+              trigger: ownerAlert.trigger,
               providerMessageId: input.providerMessageId || null,
             })
           );
@@ -2667,7 +2800,8 @@ function buildCustomerAnalysisBackgroundTasks(input: {
             classification: ownerAlert.classification,
             confidence: ownerAlert.confidence,
             metadata: {
-              source: 'post_classification_owner_alert',
+              source: 'owner_new_lead_notification',
+              trigger: ownerAlert.trigger,
               aiClassification: ownerAlert.aiClassification,
               summary: ownerAlert.summary,
               gptUsed: ownerAlert.gptUsed,
@@ -2891,6 +3025,7 @@ function buildCustomerAnalysisBackgroundTasks(input: {
 
   return [
     saveInboundTask,
+    notificationEligibilityTask,
     classifyTask,
     threadIdTask,
     setLastCustomerTask,
@@ -3623,6 +3758,30 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
     const body = ((formData.get('Body') as string) || '').trim();
     const inboundFrom = normalizePhone(from) || from || 'unknown';
     const inboundTo = normalizePhone(to) || to || 'unknown';
+
+    if (
+      await hasRecentInboundMessageDuplicate(
+        c.env,
+        inboundFrom,
+        inboundTo,
+        body,
+        INBOUND_SMS_DEDUP_WINDOW_SECONDS
+      )
+    ) {
+      d1Log.log('Duplicate inbound SMS ignored', {
+        context: {
+          handler: 'twilioSmsHandler',
+          messageSid: providerMessageId || null,
+          fromNumber: inboundFrom,
+          toNumber: inboundTo,
+        },
+        data: {
+          reason: 'phone_body_time_window',
+          windowSeconds: INBOUND_SMS_DEDUP_WINDOW_SECONDS,
+        },
+      });
+      return respondWithEmptyTwiml(c);
+    }
 
     const sig = await checkTwilioSignature(
       c.env,

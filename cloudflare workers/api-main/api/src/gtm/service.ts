@@ -4,6 +4,7 @@
 import type {
   AdvanceResult,
   EmailSendResult,
+  EmailStage,
   GTMConfig,
   GtmRepliesResponse,
   InboxMessage,
@@ -17,6 +18,11 @@ import type {
   Touchpoint,
 } from './types.ts';
 import type { LeadStore } from './lead-store.ts';
+import type {
+  LeadReviewOutput,
+  OutreachWriterOutput,
+  ReplyInterpreterOutput,
+} from './agents/schemas.ts';
 
 import { EmailClient } from './email-client.ts';
 import { MicrosoftGraphInboxProvider } from './inbox-client.ts';
@@ -32,6 +38,7 @@ const REPLIED_STATUS = 'replied';
 const UNKNOWN_REPLY_CLASSIFICATION = 'unknown';
 const DEFAULT_SYNC_CURSOR = '1970-01-01T00:00:00.000Z';
 const MAX_SYNC_BATCH_SIZE = 50;
+const AGENT_TIMEOUT_MS = 12_000;
 
 export interface GtmServiceRuntimeEnv {
   GTM_DB: D1Database;
@@ -52,6 +59,7 @@ interface GTMServiceDependencies {
   replyClassifier: ReplyClassifier;
   config: GTMConfig;
   inboxProvider?: InboxProvider;
+  agentHooks?: GTMServiceAgentHooks;
 }
 
 interface LoadedLeadContext {
@@ -64,6 +72,20 @@ interface ProcessedInboxMessageResult {
   ok: boolean;
   receivedAt: string;
   replyId: string;
+}
+
+export interface GTMServiceAgentHooks {
+  reviewLead?: (lead: LeadRecord) => Promise<LeadReviewOutput>;
+  writeOutreach?: (lead: LeadRecord, stage: EmailStage) => Promise<OutreachWriterOutput>;
+  interpretReply?: (
+    lead: LeadRecord | null,
+    rawReply: string,
+    deterministicClassification: string
+  ) => Promise<ReplyInterpreterOutput>;
+}
+
+interface GTMServiceRuntimeOptions {
+  agentHooks?: GTMServiceAgentHooks;
 }
 
 function succeed<T>(value: T): Result<T> {
@@ -120,7 +142,35 @@ function subtractOneMillisecond(isoTimestamp: string): string {
   return new Date(Math.max(0, timestamp - 1)).toISOString();
 }
 
-export function createRuntimeGtmService(env: GtmServiceRuntimeEnv): GTMService {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  return new Promise<T>((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(label + ' timed out after ' + timeoutMs + 'ms'));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        resolve(value);
+      },
+      (error) => {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        reject(error);
+      }
+    );
+  });
+}
+
+export function createRuntimeGtmService(
+  env: GtmServiceRuntimeEnv,
+  options: GTMServiceRuntimeOptions = {}
+): GTMService {
   const config = buildRuntimeConfig(env);
 
   return new GTMService({
@@ -130,6 +180,7 @@ export function createRuntimeGtmService(env: GtmServiceRuntimeEnv): GTMService {
     replyClassifier: new ReplyClassifier(),
     config,
     inboxProvider: new MicrosoftGraphInboxProvider(env),
+    agentHooks: options.agentHooks,
   });
 }
 
@@ -140,6 +191,7 @@ export class GTMService {
   private readonly replyClassifier: ReplyClassifier;
   private readonly config: GTMConfig;
   private readonly inboxProvider: InboxProvider | null;
+  private readonly agentHooks: GTMServiceAgentHooks | null;
 
   constructor(dependencies: GTMServiceDependencies) {
     this.store = dependencies.store;
@@ -151,6 +203,7 @@ export class GTMService {
       dryRun: dependencies.config.dryRun !== false,
     };
     this.inboxProvider = dependencies.inboxProvider ?? null;
+    this.agentHooks = dependencies.agentHooks ?? null;
   }
 
   async createLead(lead: Lead): Promise<Result<void>> {
@@ -194,6 +247,33 @@ export class GTMService {
       return fail('Lead must be pending to start the sequence');
     }
 
+    if (this.agentHooks?.reviewLead) {
+      try {
+        const review = await withTimeout(
+          this.agentHooks.reviewLead(leadResult.value),
+          AGENT_TIMEOUT_MS,
+          'lead review agent'
+        );
+
+        if (review.decision === 'reject') {
+          logInfo('gtm_lead_review_rejected', {
+            leadId,
+            score: review.score,
+            outreachAngle: review.outreachAngle,
+            reasoning: review.reasoning,
+            riskFlags: review.riskFlags,
+          });
+
+          return fail('Lead review rejected activation: ' + review.reasoning);
+        }
+      } catch (error) {
+        logError('gtm_lead_review_failed_open', error, {
+          leadId,
+          fallback: 'start_sequence_without_agent_gate',
+        });
+      }
+    }
+
     const updateLeadResult = await this.store.updateLead(leadId, {
       status: ACTIVE_STATUS,
     });
@@ -235,13 +315,42 @@ export class GTMService {
     }
 
     try {
-      const rendered = renderTemplate(decision.stage.templateKey, lead);
+      let subject: string;
+      let body: string;
+
+      if (this.agentHooks?.writeOutreach) {
+        try {
+          const agentDraft = await withTimeout(
+            this.agentHooks.writeOutreach(lead, decision.stage),
+            AGENT_TIMEOUT_MS,
+            'outreach writer agent'
+          );
+
+          subject = agentDraft.subject;
+          body = agentDraft.body;
+        } catch (error) {
+          logError('gtm_outreach_writer_fallback', error, {
+            leadId,
+            stageIndex: decision.stage.stageIndex,
+            templateKey: decision.stage.templateKey,
+            fallback: 'render_template',
+          });
+
+          const rendered = renderTemplate(decision.stage.templateKey, lead);
+          subject = rendered.subject;
+          body = rendered.body;
+        }
+      } else {
+        const rendered = renderTemplate(decision.stage.templateKey, lead);
+        subject = rendered.subject;
+        body = rendered.body;
+      }
 
       return succeed({
         action: 'send',
         stage: decision.stage,
-        subject: rendered.subject,
-        body: rendered.body,
+        subject,
+        body,
       });
     } catch (error) {
       logError('gtm_prepare_next_action_render_failed', error, {
@@ -413,6 +522,36 @@ export class GTMService {
       stoppedAt,
       intent: classification?.intent ?? null,
     });
+
+    if (this.agentHooks?.interpretReply) {
+      try {
+        const leadResult = await this.store.getLeadById(leadId);
+        const leadForInterpretation = leadResult.ok ? leadResult.value : null;
+        const advisory = await withTimeout(
+          this.agentHooks.interpretReply(
+            leadForInterpretation,
+            rawReply,
+            classification?.intent ?? UNKNOWN_REPLY_CLASSIFICATION
+          ),
+          AGENT_TIMEOUT_MS,
+          'reply interpreter agent'
+        );
+
+        logInfo('gtm_reply_interpreter_advisory', {
+          leadId,
+          classification: advisory.classification,
+          confidence: advisory.confidence,
+          recommendedManualAction: advisory.recommendedManualAction,
+          urgent: advisory.urgent,
+          reasoning: advisory.reasoning,
+        });
+      } catch (error) {
+        logError('gtm_reply_interpreter_failed_open', error, {
+          leadId,
+          fallback: 'deterministic_reply_stop_only',
+        });
+      }
+    }
 
     return succeed({
       classification: classification?.intent ?? UNKNOWN_REPLY_CLASSIFICATION,

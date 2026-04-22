@@ -4,10 +4,13 @@
 import { Hono, type Context } from 'hono';
 
 import type { Lead, LeadRecord, Result } from './types.ts';
+import type { LeadDiscoveryOutput } from './agents/schemas.ts';
 
 import { GTMService } from './service.ts';
+import { parseLeadDiscoveryInput } from './agents/schemas.ts';
 
 const GTM_LOG_PREFIX = '[GTM]';
+const AGENT_TIMEOUT_MS = 12_000;
 
 interface GTMHandlerBindings {
   INTERNAL_AUTH_KEY?: string;
@@ -33,6 +36,10 @@ interface ManualAdvanceItem {
   leadId: string;
   action: 'sent' | 'stopped' | 'skipped' | 'error';
   reason: string;
+}
+
+interface GtmHandlerAgentDependencies {
+  runLeadDiscovery?: (input: unknown) => Promise<LeadDiscoveryOutput>;
 }
 
 function jsonError(
@@ -133,6 +140,31 @@ function respondWithResult<T>(
 function handleUnexpectedError(c: Context<{ Bindings: GTMHandlerBindings }>, error: unknown): Response {
   logError('handler_error', error);
   return jsonError(c, 'Internal server error', 500);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  return new Promise<T>((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(label + ' timed out after ' + timeoutMs + 'ms'));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        resolve(value);
+      },
+      (error) => {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        reject(error);
+      }
+    );
+  });
 }
 
 function requireInternalAuth(c: Context<{ Bindings: GTMHandlerBindings }>): Response | null {
@@ -308,7 +340,10 @@ async function advanceEligibleLeads(
   );
 }
 
-export function createGtmHandler(service: GTMService): Hono<{ Bindings: GTMHandlerBindings }> {
+export function createGtmHandler(
+  service: GTMService,
+  agentDependencies: GtmHandlerAgentDependencies = {}
+): Hono<{ Bindings: GTMHandlerBindings }> {
   const app = new Hono<{ Bindings: GTMHandlerBindings }>();
 
   app.post('/gtm/leads', async (c) => {
@@ -442,6 +477,67 @@ export function createGtmHandler(service: GTMService): Hono<{ Bindings: GTMHandl
       );
     } catch (error) {
       return handleUnexpectedError(c, error);
+    }
+  });
+
+  app.post('/gtm/internal/discovery', async (c) => {
+    const authError = requireInternalAuth(c);
+    if (authError) {
+      return authError;
+    }
+
+    const body = await readJsonBody<unknown>(c);
+    if (!body) {
+      return jsonError(c, 'Invalid JSON body', 400);
+    }
+
+    let parsedInput;
+    try {
+      parsedInput = parseLeadDiscoveryInput(body);
+    } catch (error) {
+      logError('gtm_internal_discovery_invalid_input', error);
+      return jsonError(c, 'Invalid discovery request body', 400);
+    }
+
+    if (!agentDependencies.runLeadDiscovery) {
+      return c.json(
+        {
+          agent_status: 'fallback',
+          candidates: [],
+          limitations: ['Lead discovery agent is not configured'],
+        },
+        200
+      );
+    }
+
+    try {
+      const result = await withTimeout(
+        agentDependencies.runLeadDiscovery(parsedInput),
+        AGENT_TIMEOUT_MS,
+        'lead discovery agent'
+      );
+
+      return c.json(
+        {
+          agent_status: 'ok',
+          candidates: result.candidates,
+          limitations: result.limitations,
+        },
+        200
+      );
+    } catch (error) {
+      logError('gtm_internal_discovery_fallback', error, {
+        fallback: 'empty_discovery_result',
+      });
+
+      return c.json(
+        {
+          agent_status: 'fallback',
+          candidates: [],
+          limitations: ['Lead discovery agent failed; returned empty fallback result'],
+        },
+        200
+      );
     }
   });
 

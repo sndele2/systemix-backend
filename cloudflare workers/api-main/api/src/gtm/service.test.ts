@@ -374,6 +374,7 @@ function createService(options = {}) {
       replyClassifier,
       config,
       inboxProvider,
+      agentHooks: options.agentHooks,
     }),
   };
 }
@@ -419,6 +420,46 @@ test('startSequence moves a pending lead to active without sending', async () =>
   assert.equal(emailClient.calls.length, 0);
 });
 
+test('startSequence leaves a lead pending when the lead-review agent rejects activation', async () => {
+  const { service, store } = createService({
+    agentHooks: {
+      async reviewLead() {
+        return {
+          decision: 'reject',
+          score: 18,
+          outreachAngle: 'no_fit',
+          reasoning: 'Not a fit for missed-call recovery outreach.',
+          riskFlags: ['insufficient_signal'],
+        };
+      },
+    },
+  });
+  store.seedLead(buildLead());
+
+  assert.deepEqual(await service.startSequence('lead-123'), {
+    ok: false,
+    error: 'Lead review rejected activation: Not a fit for missed-call recovery outreach.',
+  });
+  assert.equal(store.leads.get('lead-123').status, 'pending');
+});
+
+test('startSequence fails open when the lead-review agent errors', async () => {
+  const { service, store } = createService({
+    agentHooks: {
+      async reviewLead() {
+        throw new Error('review unavailable');
+      },
+    },
+  });
+  store.seedLead(buildLead());
+
+  assert.deepEqual(await service.startSequence('lead-123'), {
+    ok: true,
+    value: undefined,
+  });
+  assert.equal(store.leads.get('lead-123').status, 'active');
+});
+
 test('prepareNextAction is read-only and returns the rendered send action', async () => {
   const { service, store } = createService();
   store.seedLead(buildLead({ status: 'active' }));
@@ -432,6 +473,23 @@ test('prepareNextAction is read-only and returns the rendered send action', asyn
     store.calls.map((entry) => entry.method),
     ['getLeadById', 'listTouchpointsByLeadId']
   );
+});
+
+test('prepareNextAction falls back to renderTemplate when the outreach writer fails', async () => {
+  const { service, store } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        throw new Error('writer unavailable');
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  const result = await service.prepareNextAction('lead-123');
+  assert.equal(result.ok, true);
+  assert.equal(result.value.action, 'send');
+  assert.match(result.value.subject, /Jordan/);
+  assert.match(result.value.body, /You called recently/);
 });
 
 test('advanceLeadSequence persists the touchpoint before the email call and then updates the lead', async () => {
@@ -542,6 +600,25 @@ test('recordReply always stops the lead even if classification fails', async () 
     ok: true,
     value: {
       classification: 'unknown',
+    },
+  });
+  assert.equal(store.leads.get('lead-123').status, 'replied');
+});
+
+test('recordReply still returns the deterministic result when the reply interpreter fails', async () => {
+  const { service, store } = createService({
+    agentHooks: {
+      async interpretReply() {
+        throw new Error('interpreter unavailable');
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  assert.deepEqual(await service.recordReply('lead-123', 'Please call me back'), {
+    ok: true,
+    value: {
+      classification: 'reply_detected',
     },
   });
   assert.equal(store.leads.get('lead-123').status, 'replied');
