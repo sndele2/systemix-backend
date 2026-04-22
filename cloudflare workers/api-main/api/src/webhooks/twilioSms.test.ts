@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  isGtmApprovalOwnerCommand,
   hasRecentInboundMessageDuplicate,
   normalizeInboundMessageBodyForDedup,
   parseOwnerCommand,
+  resolveOwnerCommandSendOutcome,
   shouldSendOwnerLeadNotification,
 } from './twilioSms.ts';
 
@@ -124,4 +126,36 @@ test('parseOwnerCommand recognizes GTM approval replies', () => {
     type: 'GTM_REJECT',
     approvalCode: 'ZXCV1234',
   });
+});
+
+test('isGtmApprovalOwnerCommand only matches GTM approval commands', () => {
+  assert.equal(isGtmApprovalOwnerCommand({ type: 'GTM_APPROVE', approvalCode: 'ABC12345' }), true);
+  assert.equal(isGtmApprovalOwnerCommand({ type: 'GTM_REJECT', approvalCode: 'ABC12345' }), true);
+  assert.equal(isGtmApprovalOwnerCommand({ type: 'HISTORY' }), false);
+});
+
+test('resolveOwnerCommandSendOutcome keeps GTM approval commands successful when confirmation SMS fails', () => {
+  assert.deepEqual(
+    resolveOwnerCommandSendOutcome({
+      command: { type: 'GTM_APPROVE', approvalCode: 'ABC12345' },
+      sendResult: { ok: false, detail: 'twilio_down' },
+    }),
+    {
+      ok: true,
+      responseDelivery: 'failed',
+      responseSid: null,
+    }
+  );
+
+  assert.deepEqual(
+    resolveOwnerCommandSendOutcome({
+      command: { type: 'HISTORY' },
+      sendResult: { ok: false, detail: 'twilio_down' },
+    }),
+    {
+      ok: false,
+      responseDelivery: 'failed',
+      responseSid: null,
+    }
+  );
 });

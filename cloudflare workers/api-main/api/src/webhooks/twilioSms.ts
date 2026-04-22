@@ -1,5 +1,9 @@
 import type { Context } from 'hono';
-import { createTwilioRestClient, type TwilioRestClient } from '../core/sms.ts';
+import {
+  createTwilioRestClient,
+  type TwilioRestClient,
+  type TwilioSendResult,
+} from '../core/sms.ts';
 import { createLogger, type StructuredLogContext } from '../core/logging.ts';
 import { checkTwilioSignature, formDataToParams } from '../core/twilioSignature.ts';
 import { syncToHubspot as syncHubspotContact } from '../services/hubspot.ts';
@@ -78,6 +82,7 @@ const ALERT_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const ACTIVE_THREAD_WINDOW_MS = 5 * 60 * 1000;
 const INBOUND_SMS_DEDUP_WINDOW_SECONDS = 10;
 const MAX_SMS_BODY = 1500;
+const GTM_INTERNAL_OPERATOR_PHONE = '+12179912895';
 const OWNER_THREAD_PREFIX = 'owner:';
 const LINE_STATE_SENTINEL = '__line_state__';
 const FORCED_HUBSPOT_SYNC_CUSTOMER = '+18443217137';
@@ -1574,6 +1579,47 @@ export function parseOwnerCommand(messageBody: string): OwnerCommand | null {
   return null;
 }
 
+export function isGtmApprovalOwnerCommand(
+  command: OwnerCommand
+): command is Extract<OwnerCommand, { type: 'GTM_APPROVE' | 'GTM_REJECT' }> {
+  return command.type === 'GTM_APPROVE' || command.type === 'GTM_REJECT';
+}
+
+function isDirectGtmOperatorPhone(phoneNumber: string): boolean {
+  return normalizePhone(phoneNumber) === GTM_INTERNAL_OPERATOR_PHONE;
+}
+
+export function resolveOwnerCommandSendOutcome(input: {
+  command: OwnerCommand;
+  sendResult: TwilioSendResult;
+}): {
+  ok: boolean;
+  responseDelivery: 'sent' | 'suppressed' | 'failed';
+  responseSid: string | null;
+} {
+  if (!input.sendResult.ok) {
+    return {
+      ok: isGtmApprovalOwnerCommand(input.command),
+      responseDelivery: 'failed',
+      responseSid: null,
+    };
+  }
+
+  if (isSmsSuppressed(input.sendResult)) {
+    return {
+      ok: true,
+      responseDelivery: 'suppressed',
+      responseSid: null,
+    };
+  }
+
+  return {
+    ok: true,
+    responseDelivery: 'sent',
+    responseSid: input.sendResult.sid || null,
+  };
+}
+
 export async function resolveGtmApprovalOwnerCommand(input: {
   env: Pick<Bindings, 'GTM_DB'>;
   command: Extract<OwnerCommand, { type: 'GTM_APPROVE' | 'GTM_REJECT' }>;
@@ -1675,7 +1721,12 @@ async function handleOwnerCommand(input: {
   inboundBody: string;
   providerMessageId: string;
   twilioClient: TwilioRestClient;
-}): Promise<{ ok: boolean; command: string; responseSid: string | null }> {
+}): Promise<{
+  ok: boolean;
+  command: string;
+  responseDelivery: 'sent' | 'suppressed' | 'failed';
+  responseSid: string | null;
+}> {
   const ownerThreadId = getOwnerThreadId(input.businessNumber);
 
   await logSwitchboardMessage(input.env, {
@@ -1798,6 +1849,10 @@ async function handleOwnerCommand(input: {
     fromPhone: input.businessNumber,
     body: sanitizeForSms(responseBody),
   });
+  const sendOutcome = resolveOwnerCommandSendOutcome({
+    command: input.command,
+    sendResult,
+  });
 
   if (!sendResult.ok) {
     twilioLog.error('Owner command response failed', {
@@ -1811,7 +1866,12 @@ async function handleOwnerCommand(input: {
         detail: sendResult.detail || 'unknown',
       },
     });
-    return { ok: false, command: input.command.type, responseSid: null };
+    return {
+      ok: sendOutcome.ok,
+      command: input.command.type,
+      responseDelivery: sendOutcome.responseDelivery,
+      responseSid: sendOutcome.responseSid,
+    };
   }
 
   if (isSmsSuppressed(sendResult)) {
@@ -1825,7 +1885,12 @@ async function handleOwnerCommand(input: {
         command: input.command.type,
       },
     });
-    return { ok: true, command: input.command.type, responseSid: null };
+    return {
+      ok: true,
+      command: input.command.type,
+      responseDelivery: sendOutcome.responseDelivery,
+      responseSid: sendOutcome.responseSid,
+    };
   }
 
   await saveOutboundSms(
@@ -1855,7 +1920,12 @@ async function handleOwnerCommand(input: {
     },
   });
 
-  return { ok: true, command: input.command.type, responseSid: sendResult.sid || null };
+  return {
+    ok: true,
+    command: input.command.type,
+    responseDelivery: sendOutcome.responseDelivery,
+    responseSid: sendOutcome.responseSid,
+  };
 }
 
 async function handleOwnerRelay(input: {
@@ -3927,6 +3997,44 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
       return respondWithEmptyTwiml(c);
     }
 
+    const directGtmCommand = parseOwnerCommand(body);
+    if (
+      directGtmCommand &&
+      isGtmApprovalOwnerCommand(directGtmCommand) &&
+      isDirectGtmOperatorPhone(inboundFrom)
+    ) {
+      const savedInbound = await saveInboundSms(c.env, inboundFrom, inboundTo, body, providerMessageId, rawJson);
+      if (!savedInbound.saved) {
+        return respondWithEmptyTwiml(c);
+      }
+
+      const commandResult = await handleOwnerCommand({
+        env: c.env,
+        command: directGtmCommand,
+        businessNumber: inboundTo,
+        ownerPhone: inboundFrom,
+        inboundBody: body,
+        providerMessageId,
+        twilioClient,
+      });
+
+      if (!commandResult.ok) {
+        return c.json({ ok: false, error: 'owner_command_failed', command: directGtmCommand.type }, 200);
+      }
+
+      return c.json(
+        {
+          ok: true,
+          mode: 'owner_proxy',
+          handledAs: 'owner_command',
+          command: commandResult.command,
+          responseDelivery: commandResult.responseDelivery,
+          responseSid: commandResult.responseSid,
+        },
+        200
+      );
+    }
+
     const route: 'owner_proxy' | 'customer_analysis' =
       ownerPhone && phonesEqual(inboundFrom, ownerPhone) && !isForcedTestLead
         ? 'owner_proxy'
@@ -4023,6 +4131,7 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
             mode: 'owner_proxy',
             handledAs: 'owner_command',
             command: commandResult.command,
+            responseDelivery: commandResult.responseDelivery,
             responseSid: commandResult.responseSid,
           },
           200

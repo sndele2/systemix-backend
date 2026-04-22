@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { hashInternalPassword } from './core/internal-auth.ts';
-import { createWorker } from './index.ts';
+import {
+  buildGtmApprovalSmsBody,
+  createRuntimeGtmApprovalHooks,
+  createWorker,
+  resolveGtmApprovalNotificationTarget,
+} from './index.ts';
 
 const executionCtx = {
   passThroughOnException() {},
@@ -162,6 +167,89 @@ class MockUserStore {
   }
 }
 
+function normalizeSql(sql) {
+  return sql.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+class MockApprovalPreparedStatement {
+  constructor(db, sql) {
+    this.db = db;
+    this.sql = sql;
+    this.boundArgs = [];
+  }
+
+  bind(...args) {
+    this.boundArgs = args;
+    return this;
+  }
+
+  async first() {
+    return this.db.handleFirst(this.sql, this.boundArgs);
+  }
+
+  async all() {
+    return this.db.handleAll(this.sql, this.boundArgs);
+  }
+
+  async run() {
+    return this.db.handleRun(this.sql, this.boundArgs);
+  }
+}
+
+class MockApprovalDatabase {
+  constructor({ businesses = [] } = {}) {
+    this.businesses = businesses;
+  }
+
+  prepare(sql) {
+    return new MockApprovalPreparedStatement(this, sql);
+  }
+
+  async handleFirst(sql, args) {
+    const normalized = normalizeSql(sql);
+
+    if (normalized.includes('from businesses') && normalized.includes('where business_number = ?')) {
+      const businessNumber = args[0];
+      return this.businesses.find((row) => row.business_number === businessNumber && row.is_active === 1) ?? null;
+    }
+
+    if (normalized.includes('from businesses') && normalized.includes('where owner_phone_number = ?')) {
+      const ownerPhone = args[0];
+      return this.businesses.find((row) => row.owner_phone_number === ownerPhone && row.is_active === 1) ?? null;
+    }
+
+    if (normalized.includes('from sms_opt_outs')) {
+      return null;
+    }
+
+    if (normalized.includes('from missed_call_ignored_numbers')) {
+      return null;
+    }
+
+    return null;
+  }
+
+  async handleAll(sql) {
+    const normalized = normalizeSql(sql);
+
+    if (normalized.includes('from businesses') && normalized.includes('where is_active = 1')) {
+      return {
+        results: this.businesses.filter((row) => row.is_active === 1).slice(0, 2),
+      };
+    }
+
+    return { results: [] };
+  }
+
+  async handleRun() {
+    return {
+      meta: {
+        changes: 1,
+      },
+    };
+  }
+}
+
 function createGtmServiceStub() {
   return {
     async syncAndListReplies() {
@@ -205,9 +293,13 @@ function createEnv(overrides = {}) {
   return {
     ALLOWED_ORIGIN: 'https://systemix.lovable.app',
     GTM_DB: {},
+    SYSTEMIX: {},
     INTERNAL_INBOX_PASSWORD: 'operator-secret',
     SESSION_SECRET: 'temporary-session-secret-that-is-long-enough',
     SYSTEMIX_NUMBER: '+18443217137',
+    TWILIO_ACCOUNT_SID: 'twilio-account',
+    TWILIO_AUTH_TOKEN: 'twilio-token',
+    TWILIO_PHONE_NUMBER: '+18443217137',
     ...overrides,
   };
 }
@@ -461,6 +553,7 @@ test('owner sessions can create operator users with separate passwords', async (
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        Authorization: 'Bearer internal-secret',
         Cookie: cookie,
         Origin: env.ALLOWED_ORIGIN,
       },
@@ -693,6 +786,10 @@ test('internal preflight rejects origins that do not exactly match ALLOWED_ORIGI
 test('internal GTM test route still requires header auth outside the cookie middleware scope', async () => {
   const sessionStore = new MockSessionStore();
   const userStore = new MockUserStore();
+  await userStore.seedUser({
+    username: 'owner',
+    displayName: 'Systemix Owner',
+  });
   const worker = createTestWorker(sessionStore, userStore);
   const env = createEnv({
     ENVIRONMENT: 'local',
@@ -704,6 +801,7 @@ test('internal GTM test route still requires header auth outside the cookie midd
     GTM_DRY_RUN: 'true',
     SMTP_USER: 'mailbox@example.com',
   });
+  const { cookie } = await loginAndCaptureCookie(worker, env);
 
   const unauthorizedResponse = await worker.fetch(
     new Request('http://example.com/v1/internal/gtm/send-test-email', {
@@ -721,6 +819,7 @@ test('internal GTM test route still requires header auth outside the cookie midd
 
   assert.equal(unauthorizedResponse.status, 401);
   assert.deepEqual(await unauthorizedResponse.json(), {
+    ok: false,
     error: 'Unauthorized',
   });
 
@@ -730,6 +829,8 @@ test('internal GTM test route still requires header auth outside the cookie midd
       headers: {
         'Content-Type': 'application/json',
         Authorization: 'Bearer internal-secret',
+        Cookie: cookie,
+        Origin: env.ALLOWED_ORIGIN,
       },
       body: JSON.stringify({
         toEmail: 'test-recipient@example.com',
@@ -743,4 +844,133 @@ test('internal GTM test route still requires header auth outside the cookie midd
   const json = await authorizedResponse.json();
   assert.equal(json.success, true);
   assert.equal(json.dryRun, true);
+});
+
+test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
+  const body = buildGtmApprovalSmsBody(
+    {
+      displayName: 'Test Roofer',
+    },
+    {
+      approval: {
+        id: 'approval-1',
+        approval_code: 'ABC12345',
+      },
+      lead: {
+        id: 'lead-123',
+        name: 'Jordan',
+      },
+      preparedAction: {
+        action: 'send',
+        stage: {
+          stageIndex: 1,
+        },
+        subject: 'Jordan, wanted to follow up on the missed call and open job',
+      },
+    }
+  );
+
+  assert.match(body, /ABC12345/);
+  assert.match(body, /Test Roofer/);
+  assert.match(body, /lead-123/);
+  assert.match(body, /touch 2/);
+  assert.match(body, /Reply YES ABC12345 or NO ABC12345/);
+});
+
+test('resolveGtmApprovalNotificationTarget fails closed to the fixed GTM operator number', async () => {
+  const env = createEnv({
+    SYSTEMIX: new MockApprovalDatabase({
+      businesses: [
+        {
+          business_number: '+18001234567',
+          owner_phone_number: '+12179912895',
+          display_name: 'Test Roofer',
+          is_active: 1,
+        },
+      ],
+    }),
+  });
+
+  const target = await resolveGtmApprovalNotificationTarget(env, {
+    approval: {
+      id: 'approval-1',
+      approval_code: 'ABC12345',
+    },
+    lead: {
+      id: 'lead-123',
+      name: 'Jordan',
+      metadata: {},
+    },
+    preparedAction: {
+      action: 'send',
+      stage: {
+        stageIndex: 0,
+      },
+      subject: 'Jordan, wanted to follow up on your missed call',
+    },
+  });
+
+  assert.deepEqual(target, {
+    businessNumber: '+18443217137',
+    displayName: 'Systemix GTM',
+    ownerPhone: '+12179912895',
+  });
+});
+
+test('createRuntimeGtmApprovalHooks sends an approval SMS through the runtime twilio client', async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchCalls = [];
+
+  globalThis.fetch = async (url, init = {}) => {
+    fetchCalls.push({ url, init });
+    return new Response(JSON.stringify({ sid: 'SM_APPROVAL_1' }), {
+      status: 201,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  };
+
+  try {
+    const env = createEnv({
+      SYSTEMIX: new MockApprovalDatabase({
+        businesses: [
+          {
+            business_number: '+18001234567',
+            owner_phone_number: '+12179912895',
+            display_name: 'Test Roofer',
+            is_active: 1,
+          },
+        ],
+      }),
+    });
+
+    const hooks = createRuntimeGtmApprovalHooks(env);
+    await hooks.requestApproval({
+      approval: {
+        id: 'approval-1',
+        approval_code: 'ABC12345',
+      },
+      lead: {
+        id: 'lead-123',
+        name: 'Jordan',
+        metadata: {},
+      },
+      preparedAction: {
+        action: 'send',
+        stage: {
+          stageIndex: 0,
+        },
+        subject: 'Jordan, wanted to follow up on your missed call',
+      },
+    });
+
+    assert.equal(fetchCalls.length, 1);
+    assert.match(String(fetchCalls[0].url), /Messages\.json/);
+    assert.match(String(fetchCalls[0].init.body), /To=%2B12179912895/);
+    assert.match(String(fetchCalls[0].init.body), /From=%2B18443217137/);
+    assert.match(String(fetchCalls[0].init.body), /YES\+ABC12345\+or\+NO\+ABC12345/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

@@ -20,6 +20,7 @@ export type TwilioSendInput = {
   body: string;
   businessNumber?: string;
   skipOptOutCheck?: boolean;
+  skipIgnoredNumberCheck?: boolean;
 };
 
 export type TwilioSendResult = {
@@ -54,8 +55,13 @@ async function dispatchTwilioSms(
   env: TwilioSmsEnv,
   input: TwilioSendInput
 ): Promise<TwilioSendResult> {
-  await ensureSmsComplianceSchema(env.SYSTEMIX);
-  await ensureCustomerMissedCallSchema(env.SYSTEMIX);
+  if (!input.skipOptOutCheck) {
+    await ensureSmsComplianceSchema(env.SYSTEMIX);
+  }
+
+  if (!input.skipIgnoredNumberCheck) {
+    await ensureCustomerMissedCallSchema(env.SYSTEMIX);
+  }
 
   const fromPhone = normalizePhone(input.fromPhone) || input.fromPhone.trim();
   const toPhone = normalizePhone(input.toPhone) || input.toPhone.trim();
@@ -84,7 +90,11 @@ async function dispatchTwilioSms(
     };
   }
 
-  if (businessNumber && (await isMissedCallNumberIgnored(env.SYSTEMIX, businessNumber, toPhone))) {
+  if (
+    !input.skipIgnoredNumberCheck &&
+    businessNumber &&
+    (await isMissedCallNumberIgnored(env.SYSTEMIX, businessNumber, toPhone))
+  ) {
     twilioLog.log('Outbound SMS suppressed because recipient is ignored for missed-call follow-up', {
       context: {
         handler: 'dispatchTwilioSms',

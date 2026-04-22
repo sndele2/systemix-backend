@@ -21,12 +21,15 @@ import {
   type Result as AuthResult,
 } from './core/internal-auth.ts';
 import { createLogger } from './core/logging.ts';
+import { createTwilioRestClient } from './core/sms.ts';
 import { resolveGtmConfigFromEnv, sendGtmTestEmail } from './gtm/email-client.ts';
 import { MicrosoftGraphInboxProvider } from './gtm/inbox-client.ts';
 import {
+  createGtmInternalFlowHandler,
   createGtmInternalRepliesHandler,
   createRuntimeGtmService,
 } from './gtm/index.ts';
+import type { ApprovalNotificationRequest, GTMServiceApprovalHooks } from './gtm/service.ts';
 import {
   createInternalInboxHandler,
   D1InternalInboxProvider,
@@ -110,6 +113,8 @@ interface RuntimeDependencies {
 }
 
 const routerLog = createLogger('[ROUTER]', 'router');
+const GTM_APPROVAL_SMS_SUMMARY_LIMIT = 56;
+const GTM_INTERNAL_OPERATOR_PHONE = '+12179912895';
 
 const REQUIRED_BINDINGS = [
   'FALLBACK_AGENT_NUMBER',
@@ -192,7 +197,7 @@ function isProtectedInternalOperatorRoute(pathname: string): boolean {
   return (
     pathname.startsWith('/v1/internal/auth/') ||
     pathname.startsWith('/v1/internal/inbox/') ||
-    pathname.startsWith('/v1/internal/gtm/replies')
+    pathname.startsWith('/v1/internal/gtm/')
   );
 }
 
@@ -242,6 +247,278 @@ function resolveRequestedRole(value: unknown, fallbackRole: InternalUserRole): A
   return {
     ok: false,
     error: 'role must be owner or operator',
+  };
+}
+
+type GtmApprovalNotificationTarget = {
+  businessNumber: string;
+  displayName: string;
+  ownerPhone: string;
+};
+
+function normalizeApprovalSummary(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= GTM_APPROVAL_SMS_SUMMARY_LIMIT) {
+    return normalized;
+  }
+
+  return normalized.slice(0, GTM_APPROVAL_SMS_SUMMARY_LIMIT - 3).trimEnd() + '...';
+}
+
+function resolveApprovalNotificationSenderNumber(
+  env: Pick<Bindings, 'TWILIO_PHONE_NUMBER' | 'SYSTEMIX_NUMBER'>,
+  target: Pick<GtmApprovalNotificationTarget, 'businessNumber'>
+): string {
+  return (
+    normalizePhone(env.TWILIO_PHONE_NUMBER || '') ||
+    normalizePhone(env.SYSTEMIX_NUMBER || '') ||
+    target.businessNumber
+  );
+}
+
+function readLeadBusinessNumber(lead: ApprovalNotificationRequest['lead']): string | null {
+  const metadata = lead.metadata;
+  if (!metadata || typeof metadata !== 'object') {
+    return null;
+  }
+
+  const candidate =
+    typeof metadata.businessNumber === 'string'
+      ? metadata.businessNumber
+      : typeof metadata.business_number === 'string'
+        ? metadata.business_number
+        : null;
+
+  return normalizePhone(candidate || '');
+}
+
+async function findActiveBusinessByNumber(
+  env: Pick<Bindings, 'SYSTEMIX'>,
+  businessNumber: string
+): Promise<GtmApprovalNotificationTarget | null> {
+  const normalizedBusinessNumber = normalizePhone(businessNumber);
+  if (!normalizedBusinessNumber) {
+    return null;
+  }
+
+  const row = await env.SYSTEMIX
+    .prepare(
+      `
+      SELECT business_number, owner_phone_number, display_name
+      FROM businesses
+      WHERE business_number = ?
+        AND is_active = 1
+      LIMIT 1
+    `
+    )
+    .bind(normalizedBusinessNumber)
+    .first<{ business_number?: string; owner_phone_number?: string | null; display_name?: string | null }>();
+
+  if (!row?.business_number) {
+    return null;
+  }
+
+  const ownerPhone = normalizePhone(row.owner_phone_number || '');
+  if (!ownerPhone) {
+    return null;
+  }
+
+  return {
+    businessNumber: normalizePhone(row.business_number) || normalizedBusinessNumber,
+    displayName: (row.display_name || '').trim() || 'Systemix',
+    ownerPhone,
+  };
+}
+
+async function findActiveBusinessByOwnerPhone(
+  env: Pick<Bindings, 'SYSTEMIX'>,
+  ownerPhone: string
+): Promise<GtmApprovalNotificationTarget | null> {
+  const normalizedOwnerPhone = normalizePhone(ownerPhone);
+  if (!normalizedOwnerPhone) {
+    return null;
+  }
+
+  const row = await env.SYSTEMIX
+    .prepare(
+      `
+      SELECT business_number, owner_phone_number, display_name
+      FROM businesses
+      WHERE owner_phone_number = ?
+        AND is_active = 1
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `
+    )
+    .bind(normalizedOwnerPhone)
+    .first<{ business_number?: string; owner_phone_number?: string | null; display_name?: string | null }>();
+
+  if (!row?.business_number) {
+    return null;
+  }
+
+  return {
+    businessNumber: normalizePhone(row.business_number) || '',
+    displayName: (row.display_name || '').trim() || 'Systemix',
+    ownerPhone: normalizedOwnerPhone,
+  };
+}
+
+async function findSingleActiveBusiness(
+  env: Pick<Bindings, 'SYSTEMIX'>
+): Promise<GtmApprovalNotificationTarget | null> {
+  const rows = await env.SYSTEMIX
+    .prepare(
+      `
+      SELECT business_number, owner_phone_number, display_name
+      FROM businesses
+      WHERE is_active = 1
+      LIMIT 2
+    `
+    )
+    .all<{
+      business_number?: string;
+      owner_phone_number?: string | null;
+      display_name?: string | null;
+    }>();
+
+  if (!Array.isArray(rows.results) || rows.results.length !== 1) {
+    return null;
+  }
+
+  const row = rows.results[0];
+  const businessNumber = normalizePhone(row.business_number || '');
+  const ownerPhone = normalizePhone(row.owner_phone_number || '');
+  if (!businessNumber || !ownerPhone) {
+    return null;
+  }
+
+  return {
+    businessNumber,
+    displayName: (row.display_name || '').trim() || 'Systemix',
+    ownerPhone,
+  };
+}
+
+export async function resolveGtmApprovalNotificationTarget(
+  env: Pick<Bindings, 'SYSTEMIX' | 'SYSTEMIX_NUMBER' | 'TWILIO_PHONE_NUMBER' | 'GTM_FROM_NAME'>,
+  input: ApprovalNotificationRequest
+): Promise<GtmApprovalNotificationTarget | null> {
+  void input;
+
+  const senderNumber =
+    normalizePhone(env.TWILIO_PHONE_NUMBER || '') || normalizePhone(env.SYSTEMIX_NUMBER || '');
+  if (!senderNumber) {
+    return null;
+  }
+
+  return {
+    businessNumber: senderNumber,
+    displayName: env.GTM_FROM_NAME?.trim() || 'Systemix GTM',
+    ownerPhone: GTM_INTERNAL_OPERATOR_PHONE,
+  };
+}
+
+export function buildGtmApprovalSmsBody(
+  target: Pick<GtmApprovalNotificationTarget, 'displayName'>,
+  input: ApprovalNotificationRequest
+): string {
+  const businessLabel = target.displayName.trim() || 'Systemix';
+  const leadLabel = input.lead.id.trim() || 'unknown-lead';
+  const touchNumber = input.preparedAction.stage.stageIndex + 1;
+  const summary = normalizeApprovalSummary(input.preparedAction.subject || input.preparedAction.body);
+  const approvalCode = input.approval.approval_code;
+
+  return (
+    `Systemix approval ${approvalCode}. ${businessLabel}, lead ${leadLabel}, ` +
+    `touch ${touchNumber}. ${summary}. Reply YES ${approvalCode} or NO ${approvalCode}.`
+  );
+}
+
+export function createRuntimeGtmApprovalHooks(
+  env: Bindings
+): GTMServiceApprovalHooks {
+  return {
+    async requestApproval(input: ApprovalNotificationRequest): Promise<void> {
+      const target = await resolveGtmApprovalNotificationTarget(env, input);
+      if (!target) {
+        throw new Error('GTM approval notification target is not configured');
+      }
+
+      const twilioClient = createTwilioRestClient(env);
+      if (!twilioClient) {
+        throw new Error('Twilio approval notification client is unavailable');
+      }
+
+      const body = buildGtmApprovalSmsBody(target, input);
+      const senderNumber = resolveApprovalNotificationSenderNumber(env, target);
+      const sendResult = await twilioClient.sendSms({
+        toPhone: target.ownerPhone,
+        fromPhone: senderNumber,
+        businessNumber: target.businessNumber,
+        body,
+        skipOptOutCheck: true,
+        skipIgnoredNumberCheck: true,
+      });
+
+      if (!sendResult.ok) {
+        routerLog.error('GTM approval SMS failed', {
+          context: {
+            handler: 'createRuntimeGtmApprovalHooks',
+            fromNumber: senderNumber,
+            toNumber: target.ownerPhone,
+          },
+          data: {
+            system: 'gtm',
+            environment: env.ENVIRONMENT ?? 'unset',
+            approvalCode: input.approval.approval_code,
+            approvalId: input.approval.id,
+            leadId: input.lead.id,
+            stageIndex: input.preparedAction.stage.stageIndex,
+            messageSid: sendResult.sid || null,
+            detail: sendResult.detail || 'unknown',
+          },
+        });
+        throw new Error(sendResult.detail || 'Failed to send GTM approval SMS');
+      }
+
+      if (sendResult.suppressed) {
+        routerLog.error('GTM approval SMS suppressed', {
+          context: {
+            handler: 'createRuntimeGtmApprovalHooks',
+            fromNumber: senderNumber,
+            toNumber: target.ownerPhone,
+          },
+          data: {
+            system: 'gtm',
+            environment: env.ENVIRONMENT ?? 'unset',
+            approvalCode: input.approval.approval_code,
+            approvalId: input.approval.id,
+            leadId: input.lead.id,
+            stageIndex: input.preparedAction.stage.stageIndex,
+            messageSid: sendResult.sid || null,
+          },
+        });
+        throw new Error('GTM approval SMS was suppressed');
+      }
+
+      routerLog.log('GTM approval SMS sent', {
+        context: {
+          handler: 'createRuntimeGtmApprovalHooks',
+          fromNumber: senderNumber,
+          toNumber: target.ownerPhone,
+        },
+        data: {
+          system: 'gtm',
+          environment: env.ENVIRONMENT ?? 'unset',
+          approvalCode: input.approval.approval_code,
+          approvalId: input.approval.id,
+          leadId: input.lead.id,
+          stageIndex: input.preparedAction.stage.stageIndex,
+          messageSid: sendResult.sid || null,
+        },
+      });
+    },
   };
 }
 
@@ -925,7 +1202,12 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
     );
   });
 
-  const gtmServiceFactory = dependencies.gtmServiceFactory ?? createRuntimeGtmService;
+  const gtmServiceFactory =
+    dependencies.gtmServiceFactory ??
+    ((bindings: Parameters<typeof createRuntimeGtmService>[0]) =>
+      createRuntimeGtmService(bindings, {
+        approvalHooks: createRuntimeGtmApprovalHooks(bindings as Bindings),
+      }));
 
   app.route(
     '/',
@@ -933,6 +1215,13 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
       dependencies.inboxProviderFactory
         ? dependencies.inboxProviderFactory(bindings as Bindings)
         : new D1InternalInboxProvider(bindings)
+    )
+  );
+
+  app.route(
+    '/',
+    createGtmInternalFlowHandler((bindings) =>
+      gtmServiceFactory(bindings as Parameters<typeof createRuntimeGtmService>[0])
     )
   );
 
