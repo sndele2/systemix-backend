@@ -2,6 +2,7 @@ import type { AiLeadClassification } from './openai.ts';
 import { createLogger } from '../core/logging.ts';
 import type { TwilioRestClient } from '../core/sms.ts';
 import { prepareCustomerFacingSmsBody } from './smsCompliance.ts';
+import { completeWorkflowRun, failWorkflowRun, logWorkflowStep } from './workflow-trace.ts';
 import {
   buildMissedCallFollowUpMessage,
   createMissedCallConversation,
@@ -24,6 +25,11 @@ const OWNER_ALERT_SUMMARY_PREFIXES = [
   'Customer needs follow-up:',
 ] as const;
 
+type WorkflowTraceContext = {
+  requestId: string;
+  runId: string;
+};
+
 type OnboardNewLeadInput = {
   db: D1Database;
   twilioClient: TwilioRestClient;
@@ -36,6 +42,7 @@ type OnboardNewLeadInput = {
   rawStatus: string;
   callSid?: string;
   parentCallSid?: string;
+  trace?: WorkflowTraceContext | null;
 };
 
 type OnboardNewLeadResult =
@@ -233,7 +240,24 @@ export function scheduleTwilioBackgroundTask(
 }
 
 export async function onboardNewLead(input: OnboardNewLeadInput): Promise<OnboardNewLeadResult> {
+  const trace = input.trace || null;
   const normalizedBusinessNumber = normalizePhone(input.businessNumber) || MISSED_CALL_VOICE_HOOK_BUSINESS_NUMBER;
+  if (trace) {
+    await logWorkflowStep(input.db, {
+      requestId: trace.requestId,
+      runId: trace.runId,
+      stepName: 'request_normalized',
+      input: {
+        businessNumber: input.businessNumber,
+        callerNumber: input.callerNumber,
+        callStatus: input.callStatus,
+      },
+      output: {
+        businessNumber: normalizedBusinessNumber,
+      },
+    });
+  }
+
   const business = (await findBusinessByNumber(input.db, normalizedBusinessNumber)) || {
     business_number: normalizedBusinessNumber,
     display_name: null,
@@ -243,6 +267,20 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
   const smsFrom = normalizePhone(input.smsFrom);
 
   if (!callerNumber) {
+    if (trace) {
+      await logWorkflowStep(input.db, {
+        requestId: trace.requestId,
+        runId: trace.runId,
+        stepName: 'request_validation',
+        status: 'error',
+        errorText: 'missing_sms_to',
+      });
+      await failWorkflowRun(input.db, {
+        requestId: trace.requestId,
+        runId: trace.runId,
+        errorText: 'missing_sms_to',
+      });
+    }
     return {
       ok: false,
       businessNumber: business.business_number,
@@ -251,6 +289,20 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
   }
 
   if (!smsFrom) {
+    if (trace) {
+      await logWorkflowStep(input.db, {
+        requestId: trace.requestId,
+        runId: trace.runId,
+        stepName: 'request_validation',
+        status: 'error',
+        errorText: 'missing_twilio_phone_number',
+      });
+      await failWorkflowRun(input.db, {
+        requestId: trace.requestId,
+        runId: trace.runId,
+        errorText: 'missing_twilio_phone_number',
+      });
+    }
     return {
       ok: false,
       businessNumber: business.business_number,
@@ -262,10 +314,32 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
     business.business_number,
     business.intake_question
   );
+  if (trace) {
+    await logWorkflowStep(input.db, {
+      requestId: trace.requestId,
+      runId: trace.runId,
+      stepName: 'lead_lookup_or_create',
+      output: {
+        businessNumber: business.business_number,
+        hasDisplayName: Boolean(business.display_name),
+      },
+    });
+  }
   await createMissedCallConversation(input.db, {
     businessNumber: business.business_number,
     phoneNumber: callerNumber,
   });
+  if (trace) {
+    await logWorkflowStep(input.db, {
+      requestId: trace.requestId,
+      runId: trace.runId,
+      stepName: 'conversation_created',
+      output: {
+        businessNumber: business.business_number,
+        phoneNumber: callerNumber,
+      },
+    });
+  }
 
   await input.db
     .prepare(
@@ -304,6 +378,20 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
     callerNumber,
     followUpMessage
   );
+  if (trace) {
+    await logWorkflowStep(input.db, {
+      requestId: trace.requestId,
+      runId: trace.runId,
+      stepName: 'outbound_sms_attempt',
+      input: {
+        to: callerNumber,
+        from: smsFrom,
+      },
+      output: {
+        preview: preparedBody,
+      },
+    });
+  }
   const sms = await input.twilioClient.sendSms({
     toPhone: callerNumber,
     fromPhone: smsFrom,
@@ -312,6 +400,23 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
   });
 
   if (!sms.ok) {
+    if (trace) {
+      await logWorkflowStep(input.db, {
+        requestId: trace.requestId,
+        runId: trace.runId,
+        stepName: 'outbound_sms_result',
+        status: 'error',
+        output: {
+          detail: sms.detail || 'sms_failed',
+        },
+        errorText: sms.detail || 'sms_failed',
+      });
+      await failWorkflowRun(input.db, {
+        requestId: trace.requestId,
+        runId: trace.runId,
+        errorText: sms.detail || 'sms_failed',
+      });
+    }
     return {
       ok: false,
       businessNumber: business.business_number,
@@ -324,6 +429,18 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
       businessNumber: business.business_number,
       phoneNumber: callerNumber,
       smsContent: preparedBody,
+    });
+  }
+
+  if (trace) {
+    await logWorkflowStep(input.db, {
+      requestId: trace.requestId,
+      runId: trace.runId,
+      stepName: 'outbound_sms_result',
+      output: {
+        sid: sms.sid || null,
+        suppressed: Boolean(sms.suppressed),
+      },
     });
   }
 
@@ -343,6 +460,15 @@ export async function onboardNewLead(input: OnboardNewLeadInput): Promise<Onboar
       input.providerCallId
     )
     .run();
+
+  if (trace) {
+    await completeWorkflowRun(input.db, {
+      requestId: trace.requestId,
+      runId: trace.runId,
+      status: 'completed',
+      summary: 'missed-call follow-up SMS completed',
+    });
+  }
 
   return {
     ok: true,

@@ -12,6 +12,7 @@ import {
   ensureCustomerMissedCallSchema,
   recordMissedCallReply,
 } from '../services/missedCallRecovery.ts';
+import { completeWorkflowRun, failWorkflowRun, logWorkflowStep, startWorkflowRun } from '../services/workflow-trace.ts';
 import {
   buildBusinessOwnerAlertMessage,
   buildEmergencyPriorityMessage,
@@ -462,14 +463,64 @@ function buildMissedCallReplyTrackingTask(input: {
   body: string;
   providerMessageId: string;
 }): Promise<unknown> {
+  const requestId = (input.providerMessageId || crypto.randomUUID()).trim();
+
   return withLoggedBackgroundCatch(
     '[D1]',
     'Track missed-call reply',
-    recordMissedCallReply(input.env.SYSTEMIX, {
-      businessNumber: input.businessNumber,
-      phoneNumber: input.customerNumber,
-      replyText: input.body,
-    }).then(() => {
+    (async () => {
+      const runId = await startWorkflowRun(input.env.SYSTEMIX, {
+        requestId,
+        workflowName: 'missed_call_reply_handling',
+        businessNumber: input.businessNumber,
+        phoneNumber: input.customerNumber,
+        source: 'twilio_sms_webhook',
+        summary: 'Inbound customer reply received',
+      });
+
+      try {
+        await logWorkflowStep(input.env.SYSTEMIX, {
+          requestId,
+          runId,
+          stepName: 'inbound_customer_reply_received',
+          input: {
+            from: input.customerNumber,
+            to: input.businessNumber,
+            body: input.body,
+          },
+        });
+
+        await recordMissedCallReply(input.env.SYSTEMIX, {
+          businessNumber: input.businessNumber,
+          phoneNumber: input.customerNumber,
+          replyText: input.body,
+        });
+
+        await logWorkflowStep(input.env.SYSTEMIX, {
+          requestId,
+          runId,
+          stepName: 'reply_recorded',
+          output: {
+            recorded: true,
+          },
+        });
+
+        await completeWorkflowRun(input.env.SYSTEMIX, {
+          requestId,
+          runId,
+          status: 'completed',
+          summary: 'Missed-call reply stored',
+        });
+      } catch (error) {
+        await failWorkflowRun(input.env.SYSTEMIX, {
+          requestId,
+          runId,
+          errorText: error instanceof Error ? error.message : String(error),
+          summary: 'Missed-call reply tracking failed',
+        });
+        throw error;
+      }
+
       d1Log.log('Missed-call reply tracked', {
         context: {
           handler: 'buildMissedCallReplyTrackingTask',
@@ -479,7 +530,7 @@ function buildMissedCallReplyTrackingTask(input: {
         },
       });
       return true;
-    }),
+    })(),
     {
       context: {
         handler: 'buildMissedCallReplyTrackingTask',
