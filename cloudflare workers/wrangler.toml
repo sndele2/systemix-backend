@@ -1,6 +1,7 @@
 name = "systemix-backend"
 main = "api-main/api/src/index.ts"
 compatibility_date = "2026-01-26"
+compatibility_flags = ["nodejs_compat"]
 
 [triggers]
 crons = ["*/5 * * * *"]
@@ -49,6 +50,7 @@ WORKER_URL = "https://systemix-backend.sean-ndele.workers.dev"
 
 [env.production]
 name = "systemix-backend"
+compatibility_flags = ["nodejs_compat"]
 
 [env.production.vars]
 VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."

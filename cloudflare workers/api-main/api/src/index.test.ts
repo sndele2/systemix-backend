@@ -1,10 +1,12 @@
 // @ts-nocheck
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { hashInternalPassword } from './core/internal-auth.ts';
 import {
   buildGtmApprovalSmsBody,
+  createRuntimeGtmAgentHooks,
   createRuntimeGtmApprovalHooks,
   createWorker,
   resolveGtmApprovalNotificationTarget,
@@ -904,6 +906,8 @@ test('GTM live proof route requires the dedicated live test key and returns appr
         {
           approval_code: 'ABC12345',
           lead_id: leadId,
+          subject: 'Agent subject',
+          body: 'Agent body for the finalized GTM proposal.',
           status: 'pending',
           requested_at: '2026-04-22T23:00:00.000Z',
           notified_at: '2026-04-22T23:00:01.000Z',
@@ -943,7 +947,76 @@ test('GTM live proof route requires the dedicated live test key and returns appr
   assert.equal(json.action, 'skipped');
   assert.equal(json.reason, 'awaiting_approval');
   assert.equal(json.approvalCode, 'ABC12345');
+  assert.equal(json.proposalSubject, 'Agent subject');
+  assert.equal(json.proposalBody, 'Agent body for the finalized GTM proposal.');
   assert.match(json.leadId, /^gtm-live-proof-/);
+});
+
+test('createRuntimeGtmAgentHooks wires only the outreach writer runner', async () => {
+  const calls = [];
+  const hooks = createRuntimeGtmAgentHooks(
+    {
+      OPENAI_API_KEY: 'openai-key',
+      GTM_AGENT_MODEL: 'gtm-model',
+    },
+    async (input, options) => {
+      calls.push({ input, options });
+      return {
+        subject: 'Agent-built GTM subject',
+        body: 'Agent-built GTM body about missed revenue.',
+        variantLabel: 'test-agent',
+      };
+    }
+  );
+
+  assert.equal(typeof hooks.writeOutreach, 'function');
+  assert.equal(hooks.reviewLead, undefined);
+  assert.equal(hooks.interpretReply, undefined);
+
+  const output = await hooks.writeOutreach(
+    {
+      id: 'lead-123',
+      name: 'Test Roofing',
+      email: 'owner@testroofing.example',
+      phone: '+13125550199',
+      createdAt: '2026-04-22T23:00:00.000Z',
+      status: 'active',
+      touches_sent: 0,
+      metadata: {
+        source: 'manual_gtm',
+        city: 'Chicago',
+        industry: 'roofing',
+      },
+    },
+    {
+      stageIndex: 0,
+      delayHours: 0,
+      templateKey: 'missed-call-touch-1',
+    }
+  );
+
+  assert.equal(output.subject, 'Agent-built GTM subject');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.apiKey, 'openai-key');
+  assert.equal(calls[0].options.model, 'gtm-model');
+  assert.equal(calls[0].input.candidate.businessName, 'Test Roofing');
+  assert.equal(calls[0].input.candidate.city, 'Chicago');
+  assert.equal(calls[0].input.outreachAngle, 'lost_jobs_recovery');
+});
+
+test('customer-facing recovery routes do not import GTM agents', () => {
+  const recoveryRouteFiles = [
+    new URL('./webhooks/twilioVoice.ts', import.meta.url),
+    new URL('./webhooks/twilioStatus.ts', import.meta.url),
+    new URL('./webhooks/twilioSms.ts', import.meta.url),
+    new URL('./services/missedCallRecovery.ts', import.meta.url),
+    new URL('./services/processCall.ts', import.meta.url),
+  ];
+
+  for (const fileUrl of recoveryRouteFiles) {
+    const source = readFileSync(fileUrl, 'utf8');
+    assert.doesNotMatch(source, /gtm\/agents|agents\/runner|outreach-writer/);
+  }
 });
 
 test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
@@ -966,6 +1039,7 @@ test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
           stageIndex: 1,
         },
         subject: 'Jordan, wanted to follow up on the missed call and open job',
+        body: 'Finalized GTM proposal body from the writer.',
       },
     }
   );
@@ -974,6 +1048,7 @@ test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
   assert.match(body, /Test Roofer/);
   assert.match(body, /lead-123/);
   assert.match(body, /touch 2/);
+  assert.match(body, /Finalized GTM proposal|Jordan, wanted/);
   assert.match(body, /Reply YES ABC12345 or NO ABC12345/);
 });
 

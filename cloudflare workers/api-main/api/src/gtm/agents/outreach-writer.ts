@@ -48,11 +48,8 @@ export function createOutreachWriterAgent(
     model: options.model ?? DEFAULT_AGENT_MODEL,
     modelSettings: {
       temperature: 0.2,
-      reasoning: { effort: 'low' },
-      text: { verbosity: 'low' },
     },
     tools: options.tools ?? [],
     outputType: OutreachWriterOutputSchema,
   })
 }
-

@@ -2,7 +2,7 @@
  * Exposes the isolated GTM module surface so callers import only from this file.
  */
 export { EmailClient } from './email-client.ts';
-export { createGtmHandler, createGtmInternalRepliesHandler } from './handler.ts';
+export { createGtmHandler, createGtmInternalFlowHandler, createGtmInternalRepliesHandler } from './handler.ts';
 export { MicrosoftGraphInboxProvider } from './inbox-client.ts';
 export { DurableLeadStore } from './lead-store.ts';
 export { renderTemplate } from './prompts.ts';

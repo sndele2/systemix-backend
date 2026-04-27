@@ -617,3 +617,68 @@ export function createGtmInternalRepliesHandler(
 
   return app;
 }
+
+export function createGtmInternalFlowHandler(
+  serviceFactory: (bindings: GTMHandlerBindings) => GTMService
+): Hono<{ Bindings: GTMHandlerBindings }> {
+  const app = new Hono<{ Bindings: GTMHandlerBindings }>();
+
+  app.post('/v1/internal/gtm/leads', async (c) => {
+    if (!c.env?.GTM_DB) {
+      return jsonError(c, 'GTM_DB is not configured', 500);
+    }
+
+    const body = await readJsonBody<Lead>(c);
+    if (!body) {
+      return jsonError(c, 'Invalid JSON body', 400);
+    }
+
+    try {
+      const service = serviceFactory(c.env);
+      return respondWithResult(c, await service.createLead(body), 201);
+    } catch (error) {
+      return handleUnexpectedError(c, error);
+    }
+  });
+
+  app.post('/v1/internal/gtm/sequences/:leadId/start', async (c) => {
+    if (!c.env?.GTM_DB) {
+      return jsonError(c, 'GTM_DB is not configured', 500);
+    }
+
+    try {
+      const service = serviceFactory(c.env);
+      return respondWithResult(c, await service.startSequence(c.req.param('leadId')), 202);
+    } catch (error) {
+      return handleUnexpectedError(c, error);
+    }
+  });
+
+  app.get('/v1/internal/gtm/sequences/:leadId/next', async (c) => {
+    if (!c.env?.GTM_DB) {
+      return jsonError(c, 'GTM_DB is not configured', 500);
+    }
+
+    try {
+      const service = serviceFactory(c.env);
+      return respondWithResult(c, await service.prepareNextAction(c.req.param('leadId')), 200);
+    } catch (error) {
+      return handleUnexpectedError(c, error);
+    }
+  });
+
+  app.post('/v1/internal/gtm/sequences/:leadId/advance', async (c) => {
+    if (!c.env?.GTM_DB) {
+      return jsonError(c, 'GTM_DB is not configured', 500);
+    }
+
+    try {
+      const service = serviceFactory(c.env);
+      return respondWithResult(c, await service.advanceLeadSequence(c.req.param('leadId')), 202);
+    } catch (error) {
+      return handleUnexpectedError(c, error);
+    }
+  });
+
+  return app;
+}

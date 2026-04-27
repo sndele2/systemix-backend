@@ -23,13 +23,20 @@ import {
 import { createLogger } from './core/logging.ts';
 import { createTwilioRestClient } from './core/sms.ts';
 import { resolveGtmConfigFromEnv, sendGtmTestEmail } from './gtm/email-client.ts';
+import { runOutreachWriter } from './gtm/agents/runner.ts';
 import { MicrosoftGraphInboxProvider } from './gtm/inbox-client.ts';
 import {
   createGtmInternalFlowHandler,
   createGtmInternalRepliesHandler,
   createRuntimeGtmService,
 } from './gtm/index.ts';
-import type { ApprovalNotificationRequest, GTMServiceApprovalHooks } from './gtm/service.ts';
+import type {
+  ApprovalNotificationRequest,
+  GTMServiceAgentHooks,
+  GTMServiceApprovalHooks,
+} from './gtm/service.ts';
+import type { LeadRecord, EmailStage } from './gtm/types.ts';
+import type { OutreachWriterInput, OutreachWriterOutput } from './gtm/agents/schemas.ts';
 import {
   createInternalInboxHandler,
   D1InternalInboxProvider,
@@ -84,6 +91,7 @@ type Bindings = {
   FALLBACK_AGENT_NUMBER?: string;
   FALLBACK_NUMBER?: string;
   GTM_DRY_RUN?: string;
+  GTM_AGENT_MODEL?: string;
   GTM_FROM_EMAIL?: string;
   GTM_FROM_NAME?: string;
   GTM_MAX_TOUCHES?: string;
@@ -277,6 +285,58 @@ function resolveApprovalNotificationSenderNumber(
   );
 }
 
+type OutreachWriterRunner = (
+  input: OutreachWriterInput,
+  options: { apiKey?: string; model?: string }
+) => Promise<OutreachWriterOutput>;
+
+function readLeadMetadataString(lead: LeadRecord, key: string): string | undefined {
+  const value = lead.metadata?.[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): OutreachWriterInput {
+  const summary = readLeadMetadataString(lead, 'summary') ?? readLeadMetadataString(lead, 'notes');
+
+  return {
+    candidate: {
+      businessName: lead.name,
+      contactName: readLeadMetadataString(lead, 'contactName'),
+      website: readLeadMetadataString(lead, 'website'),
+      email: lead.email,
+      phone: lead.phone,
+      city: readLeadMetadataString(lead, 'city'),
+      state: readLeadMetadataString(lead, 'state'),
+      industry: readLeadMetadataString(lead, 'industry'),
+      source: readLeadMetadataString(lead, 'source'),
+      summary,
+    },
+    outreachAngle: 'lost_jobs_recovery',
+    businessContext:
+      'Internal GTM dry-run outreach for Systemix. Write only prospective outbound email copy; do not imply prior contact unless the lead metadata explicitly says warm or recovery.',
+    groundingFacts: [
+      'Systemix helps service businesses respond to missed calls.',
+      'The proposal is internal GTM copy only and must not send email.',
+      `This is sequence touch ${stage.stageIndex + 1}.`,
+    ],
+    maxWords: 70,
+  };
+}
+
+export function createRuntimeGtmAgentHooks(
+  env: Pick<Bindings, 'OPENAI_API_KEY' | 'GTM_AGENT_MODEL'>,
+  runner: OutreachWriterRunner = runOutreachWriter
+): GTMServiceAgentHooks {
+  return {
+    async writeOutreach(lead: LeadRecord, stage: EmailStage): Promise<OutreachWriterOutput> {
+      return runner(buildOutreachWriterInput(lead, stage), {
+        apiKey: env.OPENAI_API_KEY,
+        model: env.GTM_AGENT_MODEL,
+      });
+    },
+  };
+}
+
 function readLeadBusinessNumber(lead: ApprovalNotificationRequest['lead']): string | null {
   const metadata = lead.metadata;
   if (!metadata || typeof metadata !== 'object') {
@@ -427,7 +487,9 @@ export function buildGtmApprovalSmsBody(
   const businessLabel = target.displayName.trim() || 'Systemix';
   const leadLabel = input.lead.id.trim() || 'unknown-lead';
   const touchNumber = input.preparedAction.stage.stageIndex + 1;
-  const summary = normalizeApprovalSummary(input.preparedAction.subject || input.preparedAction.body);
+  const summary = normalizeApprovalSummary(
+    [input.preparedAction.subject, input.preparedAction.body].filter(Boolean).join(' - ')
+  );
   const approvalCode = input.approval.approval_code;
 
   return (
@@ -525,6 +587,8 @@ export function createRuntimeGtmApprovalHooks(
 
 type GtmApprovalProofRow = {
   approval_code: string;
+  subject: string;
+  body: string;
   status: string;
   requested_at: string;
   notified_at: string | null;
@@ -546,7 +610,7 @@ async function getLatestGtmApprovalForLead(
   const row = await database
     .prepare(
       `
-      SELECT approval_code, status, requested_at, notified_at
+      SELECT approval_code, subject, body, status, requested_at, notified_at
       FROM gtm_approvals
       WHERE lead_id = ?
       ORDER BY requested_at DESC
@@ -1305,6 +1369,8 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
         reason: advanceResult.value.reason ?? null,
         approvalCode: approval?.approval_code ?? null,
         approvalStatus: approval?.status ?? null,
+        proposalSubject: approval?.subject ?? null,
+        proposalBody: approval?.body ?? null,
         notifiedAt: approval?.notified_at ?? null,
       },
     });
@@ -1316,6 +1382,8 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
         action: advanceResult.value.action,
         reason: advanceResult.value.reason ?? null,
         approvalCode: approval?.approval_code ?? null,
+        proposalSubject: approval?.subject ?? null,
+        proposalBody: approval?.body ?? null,
       },
       200
     );
@@ -1325,6 +1393,7 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
     dependencies.gtmServiceFactory ??
     ((bindings: Parameters<typeof createRuntimeGtmService>[0]) =>
       createRuntimeGtmService(bindings, {
+        agentHooks: createRuntimeGtmAgentHooks(bindings as Bindings),
         approvalHooks: createRuntimeGtmApprovalHooks(bindings as Bindings),
       }));
 

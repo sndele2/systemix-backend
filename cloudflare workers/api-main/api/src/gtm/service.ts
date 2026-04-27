@@ -26,6 +26,7 @@ import type {
 } from './agents/schemas.ts';
 
 import { EmailClient } from './email-client.ts';
+import { parseOutreachWriterOutput } from './agents/schemas.ts';
 import { MicrosoftGraphInboxProvider } from './inbox-client.ts';
 import { DurableLeadStore } from './lead-store.ts';
 import { renderTemplate } from './prompts.ts';
@@ -40,9 +41,17 @@ const UNKNOWN_REPLY_CLASSIFICATION = 'unknown';
 const DEFAULT_SYNC_CURSOR = '1970-01-01T00:00:00.000Z';
 const MAX_SYNC_BATCH_SIZE = 50;
 const AGENT_TIMEOUT_MS = 12_000;
+const GTM_RUNTIME_LABEL = 'production';
+const COLD_OUTREACH_FORBIDDEN_PHRASES = [
+  'follow up on your call',
+  'calling back',
+  'as discussed',
+] as const;
 
 export interface GtmServiceRuntimeEnv {
   GTM_DB: D1Database;
+  OPENAI_API_KEY?: string;
+  GTM_AGENT_MODEL?: string;
   GTM_FROM_EMAIL?: string;
   GTM_FROM_NAME?: string;
   GTM_MAX_TOUCHES?: string;
@@ -201,6 +210,42 @@ function generateApprovalCode(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
 }
 
+function readMetadataString(lead: LeadRecord, key: string): string | null {
+  const value = lead.metadata?.[key];
+  return typeof value === 'string' ? value.trim() || null : null;
+}
+
+function isWarmOrRecoveryLead(lead: LeadRecord): boolean {
+  const source = readMetadataString(lead, 'source')?.toLowerCase() ?? '';
+  const leadTemperature = readMetadataString(lead, 'leadTemperature')?.toLowerCase() ?? '';
+  const gtmLeadTemperature = readMetadataString(lead, 'gtmLeadTemperature')?.toLowerCase() ?? '';
+
+  return (
+    source.includes('recovery') ||
+    source.includes('missed-call') ||
+    leadTemperature === 'warm' ||
+    leadTemperature === 'recovery' ||
+    gtmLeadTemperature === 'warm' ||
+    gtmLeadTemperature === 'recovery'
+  );
+}
+
+function findColdOutreachForbiddenPhrase(subject: string, body: string): string | null {
+  const normalized = `${subject}\n${body}`.toLowerCase();
+  return COLD_OUTREACH_FORBIDDEN_PHRASES.find((phrase) => normalized.includes(phrase)) ?? null;
+}
+
+function assertColdOutreachCopySafe(lead: LeadRecord, subject: string, body: string): void {
+  if (isWarmOrRecoveryLead(lead)) {
+    return;
+  }
+
+  const forbiddenPhrase = findColdOutreachForbiddenPhrase(subject, body);
+  if (forbiddenPhrase) {
+    throw new Error(`Cold GTM outreach cannot imply prior contact: ${forbiddenPhrase}`);
+  }
+}
+
 export function createRuntimeGtmService(
   env: GtmServiceRuntimeEnv,
   options: GTMServiceRuntimeOptions = {}
@@ -357,28 +402,47 @@ export class GTMService {
 
       if (this.agentHooks?.writeOutreach) {
         try {
-          const agentDraft = await withTimeout(
+          const rawAgentDraft = await withTimeout(
             this.agentHooks.writeOutreach(lead, decision.stage),
             AGENT_TIMEOUT_MS,
             'outreach writer agent'
           );
+          const agentDraft = parseOutreachWriterOutput(rawAgentDraft);
+          assertColdOutreachCopySafe(lead, agentDraft.subject, agentDraft.body);
 
           subject = agentDraft.subject;
           body = agentDraft.body;
-        } catch (error) {
-          logError('gtm_outreach_writer_fallback', error, {
+          logInfo('gtm_outreach_writer_completed', {
+            system: 'gtm',
+            agent: 'outreach_writer',
             leadId,
             stageIndex: decision.stage.stageIndex,
+            schemaValidation: 'passed',
+            fallbackUsed: false,
+            runtime: GTM_RUNTIME_LABEL,
+            variantLabel: agentDraft.variantLabel,
+          });
+        } catch (error) {
+          logError('gtm_outreach_writer_fallback', error, {
+            system: 'gtm',
+            agent: 'outreach_writer',
+            leadId,
+            stageIndex: decision.stage.stageIndex,
+            schemaValidation: 'failed',
+            fallbackUsed: true,
+            runtime: GTM_RUNTIME_LABEL,
             templateKey: decision.stage.templateKey,
             fallback: 'render_template',
           });
 
           const rendered = renderTemplate(decision.stage.templateKey, lead);
+          assertColdOutreachCopySafe(lead, rendered.subject, rendered.body);
           subject = rendered.subject;
           body = rendered.body;
         }
       } else {
         const rendered = renderTemplate(decision.stage.templateKey, lead);
+        assertColdOutreachCopySafe(lead, rendered.subject, rendered.body);
         subject = rendered.subject;
         body = rendered.body;
       }

@@ -7,36 +7,36 @@ type TemplateRenderer = (lead: Lead) => RenderedEmailTemplate;
 
 const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
   'missed-call-touch-1': (lead) => ({
-    subject: `${resolveLeadName(lead)}, wanted to follow up on your call`,
+    subject: `${resolveLeadName(lead)}, missed calls may be costing jobs`,
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'You called recently and I wanted to make sure you were able to get the help you needed.',
-      'If the job is still open, reply to this email with a quick note about what is going on and the best number to reach you.',
+      'Systemix helps service businesses respond when calls are missed so fewer jobs slip away.',
+      'If missed calls are creating gaps for your team, reply here and I can send a quick breakdown.',
       '',
-      'Happy to help.',
+      'Worth a look?',
     ].join('\n'),
   }),
   'missed-call-touch-2': (lead) => ({
-    subject: `${resolveLeadName(lead)}, should I keep a spot open for this?`,
+    subject: `${resolveLeadName(lead)}, quick idea for missed calls`,
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'Checking back in case your project is still on your list.',
-      'If you still want help, reply here and share a good time to reconnect.',
+      'A lot of local service teams lose booked work when no one can answer every call.',
+      'Systemix can capture those opportunities and get them back into the queue quickly.',
       '',
-      'If you already found someone, no problem at all.',
+      'Open to a short overview?',
     ].join('\n'),
   }),
   'missed-call-touch-3': (lead) => ({
-    subject: `${resolveLeadName(lead)}, last quick follow-up from me`,
+    subject: `${resolveLeadName(lead)}, closing the loop`,
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
       'Last note from me so I do not keep emailing you unnecessarily.',
-      'If you still need help with the missed-call request, just reply and I can pick it back up.',
+      'If missed calls are still costing booked jobs, Systemix can help recover more of that demand.',
       '',
-      'If not, you can ignore this and I will close the loop.',
+      'If not, you can ignore this and I will close it out.',
     ].join('\n'),
   }),
 };
