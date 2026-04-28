@@ -85,6 +85,17 @@ class FakeLeadStore {
       return { ok: false, error: this.failures.createApproval };
     }
 
+    const duplicatePending = Array.from(this.approvals.values()).some(
+      (candidate) =>
+        candidate.lead_id === approval.lead_id &&
+        candidate.stage_index === approval.stage_index &&
+        candidate.proposal_hash === approval.proposal_hash &&
+        candidate.status === 'pending'
+    );
+    if (duplicatePending) {
+      return { ok: false, error: 'Approval already exists' };
+    }
+
     this.approvals.set(approval.id, { ...approval });
     return { ok: true, value: undefined };
   }
@@ -605,7 +616,7 @@ test('prepareNextAction falls back to renderTemplate when the outreach writer fa
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.match(result.value.subject, /Jordan/);
-  assert.match(result.value.body, /Systemix helps service businesses/);
+  assert.match(result.value.body, /Systemix can answer, capture the request/);
 });
 
 test('prepareNextAction uses validated outreach writer output for GTM proposals', async () => {
@@ -647,7 +658,7 @@ test('prepareNextAction falls back when outreach writer schema validation fails'
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.notEqual(result.value.subject, 'Agent subject');
-  assert.match(result.value.body, /Systemix helps service businesses/);
+  assert.match(result.value.body, /Systemix can answer, capture the request/);
 });
 
 test('prepareNextAction rejects cold outreach writer copy that implies prior contact and uses fallback', async () => {
@@ -656,7 +667,7 @@ test('prepareNextAction rejects cold outreach writer copy that implies prior con
       async writeOutreach() {
         return {
           subject: 'Wanted to follow up on your call',
-          body: 'As discussed, I am calling back about the job.',
+          body: 'As discussed, I am following up and calling back about the job.',
           variantLabel: 'unsafe',
         };
       },
@@ -667,9 +678,9 @@ test('prepareNextAction rejects cold outreach writer copy that implies prior con
   const result = await service.prepareNextAction('lead-123');
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
-  assert.doesNotMatch(result.value.subject.toLowerCase(), /follow up on your call|calling back|as discussed/);
-  assert.doesNotMatch(result.value.body.toLowerCase(), /follow up on your call|calling back|as discussed/);
-  assert.match(result.value.body, /Systemix helps service businesses/);
+  assert.doesNotMatch(result.value.subject.toLowerCase(), /follow up on your call|calling back|as discussed|following up/);
+  assert.doesNotMatch(result.value.body.toLowerCase(), /follow up on your call|calling back|as discussed|following up/);
+  assert.match(result.value.body, /Systemix can answer, capture the request/);
 });
 
 test('advanceLeadSequence persists the touchpoint before the email call and then updates the lead', async () => {
@@ -800,6 +811,114 @@ test('advanceLeadSequence stores a pending approval and skips sending until appr
   assert.equal(approval.subject, 'Agent approval subject');
   assert.equal(approval.body, 'Agent approval body for the finalized proposal.');
   assert.equal(approvalNotifications[0].preparedAction.body, 'Agent approval body for the finalized proposal.');
+});
+
+test('advanceLeadSequence reuses an equivalent pending approval without a second notification', async () => {
+  const approvalNotifications = [];
+  const { service, store, emailClient } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        return {
+          subject: 'Agent approval subject',
+          body: 'Agent approval body for the finalized proposal.',
+          variantLabel: 'approval-agent',
+        };
+      },
+    },
+    approvalHooks: {
+      async requestApproval(input) {
+        approvalNotifications.push(input);
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+
+  assert.equal(store.approvals.size, 1);
+  assert.equal(approvalNotifications.length, 1);
+  assert.equal(emailClient.calls.length, 0);
+  assert.deepEqual(
+    store.calls.filter((entry) => entry.method === 'createApproval').map((entry) => entry.approvalId).length,
+    1
+  );
+});
+
+test('advanceLeadSequence keeps the pending approval lock when SMS notification fails', async () => {
+  let notificationAttempts = 0;
+  const { service, store } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        return {
+          subject: 'Agent approval subject',
+          body: 'Agent approval body for the finalized proposal.',
+          variantLabel: 'approval-agent',
+        };
+      },
+    },
+    approvalHooks: {
+      async requestApproval() {
+        notificationAttempts += 1;
+        throw new Error('sms unavailable');
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+
+  const approval = Array.from(store.approvals.values())[0];
+  assert.equal(store.approvals.size, 1);
+  assert.equal(approval.status, 'pending');
+  assert.equal(approval.notified_at, undefined);
+  assert.equal(notificationAttempts, 1);
+});
+
+test('advanceLeadSequence does not resend approval SMS for an executed equivalent proposal', async () => {
+  const approvalNotifications = [];
+  const { service, store } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        return {
+          subject: 'Agent approval subject',
+          body: 'Agent approval body for the finalized proposal.',
+          variantLabel: 'approval-agent',
+        };
+      },
+    },
+    approvalHooks: {
+      async requestApproval(input) {
+        approvalNotifications.push(input);
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active' }));
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  const pendingApproval = Array.from(store.approvals.values())[0];
+  store.approvals.set(pendingApproval.id, {
+    ...pendingApproval,
+    status: 'approved',
+  });
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  store.leads.set('lead-123', {
+    ...store.leads.get('lead-123'),
+    status: 'active',
+    touches_sent: 0,
+    last_stage_index: undefined,
+    last_sent_at: undefined,
+  });
+
+  const result = await service.advanceLeadSequence('lead-123');
+
+  assert.deepEqual(result, {
+    ok: false,
+    error: 'Approval already executed for this proposal; GTM lead state requires manual repair',
+  });
+  assert.equal(store.approvals.size, 1);
+  assert.equal(approvalNotifications.length, 1);
 });
 
 test('advanceLeadSequence skips rejected approvals without sending', async () => {

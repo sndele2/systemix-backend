@@ -44,8 +44,10 @@ const AGENT_TIMEOUT_MS = 12_000;
 const GTM_RUNTIME_LABEL = 'production';
 const COLD_OUTREACH_FORBIDDEN_PHRASES = [
   'follow up on your call',
+  'follow up on your missed call',
   'calling back',
   'as discussed',
+  'following up',
 ] as const;
 
 export interface GtmServiceRuntimeEnv {
@@ -235,13 +237,25 @@ function findColdOutreachForbiddenPhrase(subject: string, body: string): string 
   return COLD_OUTREACH_FORBIDDEN_PHRASES.find((phrase) => normalized.includes(phrase)) ?? null;
 }
 
-function assertColdOutreachCopySafe(lead: LeadRecord, subject: string, body: string): void {
+function assertColdOutreachCopySafe(
+  lead: LeadRecord,
+  subject: string,
+  body: string,
+  stageIndex?: EmailStage['stageIndex']
+): void {
   if (isWarmOrRecoveryLead(lead)) {
     return;
   }
 
   const forbiddenPhrase = findColdOutreachForbiddenPhrase(subject, body);
   if (forbiddenPhrase) {
+    logInfo('gtm_cold_copy_safety_rejected', {
+      system: 'gtm',
+      leadId: lead.id,
+      stageIndex: stageIndex ?? null,
+      forbiddenPhrase,
+      fallbackUsed: true,
+    });
     throw new Error(`Cold GTM outreach cannot imply prior contact: ${forbiddenPhrase}`);
   }
 }
@@ -408,7 +422,7 @@ export class GTMService {
             'outreach writer agent'
           );
           const agentDraft = parseOutreachWriterOutput(rawAgentDraft);
-          assertColdOutreachCopySafe(lead, agentDraft.subject, agentDraft.body);
+          assertColdOutreachCopySafe(lead, agentDraft.subject, agentDraft.body, decision.stage.stageIndex);
 
           subject = agentDraft.subject;
           body = agentDraft.body;
@@ -436,13 +450,13 @@ export class GTMService {
           });
 
           const rendered = renderTemplate(decision.stage.templateKey, lead);
-          assertColdOutreachCopySafe(lead, rendered.subject, rendered.body);
+          assertColdOutreachCopySafe(lead, rendered.subject, rendered.body, decision.stage.stageIndex);
           subject = rendered.subject;
           body = rendered.body;
         }
       } else {
         const rendered = renderTemplate(decision.stage.templateKey, lead);
-        assertColdOutreachCopySafe(lead, rendered.subject, rendered.body);
+        assertColdOutreachCopySafe(lead, rendered.subject, rendered.body, decision.stage.stageIndex);
         subject = rendered.subject;
         body = rendered.body;
       }
@@ -755,6 +769,17 @@ export class GTMService {
 
     const existingApproval = existingApprovalResult.value;
     if (existingApproval?.status === 'approved') {
+      logInfo('gtm_approval_reused', {
+        system: 'gtm',
+        leadId: lead.id,
+        approvalId: existingApproval.id,
+        approvalCode: existingApproval.approval_code,
+        approvalStatus: existingApproval.status,
+        stageIndex: existingApproval.stage_index,
+        proposalHash,
+        deduped: true,
+        smsPreview: null,
+      });
       return succeed({
         approved: true,
         approval: existingApproval,
@@ -766,7 +791,11 @@ export class GTMService {
         leadId: lead.id,
         approvalId: existingApproval.id,
         approvalCode: existingApproval.approval_code,
+        approvalStatus: existingApproval.status,
         stageIndex: existingApproval.stage_index,
+        proposalHash,
+        deduped: true,
+        smsPreview: null,
       });
 
       return fail('Approval already executed for this proposal; GTM lead state requires manual repair');
@@ -777,7 +806,11 @@ export class GTMService {
         leadId: lead.id,
         approvalId: existingApproval.id,
         approvalCode: existingApproval.approval_code,
+        approvalStatus: existingApproval.status,
         stageIndex: existingApproval.stage_index,
+        proposalHash,
+        deduped: true,
+        smsPreview: null,
       });
 
       return succeed({
@@ -788,6 +821,7 @@ export class GTMService {
     }
 
     let approval = existingApproval;
+    let createdApproval = false;
     if (approval === null) {
       const requestedAt = new Date().toISOString();
       approval = {
@@ -818,20 +852,52 @@ export class GTMService {
           if (approval === null) {
             return fail('Failed to load GTM approval after duplicate approval detection');
           }
+
+          logInfo('gtm_approval_deduped_reused', {
+            system: 'gtm',
+            leadId: lead.id,
+            approvalId: approval.id,
+            approvalCode: approval.approval_code,
+            approvalStatus: approval.status,
+            stageIndex: approval.stage_index,
+            proposalHash,
+            deduped: true,
+            smsPreview: null,
+          });
         } else {
           return fail(createApprovalResult.error);
         }
       } else {
+        createdApproval = true;
         logInfo('gtm_approval_requested', {
+          system: 'gtm',
           leadId: lead.id,
           approvalId: approval.id,
           approvalCode: approval.approval_code,
+          approvalStatus: approval.status,
           stageIndex: approval.stage_index,
+          proposalHash,
+          deduped: false,
+          smsPreview: preparedAction.body,
         });
       }
+    } else {
+      logInfo('gtm_approval_pending_reused', {
+        system: 'gtm',
+        leadId: lead.id,
+        approvalId: approval.id,
+        approvalCode: approval.approval_code,
+        approvalStatus: approval.status,
+        stageIndex: approval.stage_index,
+        proposalHash,
+        deduped: true,
+        smsPreview: approval.body,
+      });
     }
 
-    await this.notifyApprovalRequested(lead, preparedAction, approval);
+    if (createdApproval) {
+      await this.notifyApprovalRequested(lead, preparedAction, approval, proposalHash);
+    }
 
     return succeed({
       approved: false,
@@ -843,9 +909,21 @@ export class GTMService {
   private async notifyApprovalRequested(
     lead: LeadRecord,
     preparedAction: Extract<PreparedAction, { action: 'send' }>,
-    approval: GtmApprovalRecord
+    approval: GtmApprovalRecord,
+    proposalHash: string
   ): Promise<void> {
     if (approval.notified_at) {
+      logInfo('gtm_approval_notification_reused', {
+        system: 'gtm',
+        leadId: lead.id,
+        approvalId: approval.id,
+        approvalCode: approval.approval_code,
+        approvalStatus: approval.status,
+        stageIndex: approval.stage_index,
+        proposalHash,
+        deduped: true,
+        smsPreview: approval.body,
+      });
       return;
     }
 
@@ -854,6 +932,11 @@ export class GTMService {
         leadId: lead.id,
         approvalId: approval.id,
         approvalCode: approval.approval_code,
+        approvalStatus: approval.status,
+        stageIndex: approval.stage_index,
+        proposalHash,
+        deduped: false,
+        smsPreview: preparedAction.body,
       });
       return;
     }
@@ -876,6 +959,11 @@ export class GTMService {
           leadId: lead.id,
           approvalId: approval.id,
           approvalCode: approval.approval_code,
+          approvalStatus: approval.status,
+          stageIndex: approval.stage_index,
+          proposalHash,
+          deduped: false,
+          smsPreview: preparedAction.body,
         });
         return;
       }
@@ -886,6 +974,11 @@ export class GTMService {
         leadId: lead.id,
         approvalId: approval.id,
         approvalCode: approval.approval_code,
+        approvalStatus: approval.status,
+        stageIndex: approval.stage_index,
+        proposalHash,
+        deduped: false,
+        smsPreview: preparedAction.body,
         fallback: 'pending_approval_without_sms_notification',
       });
     }

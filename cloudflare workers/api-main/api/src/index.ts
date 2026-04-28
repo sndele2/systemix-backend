@@ -122,7 +122,7 @@ interface RuntimeDependencies {
 }
 
 const routerLog = createLogger('[ROUTER]', 'router');
-const GTM_APPROVAL_SMS_SUMMARY_LIMIT = 56;
+const GTM_APPROVAL_SMS_PREVIEW_LIMIT = 92;
 const GTM_INTERNAL_OPERATOR_PHONE = '+12179912895';
 
 const REQUIRED_BINDINGS = [
@@ -265,13 +265,13 @@ type GtmApprovalNotificationTarget = {
   ownerPhone: string;
 };
 
-function normalizeApprovalSummary(value: string): string {
+function truncateApprovalSmsValue(value: string, limit: number): string {
   const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length <= GTM_APPROVAL_SMS_SUMMARY_LIMIT) {
+  if (normalized.length <= limit) {
     return normalized;
   }
 
-  return normalized.slice(0, GTM_APPROVAL_SMS_SUMMARY_LIMIT - 3).trimEnd() + '...';
+  return normalized.slice(0, limit - 3).trimEnd() + '...';
 }
 
 function resolveApprovalNotificationSenderNumber(
@@ -293,6 +293,49 @@ type OutreachWriterRunner = (
 function readLeadMetadataString(lead: LeadRecord, key: string): string | undefined {
   const value = lead.metadata?.[key];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function readFirstLeadMetadataString(lead: LeadRecord, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = readLeadMetadataString(lead, key);
+    if (value) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveGtmApprovalLeadLabel(lead: LeadRecord): string {
+  return (
+    readFirstLeadMetadataString(lead, ['contactName', 'ownerName', 'firstName', 'businessName']) ||
+    lead.name.trim() ||
+    lead.id.trim() ||
+    'Unknown lead'
+  );
+}
+
+function resolveGtmApprovalNiche(lead: LeadRecord): string | undefined {
+  return readFirstLeadMetadataString(lead, ['niche', 'industry', 'category']);
+}
+
+function resolveGtmApprovalWhy(lead: LeadRecord): string {
+  return (
+    readFirstLeadMetadataString(lead, ['approvalRationale', 'rationale', 'why', 'summary']) ||
+    'missed-call revenue opportunity'
+  );
+}
+
+function buildGtmApprovalProposalPreview(input: ApprovalNotificationRequest): string {
+  const body = input.preparedAction.body || input.approval.body || input.preparedAction.subject;
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const nonGreetingLine =
+    lines.find((line) => !/^hi[\s,]/i.test(line) && !/^hello[\s,]/i.test(line)) ?? lines[0] ?? '';
+
+  return truncateApprovalSmsValue(nonGreetingLine, GTM_APPROVAL_SMS_PREVIEW_LIMIT);
 }
 
 function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): OutreachWriterInput {
@@ -484,18 +527,15 @@ export function buildGtmApprovalSmsBody(
   target: Pick<GtmApprovalNotificationTarget, 'displayName'>,
   input: ApprovalNotificationRequest
 ): string {
-  const businessLabel = target.displayName.trim() || 'Systemix';
-  const leadLabel = input.lead.id.trim() || 'unknown-lead';
-  const touchNumber = input.preparedAction.stage.stageIndex + 1;
-  const summary = normalizeApprovalSummary(
-    [input.preparedAction.subject, input.preparedAction.body].filter(Boolean).join(' - ')
-  );
+  void target;
+  const leadLabel = resolveGtmApprovalLeadLabel(input.lead);
+  const niche = resolveGtmApprovalNiche(input.lead);
+  const headline = niche ? `${leadLabel} - ${niche}` : leadLabel;
+  const why = truncateApprovalSmsValue(resolveGtmApprovalWhy(input.lead), 72);
+  const preview = buildGtmApprovalProposalPreview(input);
   const approvalCode = input.approval.approval_code;
 
-  return (
-    `Systemix approval ${approvalCode}. ${businessLabel}, lead ${leadLabel}, ` +
-    `touch ${touchNumber}. ${summary}. Reply YES ${approvalCode} or NO ${approvalCode}.`
-  );
+  return `${headline}\nWhy: ${why}\n"${preview}"\nYES ${approvalCode} / NO ${approvalCode}`;
 }
 
 export function createRuntimeGtmApprovalHooks(
@@ -514,6 +554,24 @@ export function createRuntimeGtmApprovalHooks(
       }
 
       const body = buildGtmApprovalSmsBody(target, input);
+      routerLog.log('GTM approval SMS body built', {
+        context: {
+          handler: 'createRuntimeGtmApprovalHooks',
+        },
+        data: {
+          system: 'gtm',
+          environment: env.ENVIRONMENT ?? 'unset',
+          approvalCode: input.approval.approval_code,
+          approvalStatus: input.approval.status,
+          approvalId: input.approval.id,
+          leadId: input.lead.id,
+          stageIndex: input.preparedAction.stage.stageIndex,
+          proposalHash: input.approval.proposal_hash,
+          deduped: false,
+          smsPreview: body,
+          shortCodeImplemented: false,
+        },
+      });
       const senderNumber = resolveApprovalNotificationSenderNumber(env, target);
       const sendResult = await twilioClient.sendSms({
         toPhone: target.ownerPhone,
@@ -535,9 +593,13 @@ export function createRuntimeGtmApprovalHooks(
             system: 'gtm',
             environment: env.ENVIRONMENT ?? 'unset',
             approvalCode: input.approval.approval_code,
+            approvalStatus: input.approval.status,
             approvalId: input.approval.id,
             leadId: input.lead.id,
             stageIndex: input.preparedAction.stage.stageIndex,
+            proposalHash: input.approval.proposal_hash,
+            deduped: false,
+            smsPreview: body,
             messageSid: sendResult.sid || null,
             detail: sendResult.detail || 'unknown',
           },
@@ -556,9 +618,13 @@ export function createRuntimeGtmApprovalHooks(
             system: 'gtm',
             environment: env.ENVIRONMENT ?? 'unset',
             approvalCode: input.approval.approval_code,
+            approvalStatus: input.approval.status,
             approvalId: input.approval.id,
             leadId: input.lead.id,
             stageIndex: input.preparedAction.stage.stageIndex,
+            proposalHash: input.approval.proposal_hash,
+            deduped: false,
+            smsPreview: body,
             messageSid: sendResult.sid || null,
           },
         });
@@ -575,9 +641,13 @@ export function createRuntimeGtmApprovalHooks(
           system: 'gtm',
           environment: env.ENVIRONMENT ?? 'unset',
           approvalCode: input.approval.approval_code,
+          approvalStatus: input.approval.status,
           approvalId: input.approval.id,
           leadId: input.lead.id,
           stageIndex: input.preparedAction.stage.stageIndex,
+          proposalHash: input.approval.proposal_hash,
+          deduped: false,
+          smsPreview: body,
           messageSid: sendResult.sid || null,
         },
       });

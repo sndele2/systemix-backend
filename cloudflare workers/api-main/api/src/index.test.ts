@@ -1019,7 +1019,7 @@ test('customer-facing recovery routes do not import GTM agents', () => {
   }
 });
 
-test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
+test('buildGtmApprovalSmsBody is decision-first and uses the finalized proposal', () => {
   const body = buildGtmApprovalSmsBody(
     {
       displayName: 'Test Roofer',
@@ -1028,10 +1028,17 @@ test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
       approval: {
         id: 'approval-1',
         approval_code: 'ABC12345',
+        proposal_hash: 'gtm-hash-1',
+        status: 'pending',
+        body: 'Stored approval body should not replace the current finalized preview.',
       },
       lead: {
-        id: 'lead-123',
+        id: 'lead-full-id-should-not-appear',
         name: 'Jordan',
+        metadata: {
+          niche: 'mobile detailing',
+          approvalRationale: 'likely misses calls while on jobs',
+        },
       },
       preparedAction: {
         action: 'send',
@@ -1045,11 +1052,11 @@ test('buildGtmApprovalSmsBody includes the minimum approval context', () => {
   );
 
   assert.match(body, /ABC12345/);
-  assert.match(body, /Test Roofer/);
-  assert.match(body, /lead-123/);
-  assert.match(body, /touch 2/);
-  assert.match(body, /Finalized GTM proposal|Jordan, wanted/);
-  assert.match(body, /Reply YES ABC12345 or NO ABC12345/);
+  assert.match(body, /Jordan - mobile detailing/);
+  assert.match(body, /Why: likely misses calls while on jobs/);
+  assert.match(body, /"Finalized GTM proposal body from the writer."/);
+  assert.match(body, /YES ABC12345 \/ NO ABC12345/);
+  assert.doesNotMatch(body, /Systemix approval|Systemix GTM|lead-full-id-should-not-appear|Test Roofer|touch 2/);
 });
 
 test('resolveGtmApprovalNotificationTarget fails closed to the fixed GTM operator number', async () => {
@@ -1070,6 +1077,8 @@ test('resolveGtmApprovalNotificationTarget fails closed to the fixed GTM operato
     approval: {
       id: 'approval-1',
       approval_code: 'ABC12345',
+      proposal_hash: 'gtm-hash-1',
+      status: 'pending',
     },
     lead: {
       id: 'lead-123',
@@ -1125,11 +1134,17 @@ test('createRuntimeGtmApprovalHooks sends an approval SMS through the runtime tw
       approval: {
         id: 'approval-1',
         approval_code: 'ABC12345',
+        proposal_hash: 'gtm-hash-1',
+        status: 'pending',
+        body: 'Stored approval body.',
       },
       lead: {
         id: 'lead-123',
         name: 'Jordan',
-        metadata: {},
+        metadata: {
+          industry: 'roofing',
+          rationale: 'new inbound calls need quick capture',
+        },
       },
       preparedAction: {
         action: 'send',
@@ -1137,6 +1152,7 @@ test('createRuntimeGtmApprovalHooks sends an approval SMS through the runtime tw
           stageIndex: 0,
         },
         subject: 'Jordan, wanted to follow up on your missed call',
+        body: 'Actual finalized outbound body for approval.',
       },
     });
 
@@ -1144,7 +1160,10 @@ test('createRuntimeGtmApprovalHooks sends an approval SMS through the runtime tw
     assert.match(String(fetchCalls[0].url), /Messages\.json/);
     assert.match(String(fetchCalls[0].init.body), /To=%2B12179912895/);
     assert.match(String(fetchCalls[0].init.body), /From=%2B18443217137/);
-    assert.match(String(fetchCalls[0].init.body), /YES\+ABC12345\+or\+NO\+ABC12345/);
+    assert.match(String(fetchCalls[0].init.body), /Jordan\+-\+roofing/);
+    assert.match(String(fetchCalls[0].init.body), /Actual\+finalized\+outbound\+body\+for\+approval/);
+    assert.match(String(fetchCalls[0].init.body), /YES\+ABC12345\+%2F\+NO\+ABC12345/);
+    assert.doesNotMatch(String(fetchCalls[0].init.body), /Systemix\+approval|Systemix\+GTM/);
   } finally {
     globalThis.fetch = originalFetch;
   }

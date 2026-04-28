@@ -7,12 +7,12 @@ type TemplateRenderer = (lead: Lead) => RenderedEmailTemplate;
 
 const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
   'missed-call-touch-1': (lead) => ({
-    subject: `${resolveLeadName(lead)}, missed calls may be costing jobs`,
+    subject: `${resolveLeadName(lead)}, quick call-handling idea`,
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'Systemix helps service businesses respond when calls are missed so fewer jobs slip away.',
-      'If missed calls are creating gaps for your team, reply here and I can send a quick breakdown.',
+      'When calls come in while your team is busy, Systemix can answer, capture the request, and route the next step back to you.',
+      'If that would help, I can send a quick breakdown.',
       '',
       'Worth a look?',
     ].join('\n'),
@@ -22,8 +22,8 @@ const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'A lot of local service teams lose booked work when no one can answer every call.',
-      'Systemix can capture those opportunities and get them back into the queue quickly.',
+      'I had a short idea for keeping new inquiries from sitting unanswered during busy parts of the day.',
+      'Systemix can collect the details and hand them back to your team quickly.',
       '',
       'Open to a short overview?',
     ].join('\n'),
@@ -34,7 +34,7 @@ const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
       `Hi ${resolveLeadName(lead)},`,
       '',
       'Last note from me so I do not keep emailing you unnecessarily.',
-      'If missed calls are still costing booked jobs, Systemix can help recover more of that demand.',
+      'If inbound calls are hard to catch during the day, Systemix can help make sure each request gets captured.',
       '',
       'If not, you can ignore this and I will close it out.',
     ].join('\n'),
