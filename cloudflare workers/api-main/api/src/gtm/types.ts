@@ -12,6 +12,39 @@ export interface Lead {
   metadata?: Record<string, unknown>;
 }
 
+export interface GtmReviewedLeadInput {
+  businessName: string;
+  email: string;
+  contactName?: string;
+  niche?: string;
+  city?: string;
+  state?: string;
+  website?: string;
+  phone?: string;
+  sourceUrl: string;
+  sourceType?: string;
+  evidence: string;
+  confidence?: number;
+  researchNotes?: string;
+  outreachAngle?: string;
+  approvalStatus?: string;
+  importStatus?: string;
+}
+
+export interface GtmImportLeadsResult {
+  imported: Array<{
+    leadId: string;
+    businessName: string;
+    email: string;
+  }>;
+  skipped: Array<{
+    businessName: string;
+    email?: string;
+    reason: string;
+    duplicateLeadId?: string;
+  }>;
+}
+
 export type LeadStatus =
   | 'pending'
   | 'active'

@@ -44,6 +44,8 @@ export async function ensureCustomerMissedCallSchema(db: D1Database): Promise<vo
         display_name TEXT,
         intake_question TEXT,
         last_stripe_session_id TEXT,
+        billing_mode TEXT NOT NULL DEFAULT 'pilot',
+        is_internal INTEGER NOT NULL DEFAULT 0,
         is_active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -86,6 +88,8 @@ export async function ensureCustomerMissedCallSchema(db: D1Database): Promise<vo
         await db.prepare(statement).run();
       }
       await maybeAddColumn(db, 'ALTER TABLE businesses ADD COLUMN intake_question TEXT');
+      await maybeAddColumn(db, "ALTER TABLE businesses ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'pilot'");
+      await maybeAddColumn(db, 'ALTER TABLE businesses ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0');
       await maybeAddColumn(db, 'ALTER TABLE missed_call_conversations ADD COLUMN first_auto_text_at TEXT');
       await maybeAddColumn(db, 'ALTER TABLE missed_call_conversations ADD COLUMN first_customer_reply_at TEXT');
       await maybeAddColumn(db, 'ALTER TABLE missed_call_conversations ADD COLUMN recovered_opportunity_at TEXT');

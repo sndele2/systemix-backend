@@ -38,6 +38,7 @@ class FakeLeadStore {
       createReply: null,
       findLeadByEmail: null,
       getLatestApprovalByProposal: null,
+      getLatestApprovedApprovalByLeadStage: null,
       getSyncCursor: null,
       markApprovalExecuted: null,
       markApprovalNotified: null,
@@ -137,6 +138,31 @@ class FakeLeadStore {
     return { ok: true, value: lead };
   }
 
+  async findDuplicateLead(input) {
+    this.eventLog.push('findDuplicateLead');
+    this.calls.push({ method: 'findDuplicateLead', input });
+
+    const normalizedEmail = input.email.trim().toLowerCase();
+    const normalizedPhone = input.phone?.replace(/\D/g, '') ?? '';
+    const normalizedWebsite = input.website?.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '') ?? '';
+    const normalizedBusinessName = input.businessName.trim().toLowerCase();
+    const lead =
+      Array.from(this.leads.values()).find((candidate) => {
+        const candidateWebsite =
+          typeof candidate.metadata?.website === 'string'
+            ? candidate.metadata.website.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '')
+            : '';
+        return (
+          candidate.email.trim().toLowerCase() === normalizedEmail ||
+          (normalizedPhone && candidate.phone?.replace(/\D/g, '') === normalizedPhone) ||
+          candidate.name.trim().toLowerCase() === normalizedBusinessName ||
+          (normalizedWebsite && candidateWebsite === normalizedWebsite)
+        );
+      }) ?? null;
+
+    return { ok: true, value: lead ? { ...lead } : null };
+  }
+
   async getSyncCursor() {
     this.eventLog.push('getSyncCursor');
     this.calls.push({ method: 'getSyncCursor' });
@@ -165,6 +191,30 @@ class FakeLeadStore {
             candidate.proposal_hash === proposalHash
         )
         .sort((left, right) => right.requested_at.localeCompare(left.requested_at))[0] ?? null;
+
+    return { ok: true, value: approval ? { ...approval } : null };
+  }
+
+  async getLatestApprovedApprovalByLeadStage(leadId, stageIndex) {
+    this.eventLog.push('getLatestApprovedApprovalByLeadStage');
+    this.calls.push({ method: 'getLatestApprovedApprovalByLeadStage', leadId, stageIndex });
+
+    if (this.failures.getLatestApprovedApprovalByLeadStage) {
+      return { ok: false, error: this.failures.getLatestApprovedApprovalByLeadStage };
+    }
+
+    const approval =
+      Array.from(this.approvals.values())
+        .filter(
+          (candidate) =>
+            candidate.lead_id === leadId &&
+            candidate.stage_index === stageIndex &&
+            candidate.status === 'approved' &&
+            !candidate.executed_at
+        )
+        .sort((left, right) =>
+          (right.decision_at ?? right.requested_at).localeCompare(left.decision_at ?? left.requested_at)
+        )[0] ?? null;
 
     return { ok: true, value: approval ? { ...approval } : null };
   }
@@ -591,6 +641,38 @@ test('startSequence fails open when the lead-review agent errors', async () => {
   assert.equal(store.leads.get('lead-123').status, 'active');
 });
 
+test('importReviewedLeadsFromCsv imports only reviewed leads and dedupes existing records', async () => {
+  const { service, store } = createService();
+  store.seedLead(
+    buildLead({
+      id: 'existing-lead',
+      name: 'Existing Detail',
+      email: 'existing@example.com',
+      metadata: { website: 'https://existing.example.com' },
+    })
+  );
+
+  const csv = [
+    'businessName,contactName,niche,city,state,website,email,phone,sourceUrl,sourceType,evidence,confidence,researchNotes,outreachAngle,approvalStatus,importStatus',
+    'Jordan Detail,Jordan,mobile detailing,Chicago,IL,https://jordandetail.example.com,jordan@detail.example.com,+13125550111,https://source.example.com/jordan,website,"Site lists mobile detailing and contact email",0.86,"Owner-operator mobile detailing",missed_call_recovery,approved,approved',
+    'Unreviewed Shop,,roofing,Chicago,IL,https://unreviewed.example.com,unreviewed@example.com,,https://source.example.com/unreviewed,website,"Source lists email",0.7,,missed_call_recovery,pending,pending',
+    'Existing Detail,,detailing,Chicago,IL,https://existing.example.com,new-existing@example.com,,https://source.example.com/existing,website,"Duplicate website",0.7,,missed_call_recovery,approved,approved',
+  ].join('\n');
+
+  const result = await service.importReviewedLeadsFromCsv(csv);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.value.imported.length, 1);
+  assert.equal(result.value.imported[0].businessName, 'Jordan Detail');
+  assert.equal(result.value.skipped.length, 2);
+  assert.equal(result.value.skipped[0].reason, 'not_review_approved');
+  assert.equal(result.value.skipped[1].reason, 'duplicate_existing_lead');
+  const importedLead = store.leads.get(result.value.imported[0].leadId);
+  assert.equal(importedLead.email, 'jordan@detail.example.com');
+  assert.equal(importedLead.metadata.sourceUrl, 'https://source.example.com/jordan');
+  assert.equal(importedLead.metadata.evidence, 'Site lists mobile detailing and contact email');
+});
+
 test('prepareNextAction is read-only and returns the rendered send action', async () => {
   const { service, store } = createService();
   store.seedLead(buildLead({ status: 'active' }));
@@ -792,12 +874,14 @@ test('advanceLeadSequence persists the touchpoint before the email call and then
     'listTouchpointsByLeadId',
     'getLeadById',
     'getLatestApprovalByProposal',
+    'getLatestApprovedApprovalByLeadStage',
     'createApproval',
     'markApprovalNotified',
     'getLeadById',
     'listTouchpointsByLeadId',
     'getLeadById',
     'getLatestApprovalByProposal',
+    'getLatestApprovedApprovalByLeadStage',
     'recordTouchpoint',
     'emailSend',
     'markApprovalExecuted',
@@ -1040,18 +1124,53 @@ test('advanceLeadSequence keeps pending approval when notification hook fails', 
   assert.equal(emailClient.calls.length, 0);
 });
 
-test('advanceLeadSequence rejects live mode until the email client is wired for production sending', async () => {
+test('advanceLeadSequence can send live only after approval when dry-run is explicitly disabled', async () => {
+  const approvalNotifications = [];
   const { service, store, emailClient } = createService({
     config: { dryRun: false },
+    approvalHooks: {
+      async requestApproval(input) {
+        approvalNotifications.push(input);
+      },
+    },
   });
+  emailClient.nextResult = {
+    success: true,
+    dryRun: false,
+    messageId: 'smtp-message-1',
+  };
   store.seedLead(buildLead({ status: 'active' }));
 
   assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
-    ok: false,
-    error: 'Live GTM email sending is not implemented',
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
   });
+  assert.equal(approvalNotifications.length, 1);
   assert.equal(store.touchpoints.length, 0);
   assert.equal(emailClient.calls.length, 0);
+
+  const approval = Array.from(store.approvals.values())[0];
+  store.approvals.set(approval.id, {
+    ...approval,
+    status: 'approved',
+  });
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'sent',
+      leadId: 'lead-123',
+      reason: undefined,
+    },
+  });
+  assert.equal(store.touchpoints.length, 1);
+  assert.equal(store.touchpoints[0].dry_run, false);
+  assert.equal(store.touchpoints[0].result, 'success');
+  assert.equal(emailClient.calls.length, 1);
 });
 
 test('advanceLeadSequence marks exhausted leads as stopped', async () => {

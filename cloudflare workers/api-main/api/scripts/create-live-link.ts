@@ -75,6 +75,11 @@ function requireEnvVar(name: string): string {
 }
 
 async function main() {
+  const billingEnabled = readEnvVar('BILLING_ENABLED');
+  if (billingEnabled !== 'true') {
+    throw new Error('Live billing is disabled. Set BILLING_ENABLED=true before creating Stripe payment links.');
+  }
+
   const secretKey = requireEnvVar('STRIPE_SECRET_KEY');
   if (!secretKey.startsWith('sk_live_')) {
     throw new Error('STRIPE_SECRET_KEY must be a live Stripe secret key.');
@@ -85,6 +90,11 @@ async function main() {
   const ownerPhoneNumber = requireEnvVar('OWNER_PHONE_NUMBER');
   const displayName = requireEnvVar('DISPLAY_NAME');
   const welcomeUrl = readEnvVar('SYSTEMIX_WELCOME_URL') || DEFAULT_WELCOME_URL;
+  const systemixNumber = readEnvVar('SYSTEMIX_NUMBER')?.trim();
+
+  if (systemixNumber && systemixNumber === businessNumber.trim()) {
+    throw new Error('Internal/test business numbers are blocked from live billing.');
+  }
 
   const stripe = new Stripe(secretKey, {
     httpClient: Stripe.createFetchHttpClient(),

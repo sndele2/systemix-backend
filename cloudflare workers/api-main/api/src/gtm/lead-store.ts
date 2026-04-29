@@ -93,11 +93,21 @@ export interface LeadStore {
   createLead(lead: Lead): Promise<Result<void>>;
   createApproval(approval: CreateGtmApprovalRecord): Promise<Result<void>>;
   createReply(reply: CreateGtmReply): Promise<Result<'created' | 'exists'>>;
+  findDuplicateLead(input: {
+    businessName: string;
+    email: string;
+    phone?: string;
+    website?: string;
+  }): Promise<Result<LeadRecord | null>>;
   findLeadByEmail(email: string): Promise<Result<LeadRecord | null>>;
   getLatestApprovalByProposal(
     leadId: string,
     stageIndex: EmailStage['stageIndex'],
     proposalHash: string
+  ): Promise<Result<GtmApprovalRecord | null>>;
+  getLatestApprovedApprovalByLeadStage(
+    leadId: string,
+    stageIndex: EmailStage['stageIndex']
   ): Promise<Result<GtmApprovalRecord | null>>;
   getSyncCursor(): Promise<Result<SyncCursor | null>>;
   markApprovalExecuted(approvalId: string, executedAt: string): Promise<Result<void>>;
@@ -548,6 +558,44 @@ export class DurableLeadStore implements LeadStore {
     }
   }
 
+  async findDuplicateLead(input: {
+    businessName: string;
+    email: string;
+    phone?: string;
+    website?: string;
+  }): Promise<Result<LeadRecord | null>> {
+    try {
+      const email = input.email.trim().toLowerCase();
+      const phoneDigits = input.phone?.replace(/\D/g, '') ?? '';
+      const businessName = input.businessName.trim().toLowerCase();
+      const website = input.website?.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '') ?? '';
+
+      const row = await this.database
+        .prepare(
+          'SELECT id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
+            'FROM gtm_leads WHERE lower(email) = ? ' +
+            'OR (? != "" AND replace(replace(replace(replace(replace(phone, "+", ""), "-", ""), " ", ""), "(", ""), ")", "") = ?) ' +
+            'OR (? != "" AND lower(name) = ?) ' +
+            'OR (? != "" AND lower(replace(replace(json_extract(metadata, "$.website"), "https://", ""), "http://", "")) = ?) ' +
+            'ORDER BY created_at ASC LIMIT 1'
+        )
+        .bind(email, phoneDigits, phoneDigits, businessName, businessName, website, website)
+        .first<LeadRow>();
+
+      if (row === null) {
+        return succeed(null);
+      }
+
+      return mapLeadRow(row);
+    } catch (error) {
+      logStoreError('findDuplicateLead', error, {
+        email: input.email,
+        businessName: input.businessName,
+      });
+      return fail('Failed to find duplicate GTM lead');
+    }
+  }
+
   async getSyncCursor(): Promise<Result<SyncCursor | null>> {
     try {
       const row = await this.database
@@ -598,6 +646,34 @@ export class DurableLeadStore implements LeadStore {
         stageIndex,
       });
       return fail('Failed to load GTM approval');
+    }
+  }
+
+  async getLatestApprovedApprovalByLeadStage(
+    leadId: string,
+    stageIndex: EmailStage['stageIndex']
+  ): Promise<Result<GtmApprovalRecord | null>> {
+    try {
+      const row = await this.database
+        .prepare(
+          'SELECT id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at ' +
+            'FROM gtm_approvals WHERE lead_id = ? AND stage_index = ? AND status = ? AND executed_at IS NULL ' +
+            'ORDER BY decision_at DESC, requested_at DESC LIMIT 1'
+        )
+        .bind(leadId, stageIndex, 'approved')
+        .first<GtmApprovalRow>();
+
+      if (row === null) {
+        return succeed(null);
+      }
+
+      return mapApprovalRow(row);
+    } catch (error) {
+      logStoreError('getLatestApprovedApprovalByLeadStage', error, {
+        leadId,
+        stageIndex,
+      });
+      return fail('Failed to load approved GTM approval');
     }
   }
 

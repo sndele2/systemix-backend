@@ -643,6 +643,8 @@ async function ensureSwitchboardSchema(env: Bindings): Promise<void> {
         owner_phone_number TEXT,
         display_name TEXT,
         last_stripe_session_id TEXT,
+        billing_mode TEXT NOT NULL DEFAULT 'pilot',
+        is_internal INTEGER NOT NULL DEFAULT 0,
         is_active INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -676,6 +678,8 @@ async function ensureSwitchboardSchema(env: Bindings): Promise<void> {
         await getDb(env).prepare(statement).run();
       }
       await maybeAddColumn('ALTER TABLE businesses ADD COLUMN last_stripe_session_id TEXT');
+      await maybeAddColumn("ALTER TABLE businesses ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'pilot'");
+      await maybeAddColumn('ALTER TABLE businesses ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0');
       await maybeAddColumn('ALTER TABLE active_sessions ADD COLUMN last_emergency_alert_at TEXT');
       await maybeAddColumn('ALTER TABLE active_sessions ADD COLUMN last_emergency_classification TEXT');
     })()
@@ -1649,6 +1653,21 @@ export async function resolveGtmApprovalOwnerCommand(input: {
 
     throw new Error(resolveResult.error);
   }
+
+  twilioLog.log(decision === 'approved' ? 'GTM approval accepted' : 'GTM approval rejected', {
+    context: {
+      handler: 'resolveGtmApprovalOwnerCommand',
+    },
+    data: {
+      system: 'gtm',
+      leadId: resolveResult.value.lead_id,
+      stageIndex: resolveResult.value.stage_index,
+      proposalHash: resolveResult.value.proposal_hash,
+      approvalCode: resolveResult.value.approval_code,
+      approvalStatus: resolveResult.value.status,
+      decidedByPhone: input.ownerPhone,
+    },
+  });
 
   if (decision === 'approved') {
     return (

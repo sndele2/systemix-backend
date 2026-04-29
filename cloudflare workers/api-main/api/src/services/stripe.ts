@@ -2,6 +2,7 @@ import Stripe from 'stripe';
 import { createLogger } from '../core/logging.ts';
 import { logConsentEvent } from './smsCompliance.ts';
 import { sendBusinessWelcomeSms } from './database.ts';
+import { getBusinessBillingState } from './billing.ts';
 import {
   associateContactToCompany,
   createHubSpotCompany,
@@ -13,6 +14,7 @@ type StripeEnv = {
   SYSTEMIX: D1Database;
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  BILLING_ENABLED?: string;
   HUBSPOT_ACCESS_TOKEN?: string;
   ENVIRONMENT?: string;
   TWILIO_ACCOUNT_SID: string;
@@ -283,6 +285,21 @@ export async function handleCheckoutCompleted(
     return { hubspotSynced: false, welcomeSmsSent: false };
   }
 
+  const billingState = await getBusinessBillingState(env.SYSTEMIX, env, metadata.business_number);
+  if (!billingState.liveBillingAllowed) {
+    stripeLog.warn('Checkout completion blocked by billing safeguards', {
+      context: {
+        handler: 'handleCheckoutCompleted',
+      },
+      data: {
+        stripeSessionId,
+        businessNumber: metadata.business_number,
+        reasonCode: billingState.reasonCode,
+      },
+    });
+    return { hubspotSynced: false, welcomeSmsSent: false };
+  }
+
   stripeLog.log('Processing checkout completion', {
     context: {
       handler: 'handleCheckoutCompleted',
@@ -426,6 +443,21 @@ export async function prepareCheckoutCompleted(
         ownerPhoneNumber: owner_phone_number,
         displayName: display_name,
         stripeSessionId,
+      },
+    });
+    return { shouldProcess: false };
+  }
+
+  const billingState = await getBusinessBillingState(env.SYSTEMIX, env, business_number);
+  if (!billingState.liveBillingAllowed) {
+    stripeLog.warn('Checkout claim blocked by billing safeguards', {
+      context: {
+        handler: 'prepareCheckoutCompleted',
+      },
+      data: {
+        businessNumber: business_number,
+        stripeSessionId,
+        reasonCode: billingState.reasonCode,
       },
     });
     return { shouldProcess: false };

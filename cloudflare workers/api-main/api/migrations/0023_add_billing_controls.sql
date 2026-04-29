@@ -1,0 +1,2 @@
+ALTER TABLE businesses ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'pilot';
+ALTER TABLE businesses ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0;

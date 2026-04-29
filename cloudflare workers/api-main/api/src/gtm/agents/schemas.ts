@@ -71,7 +71,14 @@ export const CandidateBusinessSchema = z
     city: optionalTrimmedString,
     state: optionalTrimmedString,
     industry: optionalTrimmedString,
+    niche: optionalTrimmedString,
     source: optionalTrimmedString,
+    sourceUrl: z.string().trim().url().optional(),
+    sourceType: optionalTrimmedString,
+    evidence: z.string().trim().max(1000).optional(),
+    confidence: z.number().min(0).max(1).optional(),
+    researchNotes: z.string().trim().max(1000).optional(),
+    outreachAngle: optionalTrimmedString,
     summary: z.string().trim().max(280).optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
@@ -364,4 +371,3 @@ export function parseManagerOutput(
 
   return parsed
 }
-

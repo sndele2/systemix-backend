@@ -568,6 +568,47 @@ test('GET /v1/internal/auth/me returns 401 with no cookie', async () => {
   assert.deepEqual(await response.json(), { authenticated: false });
 });
 
+test('GET /v1/internal/billing-state returns the current business billing safeguards', async () => {
+  const sessionStore = new MockSessionStore();
+  const userStore = new MockUserStore();
+  const worker = createTestWorker(sessionStore, userStore);
+  const env = createEnv({
+    BILLING_ENABLED: 'true',
+    INTERNAL_AUTH_KEY: 'internal-secret',
+    SYSTEMIX: new MockApprovalDatabase({
+      businesses: [
+        {
+          business_number: '+18005550104',
+          owner_phone_number: '+13125550104',
+          display_name: 'Pilot Shop',
+          billing_mode: 'pilot',
+          is_internal: 0,
+          is_active: 1,
+        },
+      ],
+    }),
+  });
+
+  const response = await worker.fetch(
+    new Request('http://example.com/v1/internal/billing-state?business_number=%2B18005550104', {
+      headers: {
+        Authorization: 'Bearer internal-secret',
+        Origin: env.ALLOWED_ORIGIN,
+      },
+    }),
+    env,
+    executionCtx
+  );
+
+  assert.equal(response.status, 200);
+  const json = await response.json();
+  assert.equal(json.ok, true);
+  assert.equal(json.billing.businessNumber, '+18005550104');
+  assert.equal(json.billing.billingMode, 'pilot');
+  assert.equal(json.billing.liveBillingAllowed, false);
+  assert.equal(json.billing.reasonCode, 'billing_mode_pilot');
+});
+
 test('owner sessions can create operator users with separate passwords', async () => {
   const sessionStore = new MockSessionStore();
   const userStore = new MockUserStore();
@@ -985,7 +1026,12 @@ test('createRuntimeGtmAgentHooks wires only the outreach writer runner', async (
       metadata: {
         source: 'manual_gtm',
         city: 'Chicago',
-        industry: 'roofing',
+        niche: 'commercial roofing',
+        website: 'https://testroofing.example',
+        sourceUrl: 'https://maps.example/test-roofing',
+        evidence: 'Listing shows roofing services and owner email.',
+        researchNotes: 'Appears to handle emergency roof repair calls.',
+        outreachAngle: 'missed_call_recovery',
       },
     },
     {
@@ -1001,7 +1047,12 @@ test('createRuntimeGtmAgentHooks wires only the outreach writer runner', async (
   assert.equal(calls[0].options.model, 'gtm-model');
   assert.equal(calls[0].input.candidate.businessName, 'Test Roofing');
   assert.equal(calls[0].input.candidate.city, 'Chicago');
-  assert.equal(calls[0].input.outreachAngle, 'lost_jobs_recovery');
+  assert.equal(calls[0].input.candidate.niche, 'commercial roofing');
+  assert.equal(calls[0].input.candidate.website, 'https://testroofing.example');
+  assert.equal(calls[0].input.candidate.sourceUrl, 'https://maps.example/test-roofing');
+  assert.equal(calls[0].input.candidate.evidence, 'Listing shows roofing services and owner email.');
+  assert.equal(calls[0].input.candidate.researchNotes, 'Appears to handle emergency roof repair calls.');
+  assert.equal(calls[0].input.outreachAngle, 'missed_call_recovery');
 });
 
 test('customer-facing recovery routes do not import GTM agents', () => {

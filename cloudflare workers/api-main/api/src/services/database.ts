@@ -1,5 +1,6 @@
 import { sendTwilioSms } from '../core/sms.ts';
 import { createLogger } from '../core/logging.ts';
+import { ensureBillingSchema, type BillingMode } from './billing.ts';
 import { ensureCustomerMissedCallSchema } from './missedCallRecovery.ts';
 
 type UpsertBusinessInput = {
@@ -7,6 +8,8 @@ type UpsertBusinessInput = {
   owner_phone_number: string;
   display_name: string;
   intake_question?: string | null;
+  billing_mode?: BillingMode | null;
+  is_internal?: boolean | null;
 };
 
 type DatabaseEnv = {
@@ -45,10 +48,11 @@ export async function sendBusinessWelcomeSms(
 }
 
 export async function upsertBusiness(
-  { business_number, owner_phone_number, display_name, intake_question }: UpsertBusinessInput,
+  { business_number, owner_phone_number, display_name, intake_question, billing_mode, is_internal }: UpsertBusinessInput,
   env: DatabaseEnv
 ): Promise<void> {
   await ensureCustomerMissedCallSchema(env.SYSTEMIX);
+  await ensureBillingSchema(env.SYSTEMIX);
 
   const sql = `
     INSERT INTO businesses (
@@ -57,6 +61,8 @@ export async function upsertBusiness(
       owner_phone_number,
       display_name,
       intake_question,
+      billing_mode,
+      is_internal,
       created_at,
       updated_at
     )
@@ -66,6 +72,16 @@ export async function upsertBusiness(
       ?2,
       ?3,
       ?4,
+      CASE
+        WHEN ?5 IS NULL OR ?5 = ''
+        THEN 'pilot'
+        ELSE ?5
+      END,
+      CASE
+        WHEN ?6 IS NULL OR ?6 < 0
+        THEN 0
+        ELSE ?6
+      END,
       strftime('%Y-%m-%dT%H:%M:%fZ','now'),
       strftime('%Y-%m-%dT%H:%M:%fZ','now')
     )
@@ -78,6 +94,16 @@ export async function upsertBusiness(
         THEN businesses.intake_question
         ELSE excluded.intake_question
       END,
+      billing_mode = CASE
+        WHEN ?5 IS NULL OR ?5 = ''
+        THEN businesses.billing_mode
+        ELSE excluded.billing_mode
+      END,
+      is_internal = CASE
+        WHEN ?6 IS NULL OR ?6 < 0
+        THEN businesses.is_internal
+        ELSE excluded.is_internal
+      END,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `;
 
@@ -85,7 +111,9 @@ export async function upsertBusiness(
     business_number,
     owner_phone_number,
     display_name,
-    (intake_question || '').trim() || null
+    (intake_question || '').trim() || null,
+    billing_mode ?? null,
+    typeof is_internal === 'boolean' ? Number(is_internal) : null
   ).run();
   d1Log.log('Business upserted', {
     context: {
@@ -96,6 +124,8 @@ export async function upsertBusiness(
     data: {
       displayName: display_name,
       intakeQuestion: (intake_question || '').trim() || null,
+      billingMode: billing_mode ?? null,
+      isInternal: typeof is_internal === 'boolean' ? is_internal : null,
     },
   });
 

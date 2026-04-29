@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import type { Context } from 'hono';
 import { createLogger } from '../core/logging.ts';
+import { getBusinessBillingState } from '../services/billing.ts';
 import {
   handleCheckoutCompleted,
   prepareCheckoutCompleted,
@@ -21,6 +22,7 @@ type Bindings = {
   INTERNAL_AUTH_KEY?: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  BILLING_ENABLED?: string;
   HUBSPOT_ACCESS_TOKEN?: string;
   ENVIRONMENT?: string;
   TWILIO_ACCOUNT_SID: string;
@@ -181,6 +183,28 @@ export async function stripeWebhookHandler(c: Context<{ Bindings: Bindings }>) {
     return c.text('ok', 200);
   }
 
+  const billingState = await getBusinessBillingState(c.env.SYSTEMIX, c.env, metadata.business_number);
+  if (!billingState.liveBillingAllowed) {
+    stripeLog.warn('Stripe checkout onboarding blocked by billing safeguards', {
+      data: {
+        stripeSessionId,
+        businessNumber: metadata.business_number,
+        reasonCode: billingState.reasonCode,
+      },
+    });
+    return c.json(
+      {
+        ok: true,
+        blocked: true,
+        error: 'billing_blocked',
+        reasonCode: billingState.reasonCode,
+        reason: billingState.reason,
+        billing: billingState,
+      },
+      200
+    );
+  }
+
   stripeLog.log('Scheduling async onboarding', {
     data: {
       stripeSessionId,
@@ -226,5 +250,5 @@ export async function stripeWebhookHandler(c: Context<{ Bindings: Bindings }>) {
     })()
   );
 
-  return c.text('ok', 200);
+  return c.json({ ok: true }, 200);
 }

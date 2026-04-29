@@ -110,6 +110,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const billingEnabled = readEnvVar('BILLING_ENABLED');
+  if (billingEnabled !== 'true') {
+    throw new Error('Live billing is disabled. Set BILLING_ENABLED=true before creating Stripe payment links.');
+  }
+
   const secretKey = readEnvVar('STRIPE_SECRET_KEY');
   if (!secretKey) {
     throw new Error('Missing STRIPE_SECRET_KEY.');
@@ -117,6 +122,11 @@ async function main() {
 
   if (!secretKey.startsWith('sk_live_')) {
     throw new Error('STRIPE_SECRET_KEY must be a live Stripe secret key.');
+  }
+
+  const systemixNumber = readEnvVar('SYSTEMIX_NUMBER')?.trim();
+  if (systemixNumber && systemixNumber === args.businessNumber.trim()) {
+    throw new Error('Internal/test business numbers are blocked from live billing.');
   }
 
   const stripe = new Stripe(secretKey);

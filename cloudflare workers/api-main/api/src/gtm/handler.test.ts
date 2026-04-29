@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { createGtmHandler, createGtmInternalRepliesHandler } from './handler.ts';
+import { createGtmHandler, createGtmInternalFlowHandler, createGtmInternalRepliesHandler } from './handler.ts';
 import { renderTemplate } from './prompts.ts';
 import { SequenceEngine } from './sequence-engine.ts';
 
@@ -372,6 +372,8 @@ describe('createGtmHandler manual trigger routes', () => {
               businessName: 'Jordan Home Services',
               email: 'jordan@example.com',
               source: 'test-fixture',
+              sourceUrl: 'https://example.com/jordan-home-services',
+              evidence: 'Fixture source lists the business email.',
             },
           ],
           limitations: [],
@@ -406,6 +408,8 @@ describe('createGtmHandler manual trigger routes', () => {
           businessName: 'Jordan Home Services',
           email: 'jordan@example.com',
           source: 'test-fixture',
+          sourceUrl: 'https://example.com/jordan-home-services',
+          evidence: 'Fixture source lists the business email.',
         },
       ],
       limitations: [],
@@ -444,6 +448,114 @@ describe('createGtmHandler manual trigger routes', () => {
       candidates: [],
       limitations: ['Lead discovery agent failed; returned empty fallback result'],
     });
+  });
+});
+
+describe('createGtmInternalFlowHandler', () => {
+  it('proxies internal lead create, preview, start, and advance routes', async () => {
+    const calls = {
+      createLead: [],
+      startSequence: [],
+      prepareNextAction: [],
+      advanceLeadSequence: [],
+    };
+
+    const app = createGtmInternalFlowHandler(() => ({
+      async createLead(lead) {
+        calls.createLead.push(lead);
+        return { ok: true, value: undefined };
+      },
+      async startSequence(leadId) {
+        calls.startSequence.push(leadId);
+        return { ok: true, value: undefined };
+      },
+      async prepareNextAction(leadId) {
+        calls.prepareNextAction.push(leadId);
+        return {
+          ok: true,
+          value: {
+            action: 'send',
+            stage: {
+              stageIndex: 0,
+              delayHours: 1,
+              templateKey: 'missed-call-touch-1',
+            },
+            subject: 'Jordan, wanted to follow up',
+            body: 'Hi Jordan, following up on your missed call.',
+          },
+        };
+      },
+      async advanceLeadSequence(leadId) {
+        calls.advanceLeadSequence.push(leadId);
+        return {
+          ok: true,
+          value: {
+            action: 'skipped',
+            leadId,
+            reason: 'awaiting_approval',
+          },
+        };
+      },
+    }));
+
+    const lead = {
+      id: 'lead-internal-1',
+      name: 'Jordan',
+      email: 'jordan@example.com',
+      createdAt: '2026-04-22T00:00:00.000Z',
+    };
+
+    const createResponse = await app.request('/v1/internal/gtm/leads', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(lead),
+    }, {
+      GTM_DB: {},
+    });
+    assert.equal(createResponse.status, 201);
+
+    const startResponse = await app.request('/v1/internal/gtm/sequences/lead-internal-1/start', {
+      method: 'POST',
+    }, {
+      GTM_DB: {},
+    });
+    assert.equal(startResponse.status, 202);
+
+    const nextResponse = await app.request('/v1/internal/gtm/sequences/lead-internal-1/next', {
+      method: 'GET',
+    }, {
+      GTM_DB: {},
+    });
+    assert.equal(nextResponse.status, 200);
+    assert.deepEqual(await nextResponse.json(), {
+      action: 'send',
+      stage: {
+        stageIndex: 0,
+        delayHours: 1,
+        templateKey: 'missed-call-touch-1',
+      },
+      subject: 'Jordan, wanted to follow up',
+      body: 'Hi Jordan, following up on your missed call.',
+    });
+
+    const advanceResponse = await app.request('/v1/internal/gtm/sequences/lead-internal-1/advance', {
+      method: 'POST',
+    }, {
+      GTM_DB: {},
+    });
+    assert.equal(advanceResponse.status, 202);
+    assert.deepEqual(await advanceResponse.json(), {
+      action: 'skipped',
+      leadId: 'lead-internal-1',
+      reason: 'awaiting_approval',
+    });
+
+    assert.deepEqual(calls.createLead, [lead]);
+    assert.deepEqual(calls.startSequence, ['lead-internal-1']);
+    assert.deepEqual(calls.prepareNextAction, ['lead-internal-1']);
+    assert.deepEqual(calls.advanceLeadSequence, ['lead-internal-1']);
   });
 });
 

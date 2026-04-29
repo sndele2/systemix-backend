@@ -45,6 +45,7 @@ preview_id = "d8bd5be6e38d4fa7ba794587c5cff08c"
 VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."
 TWILIO_SIGNATURE_MODE = "log"
 ENVIRONMENT = "production"
+BILLING_ENABLED = "false"
 SYSTEMIX_NUMBER = "+18443217137"
 WORKER_URL = "https://systemix-backend.sean-ndele.workers.dev"
 
@@ -56,6 +57,7 @@ compatibility_flags = ["nodejs_compat"]
 VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."
 TWILIO_SIGNATURE_MODE = "log"
 ENVIRONMENT = "production"
+BILLING_ENABLED = "false"
 SYSTEMIX_NUMBER = "+18443217137"
 WORKER_URL = "https://systemix-backend.sean-ndele.workers.dev"
 
@@ -89,6 +91,7 @@ name = "systemix-backend-dev"
 VOICE_CONSENT_SCRIPT = "Thanks for calling. We're with a customer right now, but we want to help. Leave your name and request after the beep, and look out for a text from us shortly. By staying on the line, you consent to receive texts."
 TWILIO_SIGNATURE_MODE = "log"
 ENVIRONMENT = "development"
+BILLING_ENABLED = "false"
 SYSTEMIX_NUMBER = "+1XXXXXXXXXX"
 
 [[env.dev.d1_databases]]

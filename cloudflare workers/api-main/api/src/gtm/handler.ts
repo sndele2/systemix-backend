@@ -8,6 +8,8 @@ import type { LeadDiscoveryOutput } from './agents/schemas.ts';
 
 import { GTMService } from './service.ts';
 import { parseLeadDiscoveryInput } from './agents/schemas.ts';
+import { exportGtmResearchLeadsToCsv } from './csv.ts';
+import { ManualGtmResearchProvider, validateResearchedLead } from './research.ts';
 
 const GTM_LOG_PREFIX = '[GTM]';
 const AGENT_TIMEOUT_MS = 12_000;
@@ -71,6 +73,10 @@ async function readJsonBody<T>(c: Context<{ Bindings: GTMHandlerBindings }>): Pr
   } catch {
     return null;
   }
+}
+
+async function readTextBody(c: Context<{ Bindings: GTMHandlerBindings }>): Promise<string> {
+  return c.req.text();
 }
 
 async function readOptionalJsonBody<T>(
@@ -516,12 +522,31 @@ export function createGtmHandler(
         AGENT_TIMEOUT_MS,
         'lead discovery agent'
       );
+      const groundedCandidates = [];
+      const rejectedCandidates: string[] = [];
+      for (const candidate of result.candidates) {
+        const validation = validateResearchedLead({
+          ...candidate,
+          businessName: candidate.businessName,
+          email: candidate.email ?? '',
+          sourceUrl: candidate.sourceUrl ?? '',
+          evidence: candidate.evidence ?? '',
+        });
+        if (validation.ok) {
+          groundedCandidates.push(validation.value);
+        } else {
+          rejectedCandidates.push(`${candidate.businessName}: ${validation.error}`);
+        }
+      }
 
       return c.json(
         {
           agent_status: 'ok',
-          candidates: result.candidates,
-          limitations: result.limitations,
+          candidates: groundedCandidates,
+          limitations: [
+            ...result.limitations,
+            ...rejectedCandidates.map((item) => `Rejected ungrounded candidate: ${item}`),
+          ],
         },
         200
       );
@@ -622,6 +647,95 @@ export function createGtmInternalFlowHandler(
   serviceFactory: (bindings: GTMHandlerBindings) => GTMService
 ): Hono<{ Bindings: GTMHandlerBindings }> {
   const app = new Hono<{ Bindings: GTMHandlerBindings }>();
+
+  app.post('/v1/internal/gtm/research/export-csv', async (c) => {
+    const body = await readJsonBody<{ leads?: unknown[] }>(c);
+    if (!body || !Array.isArray(body.leads)) {
+      return jsonError(c, 'Invalid JSON body', 400);
+    }
+
+    const leads = [];
+    for (const rawLead of body.leads) {
+      const validation = validateResearchedLead(rawLead as never);
+      if (!validation.ok) {
+        return jsonError(c, validation.error, 400);
+      }
+
+      leads.push(validation.value);
+      logInfo('gtm_research_lead_exported', {
+        system: 'gtm',
+        businessName: validation.value.businessName,
+        email: validation.value.email,
+        sourceUrl: validation.value.sourceUrl,
+        sourceType: validation.value.sourceType ?? null,
+      });
+    }
+
+    const csvResult = exportGtmResearchLeadsToCsv(leads);
+    if (!csvResult.ok) {
+      return jsonError(c, csvResult.error, 400);
+    }
+
+    return new Response(csvResult.value, {
+      status: 200,
+      headers: {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': 'attachment; filename="gtm-researched-leads.csv"',
+      },
+    });
+  });
+
+  app.post('/v1/internal/gtm/research', async (c) => {
+    const body = await readJsonBody<{
+      objective?: string;
+      searchHints?: string[];
+      marketNotes?: string;
+      maxCandidates?: number;
+    }>(c);
+    if (!body || typeof body.objective !== 'string' || body.objective.trim().length === 0) {
+      return jsonError(c, 'Invalid research request body', 400);
+    }
+
+    const provider = new ManualGtmResearchProvider();
+    const result = await provider.research({
+      objective: body.objective,
+      searchHints: body.searchHints,
+      marketNotes: body.marketNotes,
+      maxCandidates: body.maxCandidates,
+    });
+
+    if (!result.ok) {
+      return c.json(
+        {
+          ok: false,
+          provider: 'manual',
+          error: result.error,
+          candidates: [],
+        },
+        200
+      );
+    }
+
+    return c.json({ ok: true, provider: 'configured', candidates: result.value }, 200);
+  });
+
+  app.post('/v1/internal/gtm/leads/import-csv', async (c) => {
+    if (!c.env?.GTM_DB) {
+      return jsonError(c, 'GTM_DB is not configured', 500);
+    }
+
+    const csv = await readTextBody(c);
+    if (!csv.trim()) {
+      return jsonError(c, 'CSV body is required', 400);
+    }
+
+    try {
+      const service = serviceFactory(c.env);
+      return respondWithResult(c, await service.importReviewedLeadsFromCsv(csv), 201);
+    } catch (error) {
+      return handleUnexpectedError(c, error);
+    }
+  });
 
   app.post('/v1/internal/gtm/leads', async (c) => {
     if (!c.env?.GTM_DB) {

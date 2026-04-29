@@ -6,8 +6,10 @@ import type {
   EmailSendResult,
   EmailStage,
   GTMConfig,
+  GtmImportLeadsResult,
   GtmApprovalRecord,
   GtmRepliesResponse,
+  GtmReviewedLeadInput,
   InboxMessage,
   InboxProvider,
   Lead,
@@ -27,6 +29,7 @@ import type {
 
 import { EmailClient } from './email-client.ts';
 import { parseOutreachWriterOutput } from './agents/schemas.ts';
+import { isReviewedForImport, parseGtmResearchCsv } from './csv.ts';
 import { MicrosoftGraphInboxProvider } from './inbox-client.ts';
 import { DurableLeadStore } from './lead-store.ts';
 import { renderTemplate } from './prompts.ts';
@@ -71,11 +74,15 @@ export interface GtmServiceRuntimeEnv {
   GTM_FROM_EMAIL?: string;
   GTM_FROM_NAME?: string;
   GTM_MAX_TOUCHES?: string;
+  GTM_DRY_RUN?: string;
   GRAPH_TENANT_ID?: string;
   GRAPH_CLIENT_ID?: string;
   GRAPH_CLIENT_SECRET?: string;
   GRAPH_MAILBOX_UPN?: string;
   SMTP_USER?: string;
+  SMTP_HOST?: string;
+  SMTP_PORT?: string;
+  SMTP_PASS?: string;
 }
 
 interface GTMServiceDependencies {
@@ -163,11 +170,13 @@ function parseMaxTouches(value: string | undefined): 1 | 2 | 3 {
 }
 
 function buildRuntimeConfig(env: GtmServiceRuntimeEnv): GTMConfig {
+  const dryRun = env.GTM_DRY_RUN?.trim().toLowerCase() === 'false' ? false : true;
+
   return {
     fromEmail: env.GTM_FROM_EMAIL?.trim() || env.SMTP_USER?.trim() || 'gtm-replies@example.invalid',
     fromName: env.GTM_FROM_NAME?.trim() || 'Systemix',
     maxTouches: parseMaxTouches(env.GTM_MAX_TOUCHES),
-    dryRun: true,
+    dryRun,
   };
 }
 
@@ -251,6 +260,57 @@ function findColdOutreachForbiddenPhrase(subject: string, body: string): string 
   return COLD_OUTREACH_FORBIDDEN_PHRASES.find((phrase) => normalized.includes(phrase)) ?? null;
 }
 
+function countWords(value: string): number {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function normalizeLeadIdValue(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
+
+function buildImportedLeadId(input: GtmReviewedLeadInput): string {
+  const base = normalizeLeadIdValue(input.website || input.email || input.businessName);
+  return `gtm-${base || crypto.randomUUID()}`;
+}
+
+function buildLeadFromReviewedInput(input: GtmReviewedLeadInput): Lead {
+  const now = new Date().toISOString();
+  return {
+    id: buildImportedLeadId(input),
+    name: input.businessName,
+    email: input.email,
+    phone: input.phone,
+    createdAt: now,
+    metadata: {
+      businessName: input.businessName,
+      contactName: input.contactName,
+      niche: input.niche,
+      city: input.city,
+      state: input.state,
+      website: input.website,
+      phone: input.phone,
+      sourceUrl: input.sourceUrl,
+      sourceType: input.sourceType,
+      evidence: input.evidence,
+      confidence: input.confidence,
+      researchNotes: input.researchNotes,
+      outreachAngle: input.outreachAngle,
+      approvalStatus: input.approvalStatus,
+      importStatus: input.importStatus,
+      source: 'gtm_csv_import',
+      importedAt: now,
+    },
+  };
+}
+
 function assertColdOutreachCopySafe(
   lead: LeadRecord,
   subject: string,
@@ -299,7 +359,7 @@ export function createRuntimeGtmService(
 
   return new GTMService({
     store: new DurableLeadStore(env.GTM_DB),
-    emailClient: new EmailClient(config),
+    emailClient: new EmailClient(config, env),
     sequenceEngine: new SequenceEngine({ maxTouches: config.maxTouches }),
     replyClassifier: new ReplyClassifier(),
     config,
@@ -415,6 +475,98 @@ export class GTMService {
     });
 
     return succeed(undefined);
+  }
+
+  async importReviewedLeadsFromCsv(csv: string): Promise<Result<GtmImportLeadsResult>> {
+    const parsedResult = parseGtmResearchCsv(csv);
+    if (!parsedResult.ok) {
+      return fail(parsedResult.error);
+    }
+
+    const imported: GtmImportLeadsResult['imported'] = [];
+    const skipped: GtmImportLeadsResult['skipped'] = [];
+    const seenKeys = new Set<string>();
+
+    for (const reviewedLead of parsedResult.value) {
+      const localKeys = [
+        reviewedLead.email.toLowerCase(),
+        reviewedLead.phone?.replace(/\D/g, ''),
+        reviewedLead.website?.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, ''),
+        reviewedLead.businessName.trim().toLowerCase(),
+      ].filter(Boolean) as string[];
+
+      if (localKeys.some((key) => seenKeys.has(key))) {
+        skipped.push({
+          businessName: reviewedLead.businessName,
+          email: reviewedLead.email,
+          reason: 'duplicate_in_csv',
+        });
+        continue;
+      }
+
+      localKeys.forEach((key) => seenKeys.add(key));
+
+      if (!isReviewedForImport(reviewedLead)) {
+        skipped.push({
+          businessName: reviewedLead.businessName,
+          email: reviewedLead.email,
+          reason: 'not_review_approved',
+        });
+        continue;
+      }
+
+      const duplicateResult = await this.store.findDuplicateLead({
+        businessName: reviewedLead.businessName,
+        email: reviewedLead.email,
+        phone: reviewedLead.phone,
+        website: reviewedLead.website,
+      });
+      if (!duplicateResult.ok) {
+        return fail(duplicateResult.error);
+      }
+
+      if (duplicateResult.value !== null) {
+        skipped.push({
+          businessName: reviewedLead.businessName,
+          email: reviewedLead.email,
+          reason: 'duplicate_existing_lead',
+          duplicateLeadId: duplicateResult.value.id,
+        });
+        continue;
+      }
+
+      const lead = buildLeadFromReviewedInput(reviewedLead);
+      const createResult = await this.store.createLead(lead);
+      if (!createResult.ok) {
+        return fail(createResult.error);
+      }
+
+      logInfo('gtm_research_lead_created', {
+        system: 'gtm',
+        leadId: lead.id,
+        businessName: reviewedLead.businessName,
+        email: reviewedLead.email,
+        sourceUrl: reviewedLead.sourceUrl,
+      });
+
+      logInfo('gtm_research_lead_imported', {
+        system: 'gtm',
+        leadId: lead.id,
+        businessName: reviewedLead.businessName,
+        email: reviewedLead.email,
+        sourceUrl: reviewedLead.sourceUrl,
+        sourceType: reviewedLead.sourceType ?? null,
+        outreachAngle: reviewedLead.outreachAngle ?? null,
+      });
+
+      imported.push({
+        leadId: lead.id,
+        businessName: reviewedLead.businessName,
+        email: reviewedLead.email,
+      });
+    }
+
+    return succeed({ imported, skipped });
   }
 
   async prepareNextAction(leadId: string): Promise<Result<PreparedAction>> {
@@ -550,10 +702,6 @@ export class GTMService {
       return fail('Lead must be active before advancing the sequence');
     }
 
-    if (!this.config.dryRun) {
-      return fail('Live GTM email sending is not implemented');
-    }
-
     const approvalResult = await this.requireOutboundApproval(lead, preparedAction);
     if (!approvalResult.ok) {
       return fail(approvalResult.error);
@@ -567,6 +715,9 @@ export class GTMService {
       });
     }
 
+    const approvedProposal = approvalResult.value.approval;
+    const outboundSubject = approvedProposal?.subject ?? preparedAction.subject;
+    const outboundBody = approvedProposal?.body ?? preparedAction.body;
     const sentAt = new Date().toISOString();
     const touchpoint: Touchpoint = {
       id: crypto.randomUUID(),
@@ -574,7 +725,7 @@ export class GTMService {
       stage_index: preparedAction.stage.stageIndex,
       sent_at: sentAt,
       dry_run: this.config.dryRun,
-      result: 'skipped',
+      result: this.config.dryRun ? 'skipped' : 'success',
       message_id: null,
     };
 
@@ -594,11 +745,19 @@ export class GTMService {
 
     let sendResult: EmailSendResult;
     try {
+      logInfo('gtm_email_send_attempted', {
+        system: 'gtm',
+        leadId,
+        stageIndex: preparedAction.stage.stageIndex,
+        dryRun: this.config.dryRun,
+        approvalCode: approvalResult.value.approval?.approval_code ?? null,
+      });
+
       sendResult = await this.emailClient.send({
         leadId,
         toEmail: lead.email,
-        subject: preparedAction.subject,
-        body: preparedAction.body,
+        subject: outboundSubject,
+        body: outboundBody,
       });
     } catch (error) {
       logError('gtm_email_send_failed', error, {
@@ -619,7 +778,6 @@ export class GTMService {
       return fail('Failed to send GTM email');
     }
 
-    const approvedProposal = approvalResult.value.approval;
     if (approvedProposal !== null) {
       const markExecutedResult = await this.store.markApprovalExecuted(approvedProposal.id, sentAt);
       if (!markExecutedResult.ok) {
@@ -647,6 +805,14 @@ export class GTMService {
     }
 
     const action = sendResult.dryRun ? 'skipped' : 'sent';
+
+    logInfo('gtm_email_send_succeeded', {
+      system: 'gtm',
+      leadId,
+      stageIndex: preparedAction.stage.stageIndex,
+      dryRun: sendResult.dryRun,
+      messageId: sendResult.messageId ?? null,
+    });
 
     logInfo('gtm_lead_advanced', {
       leadId,
@@ -796,6 +962,34 @@ export class GTMService {
     );
     if (!existingApprovalResult.ok) {
       return fail(existingApprovalResult.error);
+    }
+
+    const approvedApprovalResult = await this.store.getLatestApprovedApprovalByLeadStage(
+      lead.id,
+      preparedAction.stage.stageIndex
+    );
+    if (!approvedApprovalResult.ok) {
+      return fail(approvedApprovalResult.error);
+    }
+
+    const approvedApproval = approvedApprovalResult.value;
+    if (approvedApproval !== null) {
+      logInfo('gtm_approval_reused', {
+        system: 'gtm',
+        leadId: lead.id,
+        approvalId: approvedApproval.id,
+        approvalCode: approvedApproval.approval_code,
+        approvalStatus: approvedApproval.status,
+        stageIndex: approvedApproval.stage_index,
+        proposalHash: approvedApproval.proposal_hash,
+        currentProposalHash: proposalHash,
+        deduped: true,
+        smsPreview: null,
+      });
+      return succeed({
+        approved: true,
+        approval: approvedApproval,
+      });
     }
 
     const existingApproval = existingApprovalResult.value;

@@ -22,6 +22,11 @@ import {
 } from './core/internal-auth.ts';
 import { createLogger } from './core/logging.ts';
 import { createTwilioRestClient } from './core/sms.ts';
+import {
+  getBusinessBillingState,
+  normalizeBillingMode,
+  normalizeInternalBillingFlag,
+} from './services/billing.ts';
 import { resolveGtmConfigFromEnv, sendGtmTestEmail } from './gtm/email-client.ts';
 import { runOutreachWriter } from './gtm/agents/runner.ts';
 import { MicrosoftGraphInboxProvider } from './gtm/inbox-client.ts';
@@ -88,6 +93,7 @@ type Bindings = {
   GTM_ADMIN_KEY?: string;
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  BILLING_ENABLED?: string;
   FALLBACK_AGENT_NUMBER?: string;
   FALLBACK_NUMBER?: string;
   GTM_DRY_RUN?: string;
@@ -175,7 +181,7 @@ function isInternalRequestAuthorized(c: Context<AppEnv>): boolean {
 
 function shouldSkipStartupValidation(request: Request): boolean {
   const pathname = new URL(request.url).pathname;
-  return isProtectedInternalOperatorRoute(pathname);
+  return pathname === '/v1/internal/billing-state' || isProtectedInternalOperatorRoute(pathname);
 }
 
 function isLocalGtmTestEnvironment(env: Bindings): boolean {
@@ -339,27 +345,56 @@ function buildGtmApprovalProposalPreview(input: ApprovalNotificationRequest): st
 }
 
 function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): OutreachWriterInput {
-  const summary = readLeadMetadataString(lead, 'summary') ?? readLeadMetadataString(lead, 'notes');
+  const summary =
+    readLeadMetadataString(lead, 'summary') ??
+    readLeadMetadataString(lead, 'researchNotes') ??
+    readLeadMetadataString(lead, 'notes');
+  const niche = readLeadMetadataString(lead, 'niche') ?? readLeadMetadataString(lead, 'industry');
+  const sourceUrl = readLeadMetadataString(lead, 'sourceUrl');
+  const evidence = readLeadMetadataString(lead, 'evidence');
+  const outreachAngle = readLeadMetadataString(lead, 'outreachAngle');
 
   return {
     candidate: {
-      businessName: lead.name,
+      businessName: readLeadMetadataString(lead, 'businessName') ?? lead.name,
       contactName: readLeadMetadataString(lead, 'contactName'),
       website: readLeadMetadataString(lead, 'website'),
       email: lead.email,
       phone: lead.phone,
       city: readLeadMetadataString(lead, 'city'),
       state: readLeadMetadataString(lead, 'state'),
-      industry: readLeadMetadataString(lead, 'industry'),
+      industry: niche,
+      niche,
       source: readLeadMetadataString(lead, 'source'),
+      sourceUrl,
+      sourceType: readLeadMetadataString(lead, 'sourceType'),
+      evidence,
+      confidence:
+        typeof lead.metadata?.confidence === 'number' ? lead.metadata.confidence : undefined,
+      researchNotes: readLeadMetadataString(lead, 'researchNotes'),
+      outreachAngle,
       summary,
     },
-    outreachAngle: 'lost_jobs_recovery',
+    outreachAngle:
+      outreachAngle === 'missed_call_recovery' ||
+      outreachAngle === 'lost_jobs_recovery' ||
+      outreachAngle === 'revenue_recovery' ||
+      outreachAngle === 'general_follow_up' ||
+      outreachAngle === 'no_fit'
+        ? outreachAngle
+        : 'missed_call_recovery',
     businessContext:
-      'Internal GTM dry-run outreach for Systemix. Write only prospective outbound email copy; do not imply prior contact unless the lead metadata explicitly says warm or recovery.',
+      'Internal GTM outreach for Systemix. Write only prospective outbound email copy; do not imply prior contact unless the lead metadata explicitly says warm or recovery.',
     groundingFacts: [
       'Systemix helps service businesses respond to missed calls.',
       'The proposal is internal GTM copy only and must not send email.',
+      niche ? `Lead niche: ${niche}.` : 'Lead niche is unknown; keep the copy conservative.',
+      sourceUrl
+        ? `Research source URL: ${truncateApprovalSmsValue(sourceUrl, 150)}.`
+        : 'No research source URL was provided.',
+      evidence
+        ? `Evidence: ${truncateApprovalSmsValue(evidence, 160)}.`
+        : 'No source evidence was provided.',
       `This is sequence touch ${stage.stageIndex + 1}.`,
     ],
     maxWords: 70,
@@ -1202,6 +1237,8 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
       owner_phone_number?: string;
       display_name?: string;
       intake_question?: string;
+      billing_mode?: string;
+      is_internal?: boolean | string;
     };
 
     try {
@@ -1210,6 +1247,8 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
         owner_phone_number?: string;
         display_name?: string;
         intake_question?: string;
+        billing_mode?: string;
+        is_internal?: boolean | string;
       };
     } catch {
       return c.json({ error: 'Invalid JSON body' }, 400);
@@ -1220,9 +1259,19 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
       typeof payload.owner_phone_number === 'string' ? payload.owner_phone_number.trim() : '';
     const display_name = typeof payload.display_name === 'string' ? payload.display_name.trim() : '';
     const intake_question = typeof payload.intake_question === 'string' ? payload.intake_question.trim() : '';
+    const billingMode = normalizeBillingMode(payload.billing_mode);
+    const isInternal = normalizeInternalBillingFlag(payload.is_internal);
 
     if (!business_number || !owner_phone_number || !display_name) {
       return c.json({ error: 'Missing required fields' }, 400);
+    }
+
+    if (payload.billing_mode !== undefined && billingMode === null) {
+      return c.json({ error: 'billing_mode must be pilot or live' }, 400);
+    }
+
+    if (payload.is_internal !== undefined && isInternal === null) {
+      return c.json({ error: 'is_internal must be true or false' }, 400);
     }
 
     scheduleTwilioBackgroundTask(
@@ -1234,6 +1283,8 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
           owner_phone_number,
           display_name,
           intake_question: intake_question || null,
+          billing_mode: billingMode,
+          is_internal: isInternal,
         },
         c.env
       ).then(() =>
@@ -1245,12 +1296,34 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
           },
           data: {
             displayName: display_name,
+            billingMode,
+            isInternal,
           },
         })
       )
     );
 
     return c.json({ success: true }, 200);
+  });
+
+  app.get('/v1/internal/billing-state', async (c) => {
+    if (!isInternalRequestAuthorized(c)) {
+      return c.json({ ok: false, error: 'Unauthorized' }, 401);
+    }
+
+    const businessNumber = normalizePhone(c.req.query('business_number') || '');
+    if (!businessNumber) {
+      return c.json({ ok: false, error: 'business_number is required' }, 400);
+    }
+
+    const billingState = await getBusinessBillingState(c.env.SYSTEMIX, c.env, businessNumber);
+    return c.json(
+      {
+        ok: true,
+        billing: billingState,
+      },
+      200
+    );
   });
 
   app.post('/v1/internal/missed-call/ignore-number', async (c) => {
