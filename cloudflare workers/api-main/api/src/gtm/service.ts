@@ -43,12 +43,26 @@ const MAX_SYNC_BATCH_SIZE = 50;
 const AGENT_TIMEOUT_MS = 12_000;
 const GTM_RUNTIME_LABEL = 'production';
 const COLD_OUTREACH_FORBIDDEN_PHRASES = [
+  'if missed calls are common',
+  'may be costing',
+  'can help',
+  'keep potential clients engaged',
+  "let me know if you'd like",
+  'let me know if you would like',
+  'would you like to see how it works',
+  'service businesses',
+  'recover lost jobs',
   'follow up on your call',
   'follow up on your missed call',
+  'follow up',
+  'following up',
   'calling back',
   'as discussed',
-  'following up',
+  'we missed your call',
+  'your missed call',
 ] as const;
+const COLD_OUTREACH_MIN_WORDS = 45;
+const COLD_OUTREACH_MAX_WORDS = 90;
 
 export interface GtmServiceRuntimeEnv {
   GTM_DB: D1Database;
@@ -257,6 +271,23 @@ function assertColdOutreachCopySafe(
       fallbackUsed: true,
     });
     throw new Error(`Cold GTM outreach cannot imply prior contact: ${forbiddenPhrase}`);
+  }
+
+  const wordCount = body
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  if (wordCount < COLD_OUTREACH_MIN_WORDS || wordCount > COLD_OUTREACH_MAX_WORDS) {
+    logInfo('gtm_cold_copy_safety_rejected', {
+      system: 'gtm',
+      leadId: lead.id,
+      stageIndex: stageIndex ?? null,
+      wordCount,
+      fallbackUsed: true,
+    });
+    throw new Error(
+      `Cold GTM outreach body must be ${COLD_OUTREACH_MIN_WORDS}-${COLD_OUTREACH_MAX_WORDS} words`
+    );
   }
 }
 

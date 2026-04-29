@@ -1045,8 +1045,9 @@ test('buildGtmApprovalSmsBody is decision-first and uses the finalized proposal'
         stage: {
           stageIndex: 1,
         },
-        subject: 'Jordan, wanted to follow up on the missed call and open job',
-        body: 'Finalized GTM proposal body from the writer.',
+        subject: 'Missed calls?',
+        body:
+          'Hi Jordan,\n\nDo you ever miss calls while you are on detailing jobs or working with a customer?\n\nThat is usually where new jobs get lost.\n\nI built something that texts missed callers back instantly so they do not move on.\n\nWant me to send a quick demo?',
       },
     }
   );
@@ -1054,7 +1055,7 @@ test('buildGtmApprovalSmsBody is decision-first and uses the finalized proposal'
   assert.match(body, /ABC12345/);
   assert.match(body, /Jordan - mobile detailing/);
   assert.match(body, /Why: likely misses calls while on jobs/);
-  assert.match(body, /"Finalized GTM proposal body from the writer."/);
+  assert.match(body, /"Do you ever miss calls while you are on detailing jobs or working with a customer\?"/);
   assert.match(body, /YES ABC12345 \/ NO ABC12345/);
   assert.doesNotMatch(body, /Systemix approval|Systemix GTM|lead-full-id-should-not-appear|Test Roofer|touch 2/);
 });
@@ -1090,7 +1091,7 @@ test('resolveGtmApprovalNotificationTarget fails closed to the fixed GTM operato
       stage: {
         stageIndex: 0,
       },
-      subject: 'Jordan, wanted to follow up on your missed call',
+      subject: 'Missed calls?',
     },
   });
 
@@ -1151,8 +1152,9 @@ test('createRuntimeGtmApprovalHooks sends an approval SMS through the runtime tw
         stage: {
           stageIndex: 0,
         },
-        subject: 'Jordan, wanted to follow up on your missed call',
-        body: 'Actual finalized outbound body for approval.',
+        subject: 'Missed calls?',
+        body:
+          'Hi Jordan,\n\nDo you ever miss calls while you are on roofing jobs or working with a customer?\n\nThat is usually where new jobs get lost.\n\nI built something that texts missed callers back instantly so they do not move on.\n\nWant me to send a quick demo?',
       },
     });
 
@@ -1161,7 +1163,7 @@ test('createRuntimeGtmApprovalHooks sends an approval SMS through the runtime tw
     assert.match(String(fetchCalls[0].init.body), /To=%2B12179912895/);
     assert.match(String(fetchCalls[0].init.body), /From=%2B18443217137/);
     assert.match(String(fetchCalls[0].init.body), /Jordan\+-\+roofing/);
-    assert.match(String(fetchCalls[0].init.body), /Actual\+finalized\+outbound\+body\+for\+approval/);
+    assert.match(String(fetchCalls[0].init.body), /Do\+you\+ever\+miss\+calls\+while\+you\+are\+on\+roofing\+jobs/);
     assert.match(String(fetchCalls[0].init.body), /YES\+ABC12345\+%2F\+NO\+ABC12345/);
     assert.doesNotMatch(String(fetchCalls[0].init.body), /Systemix\+approval|Systemix\+GTM/);
   } finally {

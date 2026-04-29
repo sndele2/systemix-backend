@@ -61,10 +61,16 @@ describe('SequenceEngine', () => {
 });
 
 describe('renderTemplate', () => {
-  it('includes the lead name in the subject', () => {
+  it('renders sharp cold fallback copy without disallowed phrases', () => {
     const rendered = renderTemplate('missed-call-touch-1', sampleLead);
 
-    assert.match(rendered.subject, /Jordan/);
+    assert.equal(rendered.subject, 'Missed calls?');
+    assert.match(rendered.body, /Hi Jordan/);
+    assert.match(rendered.body, /Want me to send a quick demo/);
+    assert.doesNotMatch(
+      `${rendered.subject}\n${rendered.body}`,
+      /if missed calls are common|may be costing|can help|keep potential clients engaged|let me know if you'd like|would you like to see how it works|service businesses|recover lost jobs|follow up|following up|calling back|as discussed|your missed call/i
+    );
   });
 
   it('throws on an unknown template key', () => {

@@ -1,5 +1,6 @@
 // @ts-nocheck
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { EmailClient } from './email-client.ts';
@@ -17,6 +18,9 @@ test.after(() => {
   console.log = originalConsoleLog;
   console.error = originalConsoleError;
 });
+
+const DISALLOWED_COLD_GTM_COPY =
+  /if missed calls are common|may be costing|can help|keep potential clients engaged|let me know if you'd like|would you like to see how it works|service businesses|recover lost jobs|follow up|following up|calling back|as discussed|your missed call/i;
 
 class FakeLeadStore {
   constructor(eventLog = []) {
@@ -595,11 +599,22 @@ test('prepareNextAction is read-only and returns the rendered send action', asyn
   assert.equal(result.ok, true);
   assert.deepEqual(result.value.action, 'send');
   assert.equal(result.value.stage.stageIndex, 0);
-  assert.match(result.value.subject, /Jordan/);
+  assert.equal(result.value.subject, 'Missed calls?');
   assert.deepEqual(
     store.calls.map((entry) => entry.method),
     ['getLeadById', 'listTouchpointsByLeadId']
   );
+});
+
+test('outreach writer instructions include the cold GTM reply-driven constraints', () => {
+  const source = readFileSync(new URL('./agents/outreach-writer.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /Line 1: a direct question tied to the owner's daily reality/);
+  assert.match(source, /missed calls become lost jobs or bookings/);
+  assert.match(source, /I built/);
+  assert.match(source, /simple low-friction CTA/);
+  assert.match(source, /if missed calls are common/);
+  assert.match(source, /no recovery-style wording for cold GTM prospects/);
 });
 
 test('prepareNextAction falls back to renderTemplate when the outreach writer fails', async () => {
@@ -615,8 +630,10 @@ test('prepareNextAction falls back to renderTemplate when the outreach writer fa
   const result = await service.prepareNextAction('lead-123');
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
-  assert.match(result.value.subject, /Jordan/);
-  assert.match(result.value.body, /Systemix can answer, capture the request/);
+  assert.equal(result.value.subject, 'Missed calls?');
+  assert.match(result.value.body, /Do you ever miss calls/);
+  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
 test('prepareNextAction uses validated outreach writer output for GTM proposals', async () => {
@@ -625,7 +642,8 @@ test('prepareNextAction uses validated outreach writer output for GTM proposals'
       async writeOutreach() {
         return {
           subject: 'Agent subject for revenue recovery',
-          body: 'Agent body about missed calls costing booked jobs.',
+          body:
+            'Hi Jordan, do you ever miss calls while you are on detailing jobs or working with a customer? That is usually where new bookings get lost. I built something that texts missed callers back instantly so they do not move on. Want me to send a quick demo?',
           variantLabel: 'agent-proof',
         };
       },
@@ -637,7 +655,7 @@ test('prepareNextAction uses validated outreach writer output for GTM proposals'
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.equal(result.value.subject, 'Agent subject for revenue recovery');
-  assert.equal(result.value.body, 'Agent body about missed calls costing booked jobs.');
+  assert.match(result.value.body, /texts missed callers back instantly/);
 });
 
 test('prepareNextAction falls back when outreach writer schema validation fails', async () => {
@@ -658,7 +676,8 @@ test('prepareNextAction falls back when outreach writer schema validation fails'
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.notEqual(result.value.subject, 'Agent subject');
-  assert.match(result.value.body, /Systemix can answer, capture the request/);
+  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
 test('prepareNextAction rejects cold outreach writer copy that implies prior contact and uses fallback', async () => {
@@ -678,9 +697,54 @@ test('prepareNextAction rejects cold outreach writer copy that implies prior con
   const result = await service.prepareNextAction('lead-123');
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
-  assert.doesNotMatch(result.value.subject.toLowerCase(), /follow up on your call|calling back|as discussed|following up/);
-  assert.doesNotMatch(result.value.body.toLowerCase(), /follow up on your call|calling back|as discussed|following up/);
-  assert.match(result.value.body, /Systemix can answer, capture the request/);
+  assert.doesNotMatch(result.value.subject, DISALLOWED_COLD_GTM_COPY);
+  assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
+  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+});
+
+test('prepareNextAction rejects generic cold GTM phrases and uses fallback copy', async () => {
+  const { service, store } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        return {
+          subject: 'Recover lost jobs',
+          body:
+            'Hi Jordan, if missed calls are common, our system can help keep potential clients engaged. Let me know if you would like to see how it works for service businesses.',
+          variantLabel: 'generic',
+        };
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+
+  const result = await service.prepareNextAction('lead-123');
+  assert.equal(result.ok, true);
+  assert.equal(result.value.action, 'send');
+  assert.equal(result.value.subject, 'Missed calls?');
+  assert.doesNotMatch(result.value.subject, DISALLOWED_COLD_GTM_COPY);
+  assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
+});
+
+test('prepareNextAction rejects cold GTM bodies under the reply-driven word floor', async () => {
+  const { service, store } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        return {
+          subject: 'Missed calls?',
+          body: 'Do you ever miss calls during busy hours? I built Systemix to text callers back. Want a demo?',
+          variantLabel: 'too-short',
+        };
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+
+  const result = await service.prepareNextAction('lead-123');
+  assert.equal(result.ok, true);
+  assert.equal(result.value.action, 'send');
+  assert.equal(result.value.subject, 'Missed calls?');
+  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
 test('advanceLeadSequence persists the touchpoint before the email call and then updates the lead', async () => {

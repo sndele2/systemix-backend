@@ -7,36 +7,45 @@ type TemplateRenderer = (lead: Lead) => RenderedEmailTemplate;
 
 const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
   'missed-call-touch-1': (lead) => ({
-    subject: `${resolveLeadName(lead)}, quick call-handling idea`,
+    subject: 'Missed calls?',
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'When calls come in while your team is busy, Systemix can answer, capture the request, and route the next step back to you.',
-      'If that would help, I can send a quick breakdown.',
+      `Do you ever miss calls while you're ${resolveDailyReality(lead)}?`,
       '',
-      'Worth a look?',
+      'That is usually where new jobs get lost, because the next shop is one tap away.',
+      '',
+      'I built something that texts missed callers back instantly so they do not move on.',
+      '',
+      'Want me to send a quick demo?',
     ].join('\n'),
   }),
   'missed-call-touch-2': (lead) => ({
-    subject: `${resolveLeadName(lead)}, quick idea for missed calls`,
+    subject: resolveNicheSubject(lead),
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'I had a short idea for keeping new inquiries from sitting unanswered during busy parts of the day.',
-      'Systemix can collect the details and hand them back to your team quickly.',
+      `Are calls easy to miss when you're ${resolveDailyReality(lead)}?`,
       '',
-      'Open to a short overview?',
+      'A missed call can turn into a lost booking before you get a quiet minute.',
+      '',
+      'I built something that replies by text right away and captures what the caller needs.',
+      '',
+      'Want me to send the short version?',
     ].join('\n'),
   }),
   'missed-call-touch-3': (lead) => ({
-    subject: `${resolveLeadName(lead)}, closing the loop`,
+    subject: 'Quick question',
     body: [
       `Hi ${resolveLeadName(lead)},`,
       '',
-      'Last note from me so I do not keep emailing you unnecessarily.',
-      'If inbound calls are hard to catch during the day, Systemix can help make sure each request gets captured.',
+      `Last note from me: do calls ever slip by while you're ${resolveDailyReality(lead)}?`,
       '',
-      'If not, you can ignore this and I will close it out.',
+      'That is the moment a new job can go to whoever answers first.',
+      '',
+      'I built a simple text-back flow for missed callers so they do not disappear.',
+      '',
+      'Worth sending over?',
     ].join('\n'),
   }),
 };
@@ -44,6 +53,38 @@ const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
 function resolveLeadName(lead: Lead): string {
   const trimmedName = lead.name.trim();
   return trimmedName.length > 0 ? trimmedName : 'there';
+}
+
+function readLeadMetadataString(lead: Lead, key: string): string | undefined {
+  const value = lead.metadata?.[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function resolveNiche(lead: Lead): string | undefined {
+  return readLeadMetadataString(lead, 'niche') ?? readLeadMetadataString(lead, 'industry');
+}
+
+function resolveDailyReality(lead: Lead): string {
+  const niche = resolveNiche(lead)?.toLowerCase();
+
+  if (niche?.includes('detail')) return 'detailing or working with a customer';
+  if (niche?.includes('roof')) return 'on a roof or checking a job';
+  if (niche?.includes('plumb')) return 'on a plumbing job';
+  if (niche?.includes('hvac')) return 'on an HVAC job';
+  if (niche?.includes('clean')) return 'cleaning or walking a customer through a quote';
+
+  return 'with a customer or in the middle of a job';
+}
+
+function resolveNicheSubject(lead: Lead): string {
+  const niche = resolveNiche(lead)?.toLowerCase();
+
+  if (niche?.includes('detail')) return 'Calls while detailing?';
+  if (niche?.includes('roof')) return 'Calls on jobs?';
+  if (niche?.includes('plumb')) return 'Missed plumbing calls?';
+  if (niche?.includes('hvac')) return 'Missed HVAC calls?';
+
+  return 'New jobs';
 }
 
 export function renderTemplate(templateKey: string, lead: Lead): RenderedEmailTemplate {
