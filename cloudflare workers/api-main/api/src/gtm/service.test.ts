@@ -22,6 +22,13 @@ test.after(() => {
 const DISALLOWED_COLD_GTM_COPY =
   /if missed calls are common|may be costing|can help|keep potential clients engaged|let me know if you'd like|would you like to see how it works|service businesses|recover lost jobs|follow up|following up|calling back|as discussed|your missed call/i;
 
+function countWords(value) {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
 class FakeLeadStore {
   constructor(eventLog = []) {
     this.eventLog = eventLog;
@@ -695,6 +702,8 @@ test('outreach writer instructions include the cold GTM reply-driven constraints
   assert.match(source, /missed calls become lost jobs or bookings/);
   assert.match(source, /I built/);
   assert.match(source, /simple low-friction CTA/);
+  assert.match(source, /target 55-65 body words/);
+  assert.match(source, /count the final body words before returning/);
   assert.match(source, /if missed calls are common/);
   assert.match(source, /no recovery-style wording for cold GTM prospects/);
 });
@@ -737,7 +746,10 @@ test('prepareNextAction uses validated outreach writer output for GTM proposals'
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.equal(result.value.subject, 'Agent subject for revenue recovery');
+  assert.ok(countWords(result.value.body) >= 45);
+  assert.ok(countWords(result.value.body) <= 70);
   assert.match(result.value.body, /texts missed callers back instantly/);
+  assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
 test('prepareNextAction falls back when outreach writer schema validation fails', async () => {

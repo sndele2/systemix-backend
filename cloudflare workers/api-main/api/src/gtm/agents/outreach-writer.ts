@@ -15,6 +15,8 @@ Requirements:
 - cold GTM is discovered lead outreach; do not write customer-facing missed-call recovery copy unless the candidate is explicitly warm or recovery
 - output a subject, body, and variant label
 - keep cold GTM bodies between 45 and 90 words, under the requested maxWords limit, and under 70 words when no limit is supplied
+- for the normal production maxWords of 70, target 55-65 body words so the draft clears the 45-word floor without becoming padded
+- count the final body words before returning; if it is under 45 words, add one concrete daily-reality detail or consequence from the candidate context
 - plain text only
 - no markdown
 - no bullets
