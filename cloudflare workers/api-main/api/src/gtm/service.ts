@@ -716,31 +716,26 @@ export class GTMService {
     }
 
     const approvedProposal = approvalResult.value.approval;
-    const outboundSubject = approvedProposal?.subject ?? preparedAction.subject;
-    const outboundBody = approvedProposal?.body ?? preparedAction.body;
+    const outboundSubject = approvedProposal.subject;
+    const outboundBody = approvedProposal.body;
     const sentAt = new Date().toISOString();
-    const touchpoint: Touchpoint = {
-      id: crypto.randomUUID(),
-      lead_id: leadId,
-      stage_index: preparedAction.stage.stageIndex,
-      sent_at: sentAt,
-      dry_run: this.config.dryRun,
-      result: this.config.dryRun ? 'skipped' : 'success',
-      message_id: null,
-    };
+    const proposalHash = buildApprovalProposalHash(
+      lead.id,
+      preparedAction.stage.stageIndex,
+      approvedProposal.subject,
+      approvedProposal.body
+    );
 
-    const recordTouchpointResult = await this.store.recordTouchpoint(touchpoint);
-    if (!recordTouchpointResult.ok) {
-      return fail(recordTouchpointResult.error);
-    }
-
-    logInfo('gtm_touchpoint_persisted', {
+    logInfo('gtm_email_allowed_after_approval', {
+      system: 'gtm',
       leadId,
-      touchpointId: touchpoint.id,
-      stageIndex: touchpoint.stage_index,
-      dryRun: touchpoint.dry_run,
-      result: touchpoint.result,
-      sentAt: touchpoint.sent_at,
+      stageIndex: preparedAction.stage.stageIndex,
+      proposalHash,
+      approvalCode: approvedProposal.approval_code,
+      approvalStatus: approvedProposal.status,
+      dryRun: this.config.dryRun,
+      fallbackUsed: null,
+      schemaValidation: null,
     });
 
     let sendResult: EmailSendResult;
@@ -749,8 +744,12 @@ export class GTMService {
         system: 'gtm',
         leadId,
         stageIndex: preparedAction.stage.stageIndex,
+        proposalHash,
         dryRun: this.config.dryRun,
-        approvalCode: approvalResult.value.approval?.approval_code ?? null,
+        approvalCode: approvedProposal.approval_code,
+        approvalStatus: approvedProposal.status,
+        fallbackUsed: null,
+        schemaValidation: null,
       });
 
       sendResult = await this.emailClient.send({
@@ -763,6 +762,7 @@ export class GTMService {
       logError('gtm_email_send_failed', error, {
         leadId,
         stageIndex: preparedAction.stage.stageIndex,
+        proposalHash,
         dryRun: this.config.dryRun,
       });
       return fail('Failed to send GTM email');
@@ -773,21 +773,63 @@ export class GTMService {
       logError('gtm_email_send_unsuccessful', sendError, {
         leadId,
         stageIndex: preparedAction.stage.stageIndex,
+        proposalHash,
         dryRun: sendResult.dryRun,
       });
       return fail('Failed to send GTM email');
     }
 
-    if (approvedProposal !== null) {
-      const markExecutedResult = await this.store.markApprovalExecuted(approvedProposal.id, sentAt);
-      if (!markExecutedResult.ok) {
-        logError('gtm_approval_mark_executed_failed', new Error(markExecutedResult.error), {
-          leadId,
-          approvalId: approvedProposal.id,
-          approvalCode: approvedProposal.approval_code,
-        });
-      }
+    const markExecutedResult = await this.store.markApprovalExecuted(approvedProposal.id, sentAt);
+    if (!markExecutedResult.ok) {
+      logError('gtm_approval_mark_executed_failed', new Error(markExecutedResult.error), {
+        leadId,
+        approvalId: approvedProposal.id,
+        approvalCode: approvedProposal.approval_code,
+        approvalStatus: approvedProposal.status,
+        stageIndex: preparedAction.stage.stageIndex,
+        proposalHash,
+        dryRun: sendResult.dryRun,
+      });
+      return fail(markExecutedResult.error);
     }
+
+    logInfo('gtm_approval_executed', {
+      system: 'gtm',
+      leadId,
+      approvalId: approvedProposal.id,
+      approvalCode: approvedProposal.approval_code,
+      approvalStatus: 'executed',
+      stageIndex: preparedAction.stage.stageIndex,
+      proposalHash,
+      dryRun: sendResult.dryRun,
+      fallbackUsed: null,
+      schemaValidation: null,
+    });
+
+    const touchpoint: Touchpoint = {
+      id: crypto.randomUUID(),
+      lead_id: leadId,
+      stage_index: preparedAction.stage.stageIndex,
+      sent_at: sentAt,
+      dry_run: this.config.dryRun,
+      result: this.config.dryRun ? 'skipped' : 'success',
+      message_id: sendResult.messageId ?? null,
+    };
+
+    const recordTouchpointResult = await this.store.recordTouchpoint(touchpoint);
+    if (!recordTouchpointResult.ok) {
+      return fail(recordTouchpointResult.error);
+    }
+
+    logInfo('gtm_touchpoint_persisted', {
+      leadId,
+      touchpointId: touchpoint.id,
+      stageIndex: touchpoint.stage_index,
+      proposalHash,
+      dryRun: touchpoint.dry_run,
+      result: touchpoint.result,
+      sentAt: touchpoint.sent_at,
+    });
 
     const updateLeadResult = await this.store.updateLead(leadId, {
       touches_sent: lead.touches_sent + 1,
@@ -810,6 +852,7 @@ export class GTMService {
       system: 'gtm',
       leadId,
       stageIndex: preparedAction.stage.stageIndex,
+      proposalHash,
       dryRun: sendResult.dryRun,
       messageId: sendResult.messageId ?? null,
     });
@@ -947,7 +990,7 @@ export class GTMService {
   private async requireOutboundApproval(
     lead: LeadRecord,
     preparedAction: Extract<PreparedAction, { action: 'send' }>
-  ): Promise<Result<{ approved: true; approval: GtmApprovalRecord | null } | { approved: false; approval: null; reason: string }>> {
+  ): Promise<Result<{ approved: true; approval: GtmApprovalRecord } | { approved: false; approval: null; reason: string }>> {
     const proposalHash = buildApprovalProposalHash(
       lead.id,
       preparedAction.stage.stageIndex,
@@ -964,37 +1007,9 @@ export class GTMService {
       return fail(existingApprovalResult.error);
     }
 
-    const approvedApprovalResult = await this.store.getLatestApprovedApprovalByLeadStage(
-      lead.id,
-      preparedAction.stage.stageIndex
-    );
-    if (!approvedApprovalResult.ok) {
-      return fail(approvedApprovalResult.error);
-    }
-
-    const approvedApproval = approvedApprovalResult.value;
-    if (approvedApproval !== null) {
-      logInfo('gtm_approval_reused', {
-        system: 'gtm',
-        leadId: lead.id,
-        approvalId: approvedApproval.id,
-        approvalCode: approvedApproval.approval_code,
-        approvalStatus: approvedApproval.status,
-        stageIndex: approvedApproval.stage_index,
-        proposalHash: approvedApproval.proposal_hash,
-        currentProposalHash: proposalHash,
-        deduped: true,
-        smsPreview: null,
-      });
-      return succeed({
-        approved: true,
-        approval: approvedApproval,
-      });
-    }
-
     const existingApproval = existingApprovalResult.value;
     if (existingApproval?.status === 'approved') {
-      logInfo('gtm_approval_reused', {
+      logInfo('gtm_approved_proposal_reused', {
         system: 'gtm',
         leadId: lead.id,
         approvalId: existingApproval.id,
@@ -1002,6 +1017,9 @@ export class GTMService {
         approvalStatus: existingApproval.status,
         stageIndex: existingApproval.stage_index,
         proposalHash,
+        dryRun: this.config.dryRun,
+        fallbackUsed: null,
+        schemaValidation: null,
         deduped: true,
         smsPreview: null,
       });
@@ -1013,12 +1031,16 @@ export class GTMService {
 
     if (existingApproval?.status === 'executed') {
       logInfo('gtm_approval_already_executed', {
+        system: 'gtm',
         leadId: lead.id,
         approvalId: existingApproval.id,
         approvalCode: existingApproval.approval_code,
         approvalStatus: existingApproval.status,
         stageIndex: existingApproval.stage_index,
         proposalHash,
+        dryRun: this.config.dryRun,
+        fallbackUsed: null,
+        schemaValidation: null,
         deduped: true,
         smsPreview: null,
       });
@@ -1027,13 +1049,17 @@ export class GTMService {
     }
 
     if (existingApproval?.status === 'rejected') {
-      logInfo('gtm_approval_rejected', {
+      logInfo('gtm_email_blocked_rejected_approval', {
+        system: 'gtm',
         leadId: lead.id,
         approvalId: existingApproval.id,
         approvalCode: existingApproval.approval_code,
         approvalStatus: existingApproval.status,
         stageIndex: existingApproval.stage_index,
         proposalHash,
+        dryRun: this.config.dryRun,
+        fallbackUsed: null,
+        schemaValidation: null,
         deduped: true,
         smsPreview: null,
       });
@@ -1106,23 +1132,26 @@ export class GTMService {
           smsPreview: preparedAction.body,
         });
       }
-    } else {
-      logInfo('gtm_approval_pending_reused', {
-        system: 'gtm',
-        leadId: lead.id,
-        approvalId: approval.id,
-        approvalCode: approval.approval_code,
-        approvalStatus: approval.status,
-        stageIndex: approval.stage_index,
-        proposalHash,
-        deduped: true,
-        smsPreview: approval.body,
-      });
     }
 
     if (createdApproval) {
       await this.notifyApprovalRequested(lead, preparedAction, approval, proposalHash);
     }
+
+    logInfo('gtm_email_blocked_pending_approval', {
+      system: 'gtm',
+      leadId: lead.id,
+      approvalId: approval.id,
+      approvalCode: approval.approval_code,
+      approvalStatus: approval.status,
+      stageIndex: approval.stage_index,
+      proposalHash,
+      dryRun: this.config.dryRun,
+      fallbackUsed: null,
+      schemaValidation: null,
+      deduped: !createdApproval,
+      smsPreview: approval.body,
+    });
 
     return succeed({
       approved: false,

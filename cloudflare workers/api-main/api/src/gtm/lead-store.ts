@@ -105,10 +105,6 @@ export interface LeadStore {
     stageIndex: EmailStage['stageIndex'],
     proposalHash: string
   ): Promise<Result<GtmApprovalRecord | null>>;
-  getLatestApprovedApprovalByLeadStage(
-    leadId: string,
-    stageIndex: EmailStage['stageIndex']
-  ): Promise<Result<GtmApprovalRecord | null>>;
   getSyncCursor(): Promise<Result<SyncCursor | null>>;
   markApprovalExecuted(approvalId: string, executedAt: string): Promise<Result<void>>;
   markApprovalNotified(approvalId: string, notifiedAt: string): Promise<Result<void>>;
@@ -646,34 +642,6 @@ export class DurableLeadStore implements LeadStore {
         stageIndex,
       });
       return fail('Failed to load GTM approval');
-    }
-  }
-
-  async getLatestApprovedApprovalByLeadStage(
-    leadId: string,
-    stageIndex: EmailStage['stageIndex']
-  ): Promise<Result<GtmApprovalRecord | null>> {
-    try {
-      const row = await this.database
-        .prepare(
-          'SELECT id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at ' +
-            'FROM gtm_approvals WHERE lead_id = ? AND stage_index = ? AND status = ? AND executed_at IS NULL ' +
-            'ORDER BY decision_at DESC, requested_at DESC LIMIT 1'
-        )
-        .bind(leadId, stageIndex, 'approved')
-        .first<GtmApprovalRow>();
-
-      if (row === null) {
-        return succeed(null);
-      }
-
-      return mapApprovalRow(row);
-    } catch (error) {
-      logStoreError('getLatestApprovedApprovalByLeadStage', error, {
-        leadId,
-        stageIndex,
-      });
-      return fail('Failed to load approved GTM approval');
     }
   }
 
