@@ -593,6 +593,50 @@ export class GTMService {
       });
     }
 
+    const approvedApprovalResult = await this.store.listApprovedUnexecutedApprovalsByLeadStage(
+      lead.id,
+      decision.stage.stageIndex
+    );
+    if (!approvedApprovalResult.ok) {
+      return fail(approvedApprovalResult.error);
+    }
+
+    if (approvedApprovalResult.value.length > 1) {
+      logError('gtm_approved_proposal_ambiguous', new Error('Multiple approved unexecuted GTM approvals'), {
+        system: 'gtm',
+        leadId,
+        stageIndex: decision.stage.stageIndex,
+        approvalCount: approvedApprovalResult.value.length,
+        approvalCodes: approvedApprovalResult.value.map((approval) => approval.approval_code),
+        proposalHashes: approvedApprovalResult.value.map((approval) => approval.proposal_hash),
+      });
+      return fail('Multiple approved unexecuted GTM approvals found; manual review required');
+    }
+
+    if (approvedApprovalResult.value.length === 1) {
+      const approvedApproval = approvedApprovalResult.value[0];
+      logInfo('gtm_approved_proposal_reused', {
+        system: 'gtm',
+        leadId,
+        approvalId: approvedApproval.id,
+        approvalCode: approvedApproval.approval_code,
+        approvalStatus: approvedApproval.status,
+        stageIndex: approvedApproval.stage_index,
+        proposalHash: approvedApproval.proposal_hash,
+        dryRun: this.config.dryRun,
+        fallbackUsed: null,
+        schemaValidation: null,
+        deduped: true,
+        smsPreview: null,
+      });
+      return succeed({
+        action: 'send',
+        stage: decision.stage,
+        subject: approvedApproval.subject,
+        body: approvedApproval.body,
+      });
+    }
+
     try {
       let subject: string;
       let body: string;
@@ -719,12 +763,7 @@ export class GTMService {
     const outboundSubject = approvedProposal.subject;
     const outboundBody = approvedProposal.body;
     const sentAt = new Date().toISOString();
-    const proposalHash = buildApprovalProposalHash(
-      lead.id,
-      preparedAction.stage.stageIndex,
-      approvedProposal.subject,
-      approvedProposal.body
-    );
+    const proposalHash = approvedProposal.proposal_hash;
 
     logInfo('gtm_email_allowed_after_approval', {
       system: 'gtm',
@@ -748,6 +787,8 @@ export class GTMService {
         dryRun: this.config.dryRun,
         approvalCode: approvedProposal.approval_code,
         approvalStatus: approvedProposal.status,
+        subject: outboundSubject,
+        body: outboundBody,
         fallbackUsed: null,
         schemaValidation: null,
       });

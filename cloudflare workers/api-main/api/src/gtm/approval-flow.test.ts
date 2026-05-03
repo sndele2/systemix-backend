@@ -337,6 +337,25 @@ class FakeGtmD1Database {
 
     if (
       normalized ===
+      'select id, approval_code, lead_id, stage_index, proposal_hash, subject, body, status, requested_at, notified_at, decision_at, decided_by_phone, executed_at from gtm_approvals where lead_id = ? and stage_index = ? and status = ? and executed_at is null order by requested_at desc'
+    ) {
+      const [leadId, stageIndex, status] = boundValues;
+      const results = Array.from(this.approvals.values())
+        .filter(
+          (approval) =>
+            approval.lead_id === String(leadId) &&
+            approval.stage_index === Number(stageIndex) &&
+            approval.status === String(status) &&
+            approval.executed_at === null
+        )
+        .sort((left, right) => right.requested_at.localeCompare(left.requested_at))
+        .map((approval) => this.cloneApprovalRow(approval));
+
+      return { results };
+    }
+
+    if (
+      normalized ===
       'select id, lead_id, stage_index, sent_at, dry_run, result, message_id from gtm_touchpoints where lead_id = ? order by sent_at asc'
     ) {
       const leadId = String(boundValues[0]);
@@ -584,5 +603,5 @@ test('approved proposal with send failure remains approved and does not advance 
   assert.equal(approvalRow.status, 'approved');
   assert.equal(approvalRow.executed_at, null);
   assert.equal(lead.value.touches_sent, 0);
-  assert.equal(touchpoints.value.length, 1);
+  assert.equal(touchpoints.value.length, 0);
 });

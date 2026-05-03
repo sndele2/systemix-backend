@@ -53,6 +53,7 @@ class FakeLeadStore {
       createReply: null,
       findLeadByEmail: null,
       getLatestApprovalByProposal: null,
+      listApprovedUnexecutedApprovalsByLeadStage: null,
       getSyncCursor: null,
       markApprovalExecuted: null,
       markApprovalNotified: null,
@@ -207,6 +208,28 @@ class FakeLeadStore {
         .sort((left, right) => right.requested_at.localeCompare(left.requested_at))[0] ?? null;
 
     return { ok: true, value: approval ? { ...approval } : null };
+  }
+
+  async listApprovedUnexecutedApprovalsByLeadStage(leadId, stageIndex) {
+    this.eventLog.push('listApprovedUnexecutedApprovalsByLeadStage');
+    this.calls.push({ method: 'listApprovedUnexecutedApprovalsByLeadStage', leadId, stageIndex });
+
+    if (this.failures.listApprovedUnexecutedApprovalsByLeadStage) {
+      return { ok: false, error: this.failures.listApprovedUnexecutedApprovalsByLeadStage };
+    }
+
+    const approvals = Array.from(this.approvals.values())
+      .filter(
+        (candidate) =>
+          candidate.lead_id === leadId &&
+          candidate.stage_index === stageIndex &&
+          candidate.status === 'approved' &&
+          !candidate.executed_at
+      )
+      .sort((left, right) => right.requested_at.localeCompare(left.requested_at))
+      .map((approval) => ({ ...approval }));
+
+    return { ok: true, value: approvals };
   }
 
   async markApprovalExecuted(approvalId, executedAt) {
@@ -674,7 +697,7 @@ test('prepareNextAction is read-only and returns the rendered send action', asyn
   assert.equal(result.value.subject, 'Missed calls?');
   assert.deepEqual(
     store.calls.map((entry) => entry.method),
-    ['getLeadById', 'listTouchpointsByLeadId']
+    ['getLeadById', 'listTouchpointsByLeadId', 'listApprovedUnexecutedApprovalsByLeadStage']
   );
 });
 
@@ -867,12 +890,14 @@ test('advanceLeadSequence only persists the touchpoint after approval and send s
   assert.deepEqual(eventLog, [
     'getLeadById',
     'listTouchpointsByLeadId',
+    'listApprovedUnexecutedApprovalsByLeadStage',
     'getLeadById',
     'getLatestApprovalByProposal',
     'createApproval',
     'markApprovalNotified',
     'getLeadById',
     'listTouchpointsByLeadId',
+    'listApprovedUnexecutedApprovalsByLeadStage',
     'getLeadById',
     'getLatestApprovalByProposal',
     'emailSend',
@@ -1131,16 +1156,18 @@ test('advanceLeadSequence reuses pending approval and keeps lead untouched befor
   assert.equal(store.leads.get('lead-123').touches_sent, 0);
 });
 
-test('advanceLeadSequence requires a new approval when regenerated proposal changes', async () => {
+test('advanceLeadSequence sends approved stored proposal before regenerated copy can change the hash', async () => {
   let draft = {
     subject: VALID_AGENT_SUBJECT,
     body: VALID_AGENT_BODY,
     variantLabel: 'valid-one',
   };
+  let writerCalls = 0;
   const approvalNotifications = [];
   const { service, store, emailClient } = createService({
     agentHooks: {
       async writeOutreach() {
+        writerCalls += 1;
         return draft;
       },
     },
@@ -1172,24 +1199,26 @@ test('advanceLeadSequence requires a new approval when regenerated proposal chan
     value: {
       action: 'skipped',
       leadId: 'lead-123',
-      reason: 'awaiting_approval',
+      reason: 'dry_run',
     },
   });
-  assert.equal(store.approvals.size, 2);
-  assert.equal(approvalNotifications.length, 2);
-  assert.equal(emailClient.calls.length, 0);
-  assert.equal(store.touchpoints.length, 0);
-  assert.equal(store.leads.get('lead-123').touches_sent, 0);
-  assert.notEqual(
-    Array.from(store.approvals.values())[0].proposal_hash,
-    Array.from(store.approvals.values())[1].proposal_hash
-  );
+  assert.equal(writerCalls, 1);
+  assert.equal(store.approvals.size, 1);
+  assert.equal(approvalNotifications.length, 1);
+  assert.equal(emailClient.calls.length, 1);
+  assert.equal(emailClient.calls[0].subject, approved.subject);
+  assert.equal(emailClient.calls[0].body, approved.body);
+  assert.equal(store.touchpoints.length, 1);
+  assert.equal(store.leads.get('lead-123').touches_sent, 1);
+  assert.equal(store.approvals.get(approved.id).status, 'executed');
 });
 
-test('advanceLeadSequence sends exact approved subject and body for the approved proposal', async () => {
+test('advanceLeadSequence sends exact approved subject body and proposal hash for the approved proposal', async () => {
+  let writerCalls = 0;
   const { service, store, emailClient } = createService({
     agentHooks: {
       async writeOutreach() {
+        writerCalls += 1;
         return {
           subject: VALID_AGENT_SUBJECT,
           body: VALID_AGENT_BODY,
@@ -1209,18 +1238,26 @@ test('advanceLeadSequence sends exact approved subject and body for the approved
 
   assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
 
+  const touchpoint = store.touchpoints[0];
+  const executedApproval = store.approvals.get(approval.id);
   assert.equal(emailClient.calls.length, 1);
   assert.equal(emailClient.calls[0].subject, approval.subject);
   assert.equal(emailClient.calls[0].body, approval.body);
+  assert.equal(writerCalls, 1);
   assert.equal(store.touchpoints.length, 1);
+  assert.equal(touchpoint.stage_index, approval.stage_index);
+  assert.equal(executedApproval.proposal_hash, approval.proposal_hash);
+  assert.equal(executedApproval.status, 'executed');
   assert.equal(store.leads.get('lead-123').touches_sent, 1);
 });
 
-test('advanceLeadSequence does not let regenerated fallback copy bypass a different approved proposal', async () => {
+test('advanceLeadSequence does not call outreach writer when approved unexecuted proposal exists', async () => {
   let writerFails = false;
+  let writerCalls = 0;
   const { service, store, emailClient } = createService({
     agentHooks: {
       async writeOutreach() {
+        writerCalls += 1;
         if (writerFails) {
           throw new Error('writer unavailable');
         }
@@ -1249,13 +1286,112 @@ test('advanceLeadSequence does not let regenerated fallback copy bypass a differ
     value: {
       action: 'skipped',
       leadId: 'lead-123',
-      reason: 'awaiting_approval',
+      reason: 'dry_run',
     },
+  });
+  assert.equal(writerCalls, 1);
+  assert.equal(emailClient.calls.length, 1);
+  assert.equal(emailClient.calls[0].subject, approval.subject);
+  assert.equal(emailClient.calls[0].body, approval.body);
+  assert.equal(store.touchpoints.length, 1);
+  assert.equal(store.approvals.size, 1);
+  assert.equal(store.leads.get('lead-123').touches_sent, 1);
+});
+
+test('advanceLeadSequence fails closed when multiple approved unexecuted approvals exist', async () => {
+  const { service, store, emailClient } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        throw new Error('writer should not run');
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+  store.approvals.set('approval-1', {
+    id: 'approval-1',
+    approval_code: 'APPROVE1',
+    lead_id: 'lead-123',
+    stage_index: 0,
+    proposal_hash: 'gtm-approved-1',
+    subject: 'Approved subject one',
+    body: VALID_AGENT_BODY,
+    status: 'approved',
+    requested_at: '2026-04-14T00:00:00.000Z',
+  });
+  store.approvals.set('approval-2', {
+    id: 'approval-2',
+    approval_code: 'APPROVE2',
+    lead_id: 'lead-123',
+    stage_index: 0,
+    proposal_hash: 'gtm-approved-2',
+    subject: 'Approved subject two',
+    body: CHANGED_AGENT_BODY,
+    status: 'approved',
+    requested_at: '2026-04-14T00:01:00.000Z',
+  });
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: false,
+    error: 'Multiple approved unexecuted GTM approvals found; manual review required',
   });
   assert.equal(emailClient.calls.length, 0);
   assert.equal(store.touchpoints.length, 0);
-  assert.equal(store.approvals.size, 2);
   assert.equal(store.leads.get('lead-123').touches_sent, 0);
+});
+
+test('advanceLeadSequence requires a new approval when proposal changes and no approved unexecuted approval exists', async () => {
+  let draft = {
+    subject: VALID_AGENT_SUBJECT,
+    body: VALID_AGENT_BODY,
+    variantLabel: 'valid-one',
+  };
+  const approvalNotifications = [];
+  const { service, store, emailClient } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        return draft;
+      },
+    },
+    approvalHooks: {
+      async requestApproval(input) {
+        approvalNotifications.push(input);
+      },
+    },
+  });
+  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  const rejected = Array.from(store.approvals.values())[0];
+  store.approvals.set(rejected.id, {
+    ...rejected,
+    status: 'rejected',
+  });
+
+  draft = {
+    subject: CHANGED_AGENT_SUBJECT,
+    body: CHANGED_AGENT_BODY,
+    variantLabel: 'valid-two',
+  };
+
+  const result = await service.advanceLeadSequence('lead-123');
+
+  assert.deepEqual(result, {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'awaiting_approval',
+    },
+  });
+  assert.equal(store.approvals.size, 2);
+  assert.equal(approvalNotifications.length, 2);
+  assert.equal(emailClient.calls.length, 0);
+  assert.equal(store.touchpoints.length, 0);
+  assert.equal(store.leads.get('lead-123').touches_sent, 0);
+  assert.notEqual(
+    Array.from(store.approvals.values())[0].proposal_hash,
+    Array.from(store.approvals.values())[1].proposal_hash
+  );
 });
 
 test('advanceLeadSequence keeps pending approval when notification hook fails', async () => {
