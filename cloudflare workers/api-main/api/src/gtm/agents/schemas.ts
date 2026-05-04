@@ -44,6 +44,41 @@ function assertBodyWordLimit(body: string, maxWords = 70): void {
   if (wordCount > maxWords) {
     throw new Error(`Outreach writer output exceeded the ${maxWords}-word limit`)
   }
+
+  if (wordCount < 45) {
+    throw new Error('Outreach writer output must be at least 45 words')
+  }
+}
+
+function assertStrictOutreachStructure(body: string): void {
+  const lines = body.trim().split(/\r?\n/)
+  if (lines.length !== 4 || lines.some((line) => line.trim().length === 0)) {
+    throw new Error('Outreach writer body must be exactly four non-empty lines')
+  }
+
+  if (!/\?$/.test(lines[0].trim())) {
+    throw new Error('Outreach writer line 1 must be a present-tense question')
+  }
+
+  if (!/\bmissed calls?\b/i.test(lines[1])) {
+    throw new Error('Outreach writer line 2 must state missed-call pain directly')
+  }
+
+  if (/\b(if|when|can)\b/i.test(lines[1])) {
+    throw new Error('Outreach writer line 2 must not be hypothetical')
+  }
+
+  if (/[.!?].+[.!?]/.test(lines[2].trim())) {
+    throw new Error('Outreach writer line 3 must be one sentence')
+  }
+}
+
+function assertNoDisallowedOutreachPhrasing(subject: string, body: string): void {
+  const normalized = `${subject}\n${body}`.toLowerCase()
+  const disallowed = /\b(may|might|could)\b|following up|as discussed/
+  if (disallowed.test(normalized)) {
+    throw new Error('Outreach writer output used disallowed GTM phrasing')
+  }
 }
 
 export const GtmAgentTaskSchema = z.enum([
@@ -130,6 +165,9 @@ export const LeadReviewOutputSchema = z
 export const OutreachWriterInputSchema = z
   .object({
     candidate: CandidateBusinessSchema,
+    niche: optionalTrimmedString,
+    city: optionalTrimmedString,
+    context_note: optionalTrimmedString,
     outreachAngle: OutreachAngleSchema,
     businessContext: z.string().trim().max(600).optional(),
     groundingFacts: z.array(trimmedString.max(180)).max(10).default([]),
@@ -337,7 +375,9 @@ export function parseOutreachWriterOutput(
 ): OutreachWriterOutput {
   const parsed = OutreachWriterOutputSchema.parse(parseJsonLike(value))
   assertPlainTextBody(parsed.body)
+  assertStrictOutreachStructure(parsed.body)
   assertBodyWordLimit(parsed.body, options.maxWords ?? 70)
+  assertNoDisallowedOutreachPhrasing(parsed.subject, parsed.body)
   return parsed
 }
 

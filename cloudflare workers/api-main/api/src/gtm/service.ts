@@ -45,6 +45,7 @@ const DEFAULT_SYNC_CURSOR = '1970-01-01T00:00:00.000Z';
 const MAX_SYNC_BATCH_SIZE = 50;
 const AGENT_TIMEOUT_MS = 12_000;
 const GTM_RUNTIME_LABEL = 'production';
+const GTM_OUTREACH_TIME_ZONE = 'America/Chicago';
 const COLD_OUTREACH_FORBIDDEN_PHRASES = [
   'if missed calls are common',
   'may be costing',
@@ -63,9 +64,19 @@ const COLD_OUTREACH_FORBIDDEN_PHRASES = [
   'as discussed',
   'we missed your call',
   'your missed call',
+  'you missed calls',
+  'you are missing calls',
+  "you're missing calls",
+  'we know you missed calls',
+  'noticed you missed calls',
+  'circling back',
+  'touching base',
+  'synergy',
+  'streamline operations',
+  'unlock growth',
 ] as const;
 const COLD_OUTREACH_MIN_WORDS = 45;
-const COLD_OUTREACH_MAX_WORDS = 90;
+const COLD_OUTREACH_MAX_WORDS = 70;
 
 export interface GtmServiceRuntimeEnv {
   GTM_DB: D1Database;
@@ -240,6 +251,120 @@ function readMetadataString(lead: LeadRecord, key: string): string | null {
   return typeof value === 'string' ? value.trim() || null : null;
 }
 
+function readLeadExperimentField(
+  lead: LeadRecord,
+  directKey: 'experiment_tag' | 'outreach_window' | 'context_note',
+  metadataKeys: string[]
+): string {
+  const directValue = lead[directKey];
+  if (typeof directValue === 'string' && directValue.trim()) {
+    return directValue.trim();
+  }
+
+  for (const key of [directKey, ...metadataKeys]) {
+    const metadataValue = readMetadataString(lead, key);
+    if (metadataValue) {
+      return metadataValue;
+    }
+  }
+
+  return '';
+}
+
+function parseOutreachWindowTime(raw: string): number | null {
+  const value = raw.trim().toLowerCase();
+  const meridiemMatch = value.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/);
+  if (meridiemMatch) {
+    const hour = Number(meridiemMatch[1]);
+    const minute = meridiemMatch[2] === undefined ? 0 : Number(meridiemMatch[2]);
+    const meridiem = meridiemMatch[3];
+
+    if (hour < 1 || hour > 12 || minute < 0 || minute > 59) {
+      return null;
+    }
+
+    const normalizedHour = meridiem === 'am' ? hour % 12 : (hour % 12) + 12;
+    return normalizedHour * 60 + minute;
+  }
+
+  const twentyFourHourMatch = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (twentyFourHourMatch) {
+    const hour = Number(twentyFourHourMatch[1]);
+    const minute = Number(twentyFourHourMatch[2]);
+
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      return null;
+    }
+
+    return hour * 60 + minute;
+  }
+
+  return null;
+}
+
+function parseOutreachWindow(raw: string): { startMinute: number; endMinute: number } | null {
+  const parts = raw.split('-');
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const startMinute = parseOutreachWindowTime(parts[0]);
+  const endMinute = parseOutreachWindowTime(parts[1]);
+  if (startMinute === null || endMinute === null || startMinute === endMinute) {
+    return null;
+  }
+
+  return { startMinute, endMinute };
+}
+
+function getLocalMinuteOfDay(date: Date): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: GTM_OUTREACH_TIME_ZONE,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date);
+    const hour = Number(parts.find((part) => part.type === 'hour')?.value);
+    const minute = Number(parts.find((part) => part.type === 'minute')?.value);
+
+    if (Number.isInteger(hour) && Number.isInteger(minute)) {
+      return hour * 60 + minute;
+    }
+  } catch {
+    // Fall back to runtime-local time if Intl timezone data is unavailable.
+  }
+
+  return date.getHours() * 60 + date.getMinutes();
+}
+
+function isMinuteInsideOutreachWindow(
+  currentMinute: number,
+  window: { startMinute: number; endMinute: number }
+): boolean {
+  if (window.startMinute < window.endMinute) {
+    return currentMinute >= window.startMinute && currentMinute <= window.endMinute;
+  }
+
+  return currentMinute >= window.startMinute || currentMinute <= window.endMinute;
+}
+
+function validateOutreachWindowForSend(
+  outreachWindow: string,
+  now: Date
+): { ok: true } | { ok: false; reason: 'invalid_outreach_window' | 'outside_outreach_window' } {
+  const parsed = parseOutreachWindow(outreachWindow);
+  if (parsed === null) {
+    return { ok: false, reason: 'invalid_outreach_window' };
+  }
+
+  if (!isMinuteInsideOutreachWindow(getLocalMinuteOfDay(now), parsed)) {
+    return { ok: false, reason: 'outside_outreach_window' };
+  }
+
+  return { ok: true };
+}
+
 function isWarmOrRecoveryLead(lead: LeadRecord): boolean {
   const source = readMetadataString(lead, 'source')?.toLowerCase() ?? '';
   const leadTemperature = readMetadataString(lead, 'leadTemperature')?.toLowerCase() ?? '';
@@ -258,6 +383,11 @@ function isWarmOrRecoveryLead(lead: LeadRecord): boolean {
 function findColdOutreachForbiddenPhrase(subject: string, body: string): string | null {
   const normalized = `${subject}\n${body}`.toLowerCase();
   return COLD_OUTREACH_FORBIDDEN_PHRASES.find((phrase) => normalized.includes(phrase)) ?? null;
+}
+
+function findDisallowedModalPhrase(subject: string, body: string): string | null {
+  const match = `${subject}\n${body}`.toLowerCase().match(/\b(may|might|could)\b/);
+  return match?.[0] ?? null;
 }
 
 function countWords(value: string): number {
@@ -288,6 +418,9 @@ function buildLeadFromReviewedInput(input: GtmReviewedLeadInput): Lead {
     name: input.businessName,
     email: input.email,
     phone: input.phone,
+    experiment_tag: input.experimentTag,
+    outreach_window: input.outreachWindow,
+    context_note: input.contextNote,
     createdAt: now,
     metadata: {
       businessName: input.businessName,
@@ -303,12 +436,45 @@ function buildLeadFromReviewedInput(input: GtmReviewedLeadInput): Lead {
       confidence: input.confidence,
       researchNotes: input.researchNotes,
       outreachAngle: input.outreachAngle,
+      experiment_tag: input.experimentTag,
+      outreach_window: input.outreachWindow,
+      context_note: input.contextNote,
       approvalStatus: input.approvalStatus,
       importStatus: input.importStatus,
       source: 'gtm_csv_import',
       importedAt: now,
     },
   };
+}
+
+function assertStrictOutreachCopyStructure(lead: LeadRecord, body: string, stageIndex?: EmailStage['stageIndex']): void {
+  const lines = body.trim().split(/\r?\n/);
+  if (lines.length !== 4 || lines.some((line) => line.trim().length === 0)) {
+    logInfo('gtm_cold_copy_safety_rejected', {
+      system: 'gtm',
+      leadId: lead.id,
+      stageIndex: stageIndex ?? null,
+      reason: 'invalid_line_structure',
+      fallbackUsed: true,
+    });
+    throw new Error('GTM outreach body must be exactly four non-empty lines');
+  }
+
+  if (!/\?$/.test(lines[0].trim())) {
+    throw new Error('GTM outreach line 1 must be a present-tense question');
+  }
+
+  if (!/\bmissed calls?\b/i.test(lines[1])) {
+    throw new Error('GTM outreach line 2 must state missed-call pain directly');
+  }
+
+  if (/\b(if|when|can)\b/i.test(lines[1])) {
+    throw new Error('GTM outreach line 2 must not be hypothetical');
+  }
+
+  if (/[.!?].+[.!?]/.test(lines[2].trim())) {
+    throw new Error('GTM outreach line 3 must be one sentence');
+  }
 }
 
 function assertColdOutreachCopySafe(
@@ -332,6 +498,13 @@ function assertColdOutreachCopySafe(
     });
     throw new Error(`Cold GTM outreach cannot imply prior contact: ${forbiddenPhrase}`);
   }
+
+  const disallowedModal = findDisallowedModalPhrase(subject, body);
+  if (disallowedModal) {
+    throw new Error(`Cold GTM outreach cannot use disallowed phrasing: ${disallowedModal}`);
+  }
+
+  assertStrictOutreachCopyStructure(lead, body, stageIndex);
 
   const wordCount = body
     .trim()
@@ -762,8 +935,10 @@ export class GTMService {
     const approvedProposal = approvalResult.value.approval;
     const outboundSubject = approvedProposal.subject;
     const outboundBody = approvedProposal.body;
-    const sentAt = new Date().toISOString();
+    const now = new Date();
+    const sentAt = now.toISOString();
     const proposalHash = approvedProposal.proposal_hash;
+    const outreachWindow = readLeadExperimentField(lead, 'outreach_window', ['outreachWindow']);
 
     logInfo('gtm_email_allowed_after_approval', {
       system: 'gtm',
@@ -776,6 +951,29 @@ export class GTMService {
       fallbackUsed: null,
       schemaValidation: null,
     });
+
+    if (outreachWindow) {
+      const windowValidation = validateOutreachWindowForSend(outreachWindow, now);
+      if (!windowValidation.ok) {
+        logInfo('gtm_email_blocked_outreach_window', {
+          system: 'gtm',
+          leadId,
+          stageIndex: preparedAction.stage.stageIndex,
+          proposalHash,
+          approvalCode: approvedProposal.approval_code,
+          approvalStatus: approvedProposal.status,
+          outreachWindow,
+          reason: windowValidation.reason,
+          dryRun: this.config.dryRun,
+        });
+
+        return succeed({
+          action: 'skipped',
+          leadId,
+          reason: windowValidation.reason,
+        });
+      }
+    }
 
     let sendResult: EmailSendResult;
     try {
@@ -855,6 +1053,9 @@ export class GTMService {
       dry_run: this.config.dryRun,
       result: this.config.dryRun ? 'skipped' : 'success',
       message_id: sendResult.messageId ?? null,
+      experiment_tag: readLeadExperimentField(lead, 'experiment_tag', ['experimentTag']),
+      outreach_window: readLeadExperimentField(lead, 'outreach_window', ['outreachWindow']),
+      context_note: readLeadExperimentField(lead, 'context_note', ['contextNote']),
     };
 
     const recordTouchpointResult = await this.store.recordTouchpoint(touchpoint);

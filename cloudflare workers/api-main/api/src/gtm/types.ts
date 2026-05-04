@@ -8,6 +8,9 @@ export interface Lead {
   name: string;
   email: string;
   phone?: string;
+  experiment_tag?: string;
+  outreach_window?: string;
+  context_note?: string;
   createdAt: string;
   metadata?: Record<string, unknown>;
 }
@@ -27,6 +30,9 @@ export interface GtmReviewedLeadInput {
   confidence?: number;
   researchNotes?: string;
   outreachAngle?: string;
+  experimentTag?: string;
+  outreachWindow?: string;
+  contextNote?: string;
   approvalStatus?: string;
   importStatus?: string;
 }
@@ -83,6 +89,9 @@ export interface Touchpoint {
   dry_run: boolean;
   result: TouchpointResult;
   message_id?: string | null;
+  experiment_tag: string;
+  outreach_window: string;
+  context_note: string;
 }
 
 export interface ReplyClassification {

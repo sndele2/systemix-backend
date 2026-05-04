@@ -9,51 +9,31 @@ const TEMPLATE_RENDERERS: Record<TemplateKey, TemplateRenderer> = {
   'missed-call-touch-1': (lead) => ({
     subject: 'Missed calls?',
     body: [
-      `Hi ${resolveLeadName(lead)},`,
-      '',
-      `Do you ever miss calls while you're ${resolveDailyReality(lead)}?`,
-      '',
-      'That is usually where new jobs get lost, because the next shop is one tap away.',
-      '',
-      'I built something that texts missed callers back instantly so they do not move on.',
-      '',
+      `Do calls slip by while you're ${resolveDailyReality(lead)}?`,
+      'Missed calls turn into lost bookings because the next shop is one tap away.',
+      'I built Systemix to text missed callers back instantly, ask what they need, and keep the job from disappearing.',
       'Want me to send a quick demo?',
     ].join('\n'),
   }),
   'missed-call-touch-2': (lead) => ({
     subject: resolveNicheSubject(lead),
     body: [
-      `Hi ${resolveLeadName(lead)},`,
-      '',
-      `Are calls easy to miss when you're ${resolveDailyReality(lead)}?`,
-      '',
-      'A missed call can turn into a lost booking before you get a quiet minute.',
-      '',
-      'I built something that replies by text right away and captures what the caller needs.',
-      '',
+      `Are calls hard to catch while you're ${resolveDailyReality(lead)}?`,
+      'Missed calls become lost jobs before you get a quiet minute to call back.',
+      'I built Systemix to reply by text right away, capture what the caller needs, and keep the booking alive.',
       'Want me to send the short version?',
     ].join('\n'),
   }),
   'missed-call-touch-3': (lead) => ({
     subject: 'Quick question',
     body: [
-      `Hi ${resolveLeadName(lead)},`,
-      '',
-      `Last note from me: do calls ever slip by while you're ${resolveDailyReality(lead)}?`,
-      '',
-      'That is the moment a new job can go to whoever answers first.',
-      '',
-      'I built a simple text-back flow for missed callers so they do not disappear.',
-      '',
+      `Do calls still slip by while you're ${resolveDailyReality(lead)}?`,
+      'Missed calls send ready buyers to whoever answers first, even when the job is a good fit.',
+      'I built Systemix to text missed callers back instantly, collect the job details, and keep the conversation moving.',
       'Worth sending over?',
     ].join('\n'),
   }),
 };
-
-function resolveLeadName(lead: Lead): string {
-  const trimmedName = lead.name.trim();
-  return trimmedName.length > 0 ? trimmedName : 'there';
-}
 
 function readLeadMetadataString(lead: Lead, key: string): string | undefined {
   const value = lead.metadata?.[key];

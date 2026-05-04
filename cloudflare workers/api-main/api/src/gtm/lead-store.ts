@@ -26,6 +26,9 @@ interface LeadRow {
   name: string;
   email: string;
   phone: string | null;
+  experiment_tag: string | null;
+  outreach_window: string | null;
+  context_note: string | null;
   status: string;
   touches_sent: number;
   last_stage_index: number | null;
@@ -47,6 +50,9 @@ interface TouchpointRow {
   dry_run: number;
   result: string;
   message_id: string | null;
+  experiment_tag: string;
+  outreach_window: string;
+  context_note: string;
 }
 
 interface ExistingLeadRow {
@@ -305,6 +311,18 @@ function mapLeadRow(row: LeadRow): Result<LeadRecord> {
     record.phone = row.phone;
   }
 
+  if (row.experiment_tag !== null) {
+    record.experiment_tag = row.experiment_tag;
+  }
+
+  if (row.outreach_window !== null) {
+    record.outreach_window = row.outreach_window;
+  }
+
+  if (row.context_note !== null) {
+    record.context_note = row.context_note;
+  }
+
   if (metadataResult.value !== undefined) {
     record.metadata = metadataResult.value;
   }
@@ -345,6 +363,9 @@ function mapTouchpointRow(row: TouchpointRow): Result<Touchpoint> {
     dry_run: row.dry_run === 1,
     result: row.result,
     message_id: row.message_id,
+    experiment_tag: row.experiment_tag,
+    outreach_window: row.outreach_window,
+    context_note: row.context_note,
   });
 }
 
@@ -434,14 +455,17 @@ export class DurableLeadStore implements LeadStore {
       await this.database
         .prepare(
           'INSERT INTO gtm_leads ' +
-            '(id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata) ' +
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            '(id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata) ' +
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         )
         .bind(
           lead.id,
           lead.name,
           lead.email,
           lead.phone ?? null,
+          lead.experiment_tag ?? null,
+          lead.outreach_window ?? null,
+          lead.context_note ?? null,
           PENDING_STATUS,
           0,
           null,
@@ -541,7 +565,7 @@ export class DurableLeadStore implements LeadStore {
     try {
       const row = await this.database
         .prepare(
-          'SELECT id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
+          'SELECT id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
             'FROM gtm_leads WHERE lower(email) = lower(?) ORDER BY created_at ASC LIMIT 1'
         )
         .bind(email)
@@ -572,7 +596,7 @@ export class DurableLeadStore implements LeadStore {
 
       const row = await this.database
         .prepare(
-          'SELECT id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
+          'SELECT id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
             'FROM gtm_leads WHERE lower(email) = ? ' +
             'OR (? != "" AND replace(replace(replace(replace(replace(phone, "+", ""), "-", ""), " ", ""), "(", ""), ")", "") = ?) ' +
             'OR (? != "" AND lower(name) = ?) ' +
@@ -724,6 +748,33 @@ export class DurableLeadStore implements LeadStore {
 
       assignments.push('phone = ?');
       values.push(patch.phone ?? null);
+    }
+
+    if (hasOwn(patch, 'experiment_tag')) {
+      if (patch.experiment_tag !== undefined && typeof patch.experiment_tag !== 'string') {
+        return fail('experiment_tag must be a string when provided');
+      }
+
+      assignments.push('experiment_tag = ?');
+      values.push(patch.experiment_tag ?? null);
+    }
+
+    if (hasOwn(patch, 'outreach_window')) {
+      if (patch.outreach_window !== undefined && typeof patch.outreach_window !== 'string') {
+        return fail('outreach_window must be a string when provided');
+      }
+
+      assignments.push('outreach_window = ?');
+      values.push(patch.outreach_window ?? null);
+    }
+
+    if (hasOwn(patch, 'context_note')) {
+      if (patch.context_note !== undefined && typeof patch.context_note !== 'string') {
+        return fail('context_note must be a string when provided');
+      }
+
+      assignments.push('context_note = ?');
+      values.push(patch.context_note ?? null);
     }
 
     if (hasOwn(patch, 'createdAt')) {
@@ -994,7 +1045,7 @@ export class DurableLeadStore implements LeadStore {
     try {
       const row = await this.database
         .prepare(
-          'SELECT id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
+          'SELECT id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
             'FROM gtm_leads WHERE id = ? LIMIT 1'
         )
         .bind(leadId)
@@ -1048,7 +1099,7 @@ export class DurableLeadStore implements LeadStore {
     try {
       const result = await this.database
         .prepare(
-          'SELECT id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
+          'SELECT id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata ' +
             'FROM gtm_leads WHERE status = ? ORDER BY created_at ASC'
         )
         .bind(status)
@@ -1065,7 +1116,7 @@ export class DurableLeadStore implements LeadStore {
     try {
       const result = await this.database
         .prepare(
-          'SELECT id, lead_id, stage_index, sent_at, dry_run, result, message_id ' +
+          'SELECT id, lead_id, stage_index, sent_at, dry_run, result, message_id, experiment_tag, outreach_window, context_note ' +
             'FROM gtm_touchpoints WHERE lead_id = ? ORDER BY sent_at ASC'
         )
         .bind(leadId)
@@ -1099,7 +1150,7 @@ export class DurableLeadStore implements LeadStore {
     try {
       const result = await this.database
         .prepare(
-          'SELECT gtm_leads.id, gtm_leads.name, gtm_leads.email, gtm_leads.phone, gtm_leads.status, gtm_leads.touches_sent, ' +
+          'SELECT gtm_leads.id, gtm_leads.name, gtm_leads.email, gtm_leads.phone, gtm_leads.experiment_tag, gtm_leads.outreach_window, gtm_leads.context_note, gtm_leads.status, gtm_leads.touches_sent, ' +
             'gtm_leads.last_stage_index, gtm_leads.last_sent_at, gtm_leads.stopped_at, gtm_leads.created_at, gtm_leads.metadata, ' +
             'latest_touch.latest_touchpoint_sent_at ' +
             'FROM gtm_leads ' +
@@ -1168,11 +1219,19 @@ export class DurableLeadStore implements LeadStore {
       return fail('Invalid touchpoint result');
     }
 
+    if (
+      typeof touchpoint.experiment_tag !== 'string' ||
+      typeof touchpoint.outreach_window !== 'string' ||
+      typeof touchpoint.context_note !== 'string'
+    ) {
+      return fail('Touchpoint experiment fields must be strings');
+    }
+
     try {
       await this.database
         .prepare(
-          'INSERT INTO gtm_touchpoints (id, lead_id, stage_index, sent_at, dry_run, result, message_id) ' +
-            'VALUES (?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO gtm_touchpoints (id, lead_id, stage_index, sent_at, dry_run, result, message_id, experiment_tag, outreach_window, context_note) ' +
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         )
         .bind(
           touchpoint.id,
@@ -1181,7 +1240,10 @@ export class DurableLeadStore implements LeadStore {
           touchpoint.sent_at,
           touchpoint.dry_run ? 1 : 0,
           touchpoint.result,
-          touchpoint.message_id ?? null
+          touchpoint.message_id ?? null,
+          touchpoint.experiment_tag,
+          touchpoint.outreach_window,
+          touchpoint.context_note
         )
         .run();
 

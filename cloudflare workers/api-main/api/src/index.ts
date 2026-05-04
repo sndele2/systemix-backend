@@ -350,6 +350,8 @@ function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): Outreach
     readLeadMetadataString(lead, 'researchNotes') ??
     readLeadMetadataString(lead, 'notes');
   const niche = readLeadMetadataString(lead, 'niche') ?? readLeadMetadataString(lead, 'industry');
+  const city = readLeadMetadataString(lead, 'city');
+  const contextNote = readLeadMetadataString(lead, 'context_note') ?? readLeadMetadataString(lead, 'contextNote');
   const sourceUrl = readLeadMetadataString(lead, 'sourceUrl');
   const evidence = readLeadMetadataString(lead, 'evidence');
   const outreachAngle = readLeadMetadataString(lead, 'outreachAngle');
@@ -361,7 +363,7 @@ function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): Outreach
       website: readLeadMetadataString(lead, 'website'),
       email: lead.email,
       phone: lead.phone,
-      city: readLeadMetadataString(lead, 'city'),
+      city,
       state: readLeadMetadataString(lead, 'state'),
       industry: niche,
       niche,
@@ -375,6 +377,9 @@ function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): Outreach
       outreachAngle,
       summary,
     },
+    niche,
+    city,
+    context_note: contextNote,
     outreachAngle:
       outreachAngle === 'missed_call_recovery' ||
       outreachAngle === 'lost_jobs_recovery' ||
@@ -389,6 +394,8 @@ function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): Outreach
       'Systemix helps service businesses respond to missed calls.',
       'The proposal is internal GTM copy only and must not send email.',
       niche ? `Lead niche: ${niche}.` : 'Lead niche is unknown; keep the copy conservative.',
+      city ? `Lead city: ${city}.` : 'Lead city is unknown.',
+      contextNote ? `Context note: ${truncateApprovalSmsValue(contextNote, 160)}.` : 'No context note was provided.',
       sourceUrl
         ? `Research source URL: ${truncateApprovalSmsValue(sourceUrl, 150)}.`
         : 'No research source URL was provided.',

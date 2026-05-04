@@ -75,6 +75,9 @@ class FakeGtmD1Database {
       name: lead.name,
       email: lead.email,
       phone: lead.phone,
+      experiment_tag: lead.experiment_tag,
+      outreach_window: lead.outreach_window,
+      context_note: lead.context_note,
       status: lead.status,
       touches_sent: lead.touches_sent,
       last_stage_index: lead.last_stage_index,
@@ -112,6 +115,9 @@ class FakeGtmD1Database {
       dry_run: touchpoint.dry_run,
       result: touchpoint.result,
       message_id: touchpoint.message_id,
+      experiment_tag: touchpoint.experiment_tag,
+      outreach_window: touchpoint.outreach_window,
+      context_note: touchpoint.context_note,
     };
   }
 
@@ -124,6 +130,9 @@ class FakeGtmD1Database {
         name,
         email,
         phone,
+        experimentTag,
+        outreachWindow,
+        contextNote,
         status,
         touchesSent,
         lastStageIndex,
@@ -142,6 +151,9 @@ class FakeGtmD1Database {
         name: String(name),
         email: String(email),
         phone: phone === null ? null : String(phone),
+        experiment_tag: experimentTag === null ? null : String(experimentTag),
+        outreach_window: outreachWindow === null ? null : String(outreachWindow),
+        context_note: contextNote === null ? null : String(contextNote),
         status: String(status),
         touches_sent: Number(touchesSent),
         last_stage_index: lastStageIndex === null ? null : Number(lastStageIndex),
@@ -175,7 +187,8 @@ class FakeGtmD1Database {
     }
 
     if (normalized.startsWith('insert into gtm_touchpoints')) {
-      const [id, leadId, stageIndex, sentAt, dryRun, result, messageId] = boundValues;
+      const [id, leadId, stageIndex, sentAt, dryRun, result, messageId, experimentTag, outreachWindow, contextNote] =
+        boundValues;
 
       if (this.touchpoints.has(String(id))) {
         throw new Error('UNIQUE constraint failed: gtm_touchpoints.id');
@@ -189,6 +202,9 @@ class FakeGtmD1Database {
         dry_run: Number(dryRun),
         result: String(result),
         message_id: messageId === null ? null : String(messageId),
+        experiment_tag: String(experimentTag),
+        outreach_window: String(outreachWindow),
+        context_note: String(contextNote),
       });
 
       return { meta: { changes: 1 } };
@@ -299,7 +315,7 @@ class FakeGtmD1Database {
 
     if (
       normalized ===
-      'select id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where id = ? limit 1'
+      'select id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where id = ? limit 1'
     ) {
       const lead = this.leads.get(String(boundValues[0]));
       return lead ? this.cloneLeadRow(lead) : null;
@@ -356,7 +372,7 @@ class FakeGtmD1Database {
 
     if (
       normalized ===
-      'select id, lead_id, stage_index, sent_at, dry_run, result, message_id from gtm_touchpoints where lead_id = ? order by sent_at asc'
+      'select id, lead_id, stage_index, sent_at, dry_run, result, message_id, experiment_tag, outreach_window, context_note from gtm_touchpoints where lead_id = ? order by sent_at asc'
     ) {
       const leadId = String(boundValues[0]);
       const results = Array.from(this.touchpoints.values())

@@ -64,6 +64,9 @@ class FakeD1Database {
       name: lead.name,
       email: lead.email,
       phone: lead.phone,
+      experiment_tag: lead.experiment_tag,
+      outreach_window: lead.outreach_window,
+      context_note: lead.context_note,
       status: lead.status,
       touches_sent: lead.touches_sent,
       last_stage_index: lead.last_stage_index,
@@ -102,8 +105,22 @@ class FakeD1Database {
     const normalizedSql = this.normalizeSql(sql);
 
     if (normalizedSql.startsWith('insert into gtm_leads')) {
-      const [id, name, email, phone, status, touchesSent, lastStageIndex, lastSentAt, stoppedAt, createdAt, metadata] =
-        boundValues;
+      const [
+        id,
+        name,
+        email,
+        phone,
+        experimentTag,
+        outreachWindow,
+        contextNote,
+        status,
+        touchesSent,
+        lastStageIndex,
+        lastSentAt,
+        stoppedAt,
+        createdAt,
+        metadata,
+      ] = boundValues;
 
       if (this.leads.has(String(id))) {
         throw new Error('UNIQUE constraint failed: gtm_leads.id');
@@ -114,6 +131,9 @@ class FakeD1Database {
         name: String(name),
         email: String(email),
         phone: phone === null ? null : String(phone),
+        experiment_tag: experimentTag === null ? null : String(experimentTag),
+        outreach_window: outreachWindow === null ? null : String(outreachWindow),
+        context_note: contextNote === null ? null : String(contextNote),
         status: String(status),
         touches_sent: Number(touchesSent),
         last_stage_index: lastStageIndex === null ? null : Number(lastStageIndex),
@@ -147,7 +167,8 @@ class FakeD1Database {
     }
 
     if (normalizedSql.startsWith('insert into gtm_touchpoints')) {
-      const [id, leadId, stageIndex, sentAt, dryRun, result, messageId] = boundValues;
+      const [id, leadId, stageIndex, sentAt, dryRun, result, messageId, experimentTag, outreachWindow, contextNote] =
+        boundValues;
 
       if (this.touchpoints.has(String(id))) {
         throw new Error('UNIQUE constraint failed: gtm_touchpoints.id');
@@ -165,6 +186,9 @@ class FakeD1Database {
         dry_run: Number(dryRun),
         result: String(result),
         message_id: messageId === null ? null : String(messageId),
+        experiment_tag: String(experimentTag),
+        outreach_window: String(outreachWindow),
+        context_note: String(contextNote),
       });
 
       return { meta: { changes: 1 } };
@@ -250,7 +274,7 @@ class FakeD1Database {
 
     if (
       normalizedSql.startsWith(
-        'select id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where id = ? limit 1'
+        'select id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where id = ? limit 1'
       )
     ) {
       const lead = this.leads.get(String(boundValues[0]));
@@ -259,7 +283,7 @@ class FakeD1Database {
 
     if (
       normalizedSql.startsWith(
-        'select id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where lower(email) = lower(?) order by created_at asc limit 1'
+        'select id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where lower(email) = lower(?) order by created_at asc limit 1'
       )
     ) {
       const normalizedEmail = String(boundValues[0]).toLowerCase();
@@ -285,7 +309,7 @@ class FakeD1Database {
 
     if (
       normalizedSql ===
-      'select id, lead_id, stage_index, sent_at, dry_run, result, message_id from gtm_touchpoints where lead_id = ? order by sent_at asc'
+      'select id, lead_id, stage_index, sent_at, dry_run, result, message_id, experiment_tag, outreach_window, context_note from gtm_touchpoints where lead_id = ? order by sent_at asc'
     ) {
       const leadId = String(boundValues[0]);
       const results = Array.from(this.touchpoints.values())
@@ -297,7 +321,7 @@ class FakeD1Database {
 
     if (
       normalizedSql ===
-      'select id, name, email, phone, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where status = ? order by created_at asc'
+      'select id, name, email, phone, experiment_tag, outreach_window, context_note, status, touches_sent, last_stage_index, last_sent_at, stopped_at, created_at, metadata from gtm_leads where status = ? order by created_at asc'
     ) {
       const status = String(boundValues[0]);
       const results = Array.from(this.leads.values())
@@ -398,6 +422,9 @@ function buildTouchpoint(overrides = {}) {
     dry_run: true,
     result: 'success',
     message_id: 'message-' + touchpointCounter,
+    experiment_tag: '',
+    outreach_window: '',
+    context_note: '',
     ...overrides,
   };
 }
@@ -603,7 +630,36 @@ test('recordTouchpoint persists dry_run as a 0 or 1 integer in the durable store
     dry_run: 1,
     result: 'success',
     message_id: 'message-123',
+    experiment_tag: '',
+    outreach_window: '',
+    context_note: '',
   });
+});
+
+test('createLead and recordTouchpoint persist GTM experiment fields', async () => {
+  const db = new FakeD1Database();
+  const store = createStore(db);
+  const lead = buildLead({
+    experiment_tag: 'timing-a',
+    outreach_window: 'weekday-morning',
+    context_note: 'Busy shop hours',
+  });
+  const touchpoint = buildTouchpoint({
+    lead_id: lead.id,
+    experiment_tag: 'timing-a',
+    outreach_window: 'weekday-morning',
+    context_note: 'Busy shop hours',
+  });
+
+  assert.equal((await store.createLead(lead)).ok, true);
+  assert.equal((await store.recordTouchpoint(touchpoint)).ok, true);
+
+  assert.equal(db.getLead(lead.id).experiment_tag, 'timing-a');
+  assert.equal(db.getLead(lead.id).outreach_window, 'weekday-morning');
+  assert.equal(db.getLead(lead.id).context_note, 'Busy shop hours');
+  assert.equal(db.getTouchpoint(touchpoint.id).experiment_tag, 'timing-a');
+  assert.equal(db.getTouchpoint(touchpoint.id).outreach_window, 'weekday-morning');
+  assert.equal(db.getTouchpoint(touchpoint.id).context_note, 'Busy shop hours');
 });
 
 test('listTouchpointsByLeadId returns touchpoints with dry_run cast back to boolean', async () => {

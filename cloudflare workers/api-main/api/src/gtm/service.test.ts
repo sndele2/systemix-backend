@@ -20,7 +20,7 @@ test.after(() => {
 });
 
 const DISALLOWED_COLD_GTM_COPY =
-  /if missed calls are common|may be costing|can help|keep potential clients engaged|let me know if you'd like|would you like to see how it works|service businesses|recover lost jobs|follow up|following up|calling back|as discussed|your missed call/i;
+  /if missed calls are common|\bmay\b|\bmight\b|\bcould\b|can help|keep potential clients engaged|let me know if you'd like|would you like to see how it works|service businesses|recover lost jobs|follow up|following up|calling back|as discussed|your missed call/i;
 
 function countWords(value) {
   return value
@@ -29,13 +29,58 @@ function countWords(value) {
     .filter(Boolean).length;
 }
 
+function currentChicagoMinuteOfDay() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+
+  return (
+    Number(parts.find((part) => part.type === 'hour')?.value) * 60 +
+    Number(parts.find((part) => part.type === 'minute')?.value)
+  );
+}
+
+function formatTwentyFourHourWindowMinute(minuteOfDay) {
+  const normalizedMinute = ((minuteOfDay % 1440) + 1440) % 1440;
+  const hour = Math.floor(normalizedMinute / 60);
+  const minute = normalizedMinute % 60;
+  return String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0');
+}
+
+function buildWindowAroundCurrentMinute() {
+  const currentMinute = currentChicagoMinuteOfDay();
+  return (
+    formatTwentyFourHourWindowMinute(currentMinute - 30) +
+    '-' +
+    formatTwentyFourHourWindowMinute(currentMinute + 30)
+  );
+}
+
+function buildWindowAfterCurrentMinute() {
+  const currentMinute = currentChicagoMinuteOfDay();
+  return (
+    formatTwentyFourHourWindowMinute(currentMinute + 60) +
+    '-' +
+    formatTwentyFourHourWindowMinute(currentMinute + 120)
+  );
+}
+
 const VALID_AGENT_SUBJECT = 'Calls while detailing?';
 const VALID_AGENT_BODY =
-  'Hi Jordan, do you ever miss calls while you are detailing a car or talking with a customer? That is usually where new bookings get lost, because the next shop is one tap away. I built something that texts missed callers back instantly so they do not move on. Want me to send a quick demo?';
+  'Do calls slip by while you are detailing a car or talking with a customer?\n' +
+  'Missed calls turn into lost bookings because the next shop is one tap away.\n' +
+  'I built Systemix to text missed callers back instantly, ask what they need, and keep the job from disappearing.\n' +
+  'Want me to send a quick demo?';
 
 const CHANGED_AGENT_SUBJECT = 'New detailing jobs';
 const CHANGED_AGENT_BODY =
-  'Hi Jordan, are calls easy to miss when you are polishing a car or walking a customer through a quote? That is where new detailing jobs can disappear fast. I built something that replies by text right away and captures what the caller needs. Want me to send the short version?';
+  'Are calls hard to catch when you are polishing a car or walking a customer through a quote?\n' +
+  'Missed calls turn into lost detailing jobs because the next shop is one tap away.\n' +
+  'I built Systemix to reply by text right away, capture what the caller needs, and keep the booking alive.\n' +
+  'Want me to send the short version?';
 
 class FakeLeadStore {
   constructor(eventLog = []) {
@@ -704,8 +749,8 @@ test('prepareNextAction is read-only and returns the rendered send action', asyn
 test('outreach writer instructions include the cold GTM reply-driven constraints', () => {
   const source = readFileSync(new URL('./agents/outreach-writer.ts', import.meta.url), 'utf8');
 
-  assert.match(source, /Line 1: a direct question tied to the owner's daily reality/);
-  assert.match(source, /missed calls become lost jobs or bookings/);
+  assert.match(source, /Line 1: a present-tense question tied to the owner's daily reality/);
+  assert.match(source, /Line 2: missed-call pain, direct and not hypothetical/);
   assert.match(source, /I built/);
   assert.match(source, /simple low-friction CTA/);
   assert.match(source, /target 55-65 body words/);
@@ -728,8 +773,8 @@ test('prepareNextAction falls back to renderTemplate when the outreach writer fa
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.equal(result.value.subject, 'Missed calls?');
-  assert.match(result.value.body, /Do you ever miss calls/);
-  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.match(result.value.body, /Do calls slip by/);
+  assert.match(result.value.body, /I built Systemix to text missed callers back instantly/);
   assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
@@ -739,14 +784,23 @@ test('prepareNextAction uses validated outreach writer output for GTM proposals'
       async writeOutreach() {
         return {
           subject: 'Agent subject for revenue recovery',
-          body:
-            'Hi Jordan, do you ever miss calls while you are on detailing jobs or working with a customer? That is usually where new bookings get lost. I built something that texts missed callers back instantly so they do not move on. Want me to send a quick demo?',
+          body: VALID_AGENT_BODY,
           variantLabel: 'agent-proof',
         };
       },
     },
   });
-  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        experiment_tag: 'timing-a',
+        outreach_window: 'weekday-morning',
+        context_note: 'Lead opens early',
+      },
+    })
+  );
 
   const result = await service.prepareNextAction('lead-123');
   assert.equal(result.ok, true);
@@ -754,7 +808,7 @@ test('prepareNextAction uses validated outreach writer output for GTM proposals'
   assert.equal(result.value.subject, 'Agent subject for revenue recovery');
   assert.ok(countWords(result.value.body) >= 45);
   assert.ok(countWords(result.value.body) <= 70);
-  assert.match(result.value.body, /texts missed callers back instantly/);
+  assert.match(result.value.body, /text missed callers back instantly/);
   assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
@@ -770,13 +824,23 @@ test('prepareNextAction falls back when outreach writer schema validation fails'
       },
     },
   });
-  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        experiment_tag: 'timing-a',
+        outreach_window: 'weekday-morning',
+        context_note: 'Lead opens early',
+      },
+    })
+  );
 
   const result = await service.prepareNextAction('lead-123');
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.notEqual(result.value.subject, 'Agent subject');
-  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.match(result.value.body, /I built Systemix to text missed callers back instantly/);
   assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
@@ -792,14 +856,24 @@ test('prepareNextAction rejects cold outreach writer copy that implies prior con
       },
     },
   });
-  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        experiment_tag: 'timing-a',
+        outreach_window: 'weekday-morning',
+        context_note: 'Lead opens early',
+      },
+    })
+  );
 
   const result = await service.prepareNextAction('lead-123');
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.doesNotMatch(result.value.subject, DISALLOWED_COLD_GTM_COPY);
   assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
-  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.match(result.value.body, /I built Systemix to text missed callers back instantly/);
 });
 
 test('prepareNextAction rejects generic cold GTM phrases and uses fallback copy', async () => {
@@ -843,7 +917,7 @@ test('prepareNextAction rejects cold GTM bodies under the reply-driven word floo
   assert.equal(result.ok, true);
   assert.equal(result.value.action, 'send');
   assert.equal(result.value.subject, 'Missed calls?');
-  assert.match(result.value.body, /I built something that texts missed callers back instantly/);
+  assert.match(result.value.body, /I built Systemix to text missed callers back instantly/);
   assert.doesNotMatch(result.value.body, DISALLOWED_COLD_GTM_COPY);
 });
 
@@ -955,7 +1029,7 @@ test('advanceLeadSequence stores a pending approval and skips sending until appr
       async writeOutreach() {
         return {
           subject: 'Agent approval subject',
-          body: 'Agent approval body for the finalized proposal.',
+          body: VALID_AGENT_BODY,
           variantLabel: 'approval-agent',
         };
       },
@@ -983,8 +1057,8 @@ test('advanceLeadSequence stores a pending approval and skips sending until appr
   assert.equal(approvalNotifications.length, 1);
   const approval = Array.from(store.approvals.values())[0];
   assert.equal(approval.subject, 'Agent approval subject');
-  assert.equal(approval.body, 'Agent approval body for the finalized proposal.');
-  assert.equal(approvalNotifications[0].preparedAction.body, 'Agent approval body for the finalized proposal.');
+  assert.equal(approval.body, VALID_AGENT_BODY);
+  assert.equal(approvalNotifications[0].preparedAction.body, VALID_AGENT_BODY);
 });
 
 test('advanceLeadSequence reuses an equivalent pending approval without a second notification', async () => {
@@ -994,7 +1068,7 @@ test('advanceLeadSequence reuses an equivalent pending approval without a second
       async writeOutreach() {
         return {
           subject: 'Agent approval subject',
-          body: 'Agent approval body for the finalized proposal.',
+          body: VALID_AGENT_BODY,
           variantLabel: 'approval-agent',
         };
       },
@@ -1026,7 +1100,7 @@ test('advanceLeadSequence keeps the pending approval lock when SMS notification 
       async writeOutreach() {
         return {
           subject: 'Agent approval subject',
-          body: 'Agent approval body for the finalized proposal.',
+          body: VALID_AGENT_BODY,
           variantLabel: 'approval-agent',
         };
       },
@@ -1057,7 +1131,7 @@ test('advanceLeadSequence does not resend approval SMS for an executed equivalen
       async writeOutreach() {
         return {
           subject: 'Agent approval subject',
-          body: 'Agent approval body for the finalized proposal.',
+          body: VALID_AGENT_BODY,
           variantLabel: 'approval-agent',
         };
       },
@@ -1215,6 +1289,7 @@ test('advanceLeadSequence sends approved stored proposal before regenerated copy
 
 test('advanceLeadSequence sends exact approved subject body and proposal hash for the approved proposal', async () => {
   let writerCalls = 0;
+  const outreachWindow = buildWindowAroundCurrentMinute();
   const { service, store, emailClient } = createService({
     agentHooks: {
       async writeOutreach() {
@@ -1227,7 +1302,17 @@ test('advanceLeadSequence sends exact approved subject body and proposal hash fo
       },
     },
   });
-  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        experiment_tag: 'timing-a',
+        outreach_window: outreachWindow,
+        context_note: 'Lead opens early',
+      },
+    })
+  );
 
   assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
   const approval = Array.from(store.approvals.values())[0];
@@ -1246,8 +1331,148 @@ test('advanceLeadSequence sends exact approved subject body and proposal hash fo
   assert.equal(writerCalls, 1);
   assert.equal(store.touchpoints.length, 1);
   assert.equal(touchpoint.stage_index, approval.stage_index);
+  assert.equal(touchpoint.experiment_tag, 'timing-a');
+  assert.equal(touchpoint.outreach_window, outreachWindow);
+  assert.equal(touchpoint.context_note, 'Lead opens early');
   assert.equal(executedApproval.proposal_hash, approval.proposal_hash);
   assert.equal(executedApproval.status, 'executed');
+  assert.equal(store.leads.get('lead-123').touches_sent, 1);
+});
+
+test('advanceLeadSequence sends approved proposal inside outreach_window', async () => {
+  const { service, store, emailClient } = createService();
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        outreach_window: buildWindowAroundCurrentMinute(),
+      },
+    })
+  );
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  const approval = Array.from(store.approvals.values())[0];
+  store.approvals.set(approval.id, {
+    ...approval,
+    status: 'approved',
+  });
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'dry_run',
+    },
+  });
+  assert.equal(emailClient.calls.length, 1);
+  assert.equal(store.approvals.get(approval.id).status, 'executed');
+  assert.equal(store.touchpoints.length, 1);
+  assert.equal(store.leads.get('lead-123').touches_sent, 1);
+});
+
+test('advanceLeadSequence blocks approved proposal outside outreach_window without mutations', async () => {
+  let writerCalls = 0;
+  let writerShouldFail = false;
+  const { service, store, emailClient } = createService({
+    agentHooks: {
+      async writeOutreach() {
+        writerCalls += 1;
+        if (writerShouldFail) {
+          throw new Error('writer should not run for approved proposal');
+        }
+        return {
+          subject: VALID_AGENT_SUBJECT,
+          body: VALID_AGENT_BODY,
+          variantLabel: 'valid',
+        };
+      },
+    },
+  });
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        outreach_window: buildWindowAfterCurrentMinute(),
+      },
+    })
+  );
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  const approval = Array.from(store.approvals.values())[0];
+  store.approvals.set(approval.id, {
+    ...approval,
+    status: 'approved',
+  });
+  writerShouldFail = true;
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'outside_outreach_window',
+    },
+  });
+  assert.equal(writerCalls, 1);
+  assert.equal(emailClient.calls.length, 0);
+  assert.equal(store.approvals.get(approval.id).status, 'approved');
+  assert.equal(store.approvals.get(approval.id).executed_at, undefined);
+  assert.equal(store.touchpoints.length, 0);
+  assert.equal(store.leads.get('lead-123').touches_sent, 0);
+});
+
+test('advanceLeadSequence blocks invalid outreach_window without mutations', async () => {
+  const { service, store, emailClient } = createService();
+  store.seedLead(
+    buildLead({
+      status: 'active',
+      metadata: {
+        source: 'manual_gtm',
+        outreach_window: 'after lunch',
+      },
+    })
+  );
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  const approval = Array.from(store.approvals.values())[0];
+  store.approvals.set(approval.id, {
+    ...approval,
+    status: 'approved',
+  });
+
+  assert.deepEqual(await service.advanceLeadSequence('lead-123'), {
+    ok: true,
+    value: {
+      action: 'skipped',
+      leadId: 'lead-123',
+      reason: 'invalid_outreach_window',
+    },
+  });
+  assert.equal(emailClient.calls.length, 0);
+  assert.equal(store.approvals.get(approval.id).status, 'approved');
+  assert.equal(store.approvals.get(approval.id).executed_at, undefined);
+  assert.equal(store.touchpoints.length, 0);
+  assert.equal(store.leads.get('lead-123').touches_sent, 0);
+});
+
+test('advanceLeadSequence keeps existing no-window sends working', async () => {
+  const { service, store, emailClient } = createService();
+  store.seedLead(buildLead({ status: 'active', metadata: { source: 'manual_gtm' } }));
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  const approval = Array.from(store.approvals.values())[0];
+  store.approvals.set(approval.id, {
+    ...approval,
+    status: 'approved',
+  });
+
+  assert.equal((await service.advanceLeadSequence('lead-123')).ok, true);
+  assert.equal(emailClient.calls.length, 1);
+  assert.equal(store.approvals.get(approval.id).status, 'executed');
+  assert.equal(store.touchpoints.length, 1);
   assert.equal(store.leads.get('lead-123').touches_sent, 1);
 });
 
