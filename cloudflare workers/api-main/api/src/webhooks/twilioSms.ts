@@ -3944,7 +3944,7 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      twilioLog.error('Twilio SMS signature rejected and request processing continued', {
+      twilioLog.error('Twilio SMS signature rejected and request blocked', {
         context: {
           handler: 'twilioSmsHandler',
           messageSid: providerMessageId,
@@ -3956,6 +3956,7 @@ export async function twilioSmsHandler(c: Context<{ Bindings: Bindings }>) {
           reason: sig.reason,
         },
       });
+      return new Response('Forbidden', { status: 403 });
     }
 
     const businessContext = await resolveBusinessContext(c.env, inboundTo);

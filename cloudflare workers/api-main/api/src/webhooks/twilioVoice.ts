@@ -269,7 +269,7 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      voiceLog.error('Twilio voice signature rejected and request processing continued', {
+      voiceLog.error('Twilio voice signature rejected and request blocked', {
         context: {
           handler: 'twilioVoiceHandler',
           callSid: callSid || parentCallSid,
@@ -281,6 +281,7 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
           reason: sig.reason,
         },
       });
+      return new Response('Forbidden', { status: 403 });
     }
 
     twiml = buildImmediateVoiceResponse(env, c.req.url, from, to);
@@ -482,7 +483,7 @@ export async function twilioDialStatusHandler(c: Context<{ Bindings: Bindings }>
     const to = (formData.get('To') as string) || '';
     const dialCallStatus = normalizeCallStatus((formData.get('DialCallStatus') as string) || '');
     if (!sig.ok) {
-      voiceLog.error('Twilio dial status signature rejected and request processing continued', {
+      voiceLog.error('Twilio dial status signature rejected and request blocked', {
         context: {
           handler: 'twilioDialStatusHandler',
           fromNumber: from,
@@ -493,6 +494,7 @@ export async function twilioDialStatusHandler(c: Context<{ Bindings: Bindings }>
           reason: sig.reason,
         },
       });
+      return new Response('Forbidden', { status: 403 });
     }
 
     voiceLog.log('Dial status callback received', {
@@ -546,7 +548,7 @@ export async function twilioVoicemailTranscriptionHandler(c: Context<{ Bindings:
     const callSid = ((formData.get('CallSid') as string) || '').trim();
     const transcriptionText = ((formData.get('TranscriptionText') as string) || '').trim();
     if (!sig.ok) {
-      voiceLog.error('Twilio voicemail transcription signature rejected and request processing continued', {
+      voiceLog.error('Twilio voicemail transcription signature rejected and request blocked', {
         context: {
           handler: 'twilioVoicemailTranscriptionHandler',
           callSid,
@@ -556,6 +558,7 @@ export async function twilioVoicemailTranscriptionHandler(c: Context<{ Bindings:
           reason: sig.reason,
         },
       });
+      return new Response('Forbidden', { status: 403 });
     }
 
     voiceLog.log('Voicemail transcription callback received', {
@@ -605,7 +608,7 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
     const callSid = formData.get('CallSid') as string;
     const recordingDuration = formData.get('RecordingDuration') as string;
     if (!sig.ok) {
-      voiceLog.error('Twilio recording signature rejected and request processing continued', {
+      voiceLog.error('Twilio recording signature rejected and request blocked', {
         context: {
           handler: 'twilioRecordingHandler',
           callSid,
@@ -617,6 +620,7 @@ export async function twilioRecordingHandler(c: Context<{ Bindings: Bindings }>)
           reason: sig.reason,
         },
       });
+      return new Response('Forbidden', { status: 403 });
     }
 
     if (!recordingUrl) {

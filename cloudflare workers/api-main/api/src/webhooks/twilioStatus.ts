@@ -55,7 +55,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
       c.req.header('X-Twilio-Signature') || undefined
     );
     if (!sig.ok) {
-      twilioLog.error('Twilio status signature rejected and request processing continued', {
+      twilioLog.error('Twilio status signature rejected and request blocked', {
         context: {
           callSid: providerCallId || callSid,
           fromNumber: fromPhone,
@@ -66,6 +66,7 @@ export async function twilioStatusHandler(c: Context<{ Bindings: Bindings }>) {
           reason: sig.reason,
         },
       });
+      return new Response('Forbidden', { status: 403 });
     }
 
     if (!providerCallId) {
