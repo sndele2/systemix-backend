@@ -44,6 +44,7 @@ type Bindings = {
   HUBSPOT_ACCESS_TOKEN?: string;
   TWILIO_SIGNATURE_MODE?: string;
   ENVIRONMENT?: string;
+  ENABLE_CLASSIFICATION?: string;
 };
 
 type Confidence = 'high' | 'low' | null;
@@ -77,7 +78,6 @@ type BusinessContext = {
 };
 
 const PROVIDER = 'twilio';
-const ENABLE_CLASSIFICATION = false;
 const ALERT_DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const ACTIVE_THREAD_WINDOW_MS = 5 * 60 * 1000;
 const INBOUND_SMS_DEDUP_WINDOW_SECONDS = 10;
@@ -290,8 +290,8 @@ function buildClassificationDisabledTriage(messageBody: string): TriageResult {
   };
 }
 
-async function classifyCustomerMessage(messageBody: string, apiKey?: string): Promise<TriageResult> {
-  if (!ENABLE_CLASSIFICATION) {
+async function classifyCustomerMessage(messageBody: string, apiKey?: string, enableClassification = false): Promise<TriageResult> {
+  if (!enableClassification) {
     return buildClassificationDisabledTriage(messageBody);
   }
 
@@ -2671,7 +2671,7 @@ function buildCustomerAnalysisBackgroundTasks(input: {
     saveInboundTask.then(async (savedInbound) => {
       if (!savedInbound?.saved) return null;
 
-      const triage = await classifyCustomerMessage(input.body, input.env.OPENAI_API_KEY);
+      const triage = await classifyCustomerMessage(input.body, input.env.OPENAI_API_KEY, input.env.ENABLE_CLASSIFICATION === 'true');
       classifyLog.log('Lead classification completed', {
         context: {
           handler: 'buildCustomerAnalysisBackgroundTasks',
@@ -3216,7 +3216,7 @@ async function handleCustomerInbound(input: {
   ownerAlertSid?: string | null;
 }> {
   const threadId = await getOrCreateCustomerThread(input.env, input.businessNumber, input.customerNumber);
-  const triage = await classifyCustomerMessage(input.body, input.env.OPENAI_API_KEY);
+  const triage = await classifyCustomerMessage(input.body, input.env.OPENAI_API_KEY, input.env.ENABLE_CLASSIFICATION === 'true');
 
   classifyLog.log('Classification timing trace recorded', {
     context: {
