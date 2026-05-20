@@ -23,7 +23,8 @@ export class ManualGtmResearchProvider implements GtmResearchProvider {
 
 export function validateResearchedLead(input: GtmReviewedLeadInput): Result<GtmReviewedLeadInput> {
   const businessName = input.businessName.trim();
-  const email = input.email.trim().toLowerCase();
+  // email optional post-migration-0025 — null permitted, sequence will not advance until email is found
+  const email = typeof input.email === 'string' ? input.email.trim().toLowerCase() : '';
   const sourceUrl = input.sourceUrl.trim();
   const evidence = input.evidence.trim();
 
@@ -31,8 +32,8 @@ export function validateResearchedLead(input: GtmReviewedLeadInput): Result<GtmR
     return { ok: false, error: 'businessName is required' };
   }
 
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return { ok: false, error: 'valid email is required' };
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { ok: false, error: 'email must be a valid format when provided' };
   }
 
   try {
