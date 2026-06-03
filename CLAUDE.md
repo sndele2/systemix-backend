@@ -164,17 +164,34 @@ Challenge any task that does not serve one of these five.
 
 ## Deployment Commands
 
-Deploy:
-  cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers/api-main/api && wrangler deploy
+CANONICAL PRODUCTION WORKER: systemix-backend (https://systemix-backend.sean-ndele.workers.dev)
+Deployed from "cloudflare workers/wrangler.toml" with --env production. This config
+has nodejs_compat, the DB binding, the cron trigger, and all required secrets.
 
-Logs:
-  wrangler tail
+DO NOT deploy from api-main/api (wrangler.jsonc). The "api" worker it named was a
+dormant duplicate and was DELETED on 2026-06-02; the jsonc is retained ONLY for the
+vitest test harness and local dev. Deploying from it would RECREATE the dead worker.
+Deploying from there for ~a month silently shipped commits to the wrong worker and
+they never reached production. See
+~/Brain/businesses/systemix/decisions/2026-06-02-dual-wrangler-config-deploy-trap.md.
+
+Deploy (production):
+  cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers && wrangler deploy --env production
+
+Logs (production):
+  cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers && wrangler tail --env production
 
 Migrations (production):
-  wrangler d1 migrations apply <database-name> --remote
+  cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers && wrangler d1 migrations apply systemix --remote --env production
 
-Tests:
-  npm run test
+Tests (run in the api package):
+  cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers/api-main/api && npm run test
 
-Build:
-  npm run build
+Build (run in the api package):
+  cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers/api-main/api && npm run build
+
+---
+
+## Tech Debt
+
+- [DEBT] P1-3 SKIPPED: businesses table DDL duplicated in ensureSwitchboardSchema (twilioSms.ts) and ensureCustomerMissedCallSchema (missedCallRecovery.ts). intake_question column is not in any migration — it is runtime-only via maybeAddColumn. Fix requires adding a new migration (e.g. 0025_add_intake_question.sql) with an existence guard before the duplicate DDL blocks can be safely removed. Revisit when next touching schema init or migrations.

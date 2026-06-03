@@ -10,7 +10,6 @@
 		"start": "wrangler dev"
 	},
 	"dependencies": {
-		"@openai/agents": "^0.8.5",
 		"hono": "^4.11.3",
 		"openai": "^6.34.0",
 		"stripe": "^20.4.1",
@@ -20,5 +19,8 @@
 		"@cloudflare/workers-types": "^4.20260109.0",
 		"typescript": "^5.9.3",
 		"wrangler": "^4.83.0"
+	},
+	"overrides": {
+		"@modelcontextprotocol/sdk": "file:./stubs/mcp-noop"
 	}
 }

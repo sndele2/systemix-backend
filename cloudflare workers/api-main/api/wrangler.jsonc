@@ -1,4 +1,20 @@
 /**
+ * ⚠️ DO NOT DEPLOY FROM THIS CONFIG. Tests/local-dev only.
+ *
+ * The worker "api" this config named was DELETED on 2026-06-02 (it was a dormant
+ * duplicate serving no traffic). This file is retained ONLY because the test
+ * harness depends on it: vitest.config.mts references ./wrangler.jsonc for the
+ * @cloudflare/vitest-pool-workers D1/KV bindings, and package.json dev/start use it.
+ *
+ * Running `wrangler deploy` from here would RECREATE the deleted "api" worker —
+ * never do it. CANONICAL PRODUCTION = worker "systemix-backend", deployed from
+ * "cloudflare workers/wrangler.toml" with --env production:
+ *   cd ~/Desktop/Systemix/systemix-backend/cloudflare\ workers && wrangler deploy --env production
+ *
+ * Background: deploying from this jsonc for ~a month silently shipped commits to
+ * the wrong worker; they never reached production. See
+ * ~/Brain/businesses/systemix/decisions/2026-06-02-dual-wrangler-config-deploy-trap.md
+ *
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */

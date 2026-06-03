@@ -28,7 +28,6 @@ import {
   normalizeInternalBillingFlag,
 } from './services/billing.ts';
 import { resolveGtmConfigFromEnv, sendGtmTestEmail } from './gtm/email-client.ts';
-import { runOutreachWriter } from './gtm/agents/runner.ts';
 import { MicrosoftGraphInboxProvider } from './gtm/inbox-client.ts';
 import {
   createGtmInternalFlowHandler,
@@ -37,11 +36,9 @@ import {
 } from './gtm/index.ts';
 import type {
   ApprovalNotificationRequest,
-  GTMServiceAgentHooks,
   GTMServiceApprovalHooks,
 } from './gtm/service.ts';
-import type { LeadRecord, EmailStage } from './gtm/types.ts';
-import type { OutreachWriterInput, OutreachWriterOutput } from './gtm/agents/schemas.ts';
+import type { LeadRecord } from './gtm/types.ts';
 import {
   createInternalInboxHandler,
   D1InternalInboxProvider,
@@ -291,11 +288,6 @@ function resolveApprovalNotificationSenderNumber(
   );
 }
 
-type OutreachWriterRunner = (
-  input: OutreachWriterInput,
-  options: { apiKey?: string; model?: string }
-) => Promise<OutreachWriterOutput>;
-
 function readLeadMetadataString(lead: LeadRecord, key: string): string | undefined {
   const value = lead.metadata?.[key];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -342,84 +334,6 @@ function buildGtmApprovalProposalPreview(input: ApprovalNotificationRequest): st
     lines.find((line) => !/^hi[\s,]/i.test(line) && !/^hello[\s,]/i.test(line)) ?? lines[0] ?? '';
 
   return truncateApprovalSmsValue(nonGreetingLine, GTM_APPROVAL_SMS_PREVIEW_LIMIT);
-}
-
-function buildOutreachWriterInput(lead: LeadRecord, stage: EmailStage): OutreachWriterInput {
-  const summary =
-    readLeadMetadataString(lead, 'summary') ??
-    readLeadMetadataString(lead, 'researchNotes') ??
-    readLeadMetadataString(lead, 'notes');
-  const niche = readLeadMetadataString(lead, 'niche') ?? readLeadMetadataString(lead, 'industry');
-  const city = readLeadMetadataString(lead, 'city');
-  const contextNote = readLeadMetadataString(lead, 'context_note') ?? readLeadMetadataString(lead, 'contextNote');
-  const sourceUrl = readLeadMetadataString(lead, 'sourceUrl');
-  const evidence = readLeadMetadataString(lead, 'evidence');
-  const outreachAngle = readLeadMetadataString(lead, 'outreachAngle');
-
-  return {
-    candidate: {
-      businessName: readLeadMetadataString(lead, 'businessName') ?? lead.name,
-      contactName: readLeadMetadataString(lead, 'contactName'),
-      website: readLeadMetadataString(lead, 'website'),
-      email: lead.email,
-      phone: lead.phone,
-      city,
-      state: readLeadMetadataString(lead, 'state'),
-      industry: niche,
-      niche,
-      source: readLeadMetadataString(lead, 'source'),
-      sourceUrl,
-      sourceType: readLeadMetadataString(lead, 'sourceType'),
-      evidence,
-      confidence:
-        typeof lead.metadata?.confidence === 'number' ? lead.metadata.confidence : undefined,
-      researchNotes: readLeadMetadataString(lead, 'researchNotes'),
-      outreachAngle,
-      summary,
-    },
-    niche,
-    city,
-    context_note: contextNote,
-    outreachAngle:
-      outreachAngle === 'missed_call_recovery' ||
-      outreachAngle === 'lost_jobs_recovery' ||
-      outreachAngle === 'revenue_recovery' ||
-      outreachAngle === 'general_follow_up' ||
-      outreachAngle === 'no_fit'
-        ? outreachAngle
-        : 'missed_call_recovery',
-    businessContext:
-      'Internal GTM outreach for Systemix. Write only prospective outbound email copy; do not imply prior contact unless the lead metadata explicitly says warm or recovery.',
-    groundingFacts: [
-      'Systemix helps service businesses respond to missed calls.',
-      'The proposal is internal GTM copy only and must not send email.',
-      niche ? `Lead niche: ${niche}.` : 'Lead niche is unknown; keep the copy conservative.',
-      city ? `Lead city: ${city}.` : 'Lead city is unknown.',
-      contextNote ? `Context note: ${truncateApprovalSmsValue(contextNote, 160)}.` : 'No context note was provided.',
-      sourceUrl
-        ? `Research source URL: ${truncateApprovalSmsValue(sourceUrl, 150)}.`
-        : 'No research source URL was provided.',
-      evidence
-        ? `Evidence: ${truncateApprovalSmsValue(evidence, 160)}.`
-        : 'No source evidence was provided.',
-      `This is sequence touch ${stage.stageIndex + 1}.`,
-    ],
-    maxWords: 70,
-  };
-}
-
-export function createRuntimeGtmAgentHooks(
-  env: Pick<Bindings, 'OPENAI_API_KEY' | 'GTM_AGENT_MODEL'>,
-  runner: OutreachWriterRunner = runOutreachWriter
-): GTMServiceAgentHooks {
-  return {
-    async writeOutreach(lead: LeadRecord, stage: EmailStage): Promise<OutreachWriterOutput> {
-      return runner(buildOutreachWriterInput(lead, stage), {
-        apiKey: env.OPENAI_API_KEY,
-        model: env.GTM_AGENT_MODEL,
-      });
-    },
-  };
 }
 
 function readLeadBusinessNumber(lead: ApprovalNotificationRequest['lead']): string | null {
@@ -1543,7 +1457,6 @@ export function createApp(dependencies: RuntimeDependencies = {}): Hono<AppEnv> 
     dependencies.gtmServiceFactory ??
     ((bindings: Parameters<typeof createRuntimeGtmService>[0]) =>
       createRuntimeGtmService(bindings, {
-        agentHooks: createRuntimeGtmAgentHooks(bindings as Bindings),
         approvalHooks: createRuntimeGtmApprovalHooks(bindings as Bindings),
       }));
 
