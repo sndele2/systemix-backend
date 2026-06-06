@@ -521,7 +521,6 @@ export class DurableLeadStore implements LeadStore {
       logStoreError('createApproval', error, {
         approvalId: approval.id,
         leadId: approval.lead_id,
-        approvalCode: approval.approval_code,
       });
       return fail('Failed to create GTM approval');
     }
@@ -982,7 +981,6 @@ export class DurableLeadStore implements LeadStore {
       });
     } catch (error) {
       logStoreError('resolveApprovalByCode', error, {
-        approvalCode,
         status,
       });
       return fail('Failed to resolve GTM approval');
