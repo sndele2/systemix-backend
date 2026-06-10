@@ -13,6 +13,7 @@ import {
   scheduleTwilioBackgroundTask,
   shouldFireMissedCallVoiceHook,
 } from '../services/twilioLaunch.ts';
+import { failWorkflowRun, logWorkflowStep, startWorkflowRun } from '../services/workflow-trace.ts';
 import { logConsentEvent } from '../services/smsCompliance.ts';
 
 type Bindings = {
@@ -306,8 +307,32 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
 
     if (shouldFireMissedCallVoiceHook(callStatus, to)) {
       const backgroundTask = (async () => {
+        const requestId = (callSid || parentCallSid || crypto.randomUUID()).trim();
+        const runId = await startWorkflowRun(getDb(env), {
+          requestId,
+          workflowName: 'missed_call_recovery',
+          businessNumber: to,
+          phoneNumber: from,
+          source: 'twilio_voice_webhook',
+          summary: 'Twilio voice webhook received',
+        });
+
         try {
           const providerCallId = callSid || parentCallSid;
+          await logWorkflowStep(getDb(env), {
+            requestId,
+            runId,
+            stepName: 'inbound_webhook_received',
+            input: {
+              callSid: callSid || null,
+              parentCallSid: parentCallSid || null,
+              callStatus,
+            },
+            output: {
+              providerCallId: providerCallId || null,
+            },
+          });
+
           if (!providerCallId) {
             throw new Error('missing_call_sid');
           }
@@ -399,6 +424,10 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
             rawStatus,
             callSid,
             parentCallSid,
+            trace: {
+              requestId,
+              runId,
+            },
           });
 
           if (!result.ok) {
@@ -419,6 +448,12 @@ export async function twilioVoiceHandler(c: Context<{ Bindings: Bindings }>) {
             },
           });
         } catch (error) {
+          await failWorkflowRun(getDb(env), {
+            requestId,
+            runId,
+            errorText: error instanceof Error ? error.message : String(error),
+            summary: 'Missed-call recovery workflow failed',
+          });
           voiceLog.error('Voice hook background task failed', {
             error,
             context: {
